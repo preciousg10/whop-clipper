@@ -32,6 +32,40 @@ SAFE_MARGIN_HINTS = ("safe margin", "safe-margin", "safemargin", "cropped",
 SECTION_CAP = 40
 
 
+# --- scout handoff (Task C) ----------------------------------------------------
+def apply_pick(args):
+    """Load the scout->clipper handoff (campaign_inputs/pick.json from pickcampaign.py) and
+    point intake's --campaign/--brief/--links at it. This is the wiring that lets intake run
+    on the campaign scout ranked #1 instead of hand-placed files. Fail loud if the pick or
+    its files are missing — never fall back to whatever stale inputs happen to be on disk."""
+    pick_path = os.path.expanduser(args.pick_json) if args.pick_json \
+        else str(C.ROOT / "campaign_inputs" / "pick.json")
+    if not os.path.exists(pick_path):
+        C.fail(f"--from-pick set but no pick file at {pick_path}.\n"
+               "Run the picker first: python scripts/pickcampaign.py")
+    meta = C.load_json(pick_path)
+    if not meta:
+        C.fail(f"pick file is empty or corrupt: {pick_path}")
+
+    def _abs(rel):
+        if not rel:
+            return None
+        return rel if os.path.isabs(rel) else str(C.ROOT / rel)
+
+    args.campaign = meta.get("campaign") or args.campaign
+    args.brief = _abs(meta.get("brief"))
+    args.links = _abs(meta.get("links"))
+    if not args.brief or not os.path.exists(args.brief):
+        C.fail(f"pick references a brief that isn't on disk: {args.brief!r} "
+               f"(from {pick_path}). Re-run pickcampaign.py.")
+    if not args.links or not os.path.exists(args.links):
+        C.fail(f"pick references a links file that isn't on disk: {args.links!r} "
+               f"(from {pick_path}). Re-run pickcampaign.py.")
+    C.log(f"intake from scout pick: campaign={args.campaign!r} "
+          f"(rank {meta.get('rank')}, composite {meta.get('composite_score')}); "
+          f"brief={args.brief}, links={args.links}")
+
+
 # --- inputs --------------------------------------------------------------------
 def read_brief(args):
     if args.brief_text:
@@ -381,6 +415,11 @@ def main():
     ap.add_argument("--brief-text", help="brief text pasted inline")
     ap.add_argument("--links", help="file with one link/path per line")
     ap.add_argument("--link", action="append", help="a single link/path (repeatable)")
+    ap.add_argument("--from-pick", action="store_true",
+                    help="take the campaign from the scout handoff (campaign_inputs/pick.json, "
+                         "written by pickcampaign.py) instead of hand-placed --brief/--links.")
+    ap.add_argument("--pick-json",
+                    help="path to a specific pick.json (implies --from-pick).")
     ap.add_argument("--cookies-from-browser",
                     help="browser for cookies on gated VODs (chrome/edge/firefox) — Kick needs this")
     ap.add_argument("--max-source-height", type=int, default=720,
@@ -388,6 +427,8 @@ def main():
     ap.add_argument("--original", action="store_true",
                     help="force raw original Drive files instead of preview streams")
     args = ap.parse_args()
+    if args.from_pick or args.pick_json:
+        apply_pick(args)
 
     C.ensure_dirs()
     brief = read_brief(args)

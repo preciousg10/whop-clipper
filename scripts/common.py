@@ -59,8 +59,8 @@ DEFAULT_BANNED_WORDS = ["bet", "gamble", "gambling", "casino", "odds", "wager", 
 AUDIENCE_CONTEXT = (
     "WTF Leagues: hamster racing / novelty sports league. Audience: Gen Z meme "
     "culture, F1/sports-parody crossover humor, chaos enjoyers. Reference caption "
-    "tone: 'omg mum they race hamsters', 'Hamdo Norris'. Lowercase, "
-    "unhinged-but-deadpan energy."
+    "tone: 'omg mum they race hamsters', 'Hamdo Norris'. Unhinged-but-deadpan "
+    "energy (final casing is Title Case, applied downstream — write for voice, not case)."
 )
 
 

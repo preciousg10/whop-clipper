@@ -26,7 +26,13 @@ import cut as cut_stage
 
 # ---- CONFIG (defaults; all tunable per run via flags) ----
 DEFAULT_CONFIG = {
-    "clips_per_batch": 25,
+    "clips_per_batch": 25,          # legacy soft target; real limiters are the two below
+    # Highlight selection (select stage). We take the genuinely-good peaks, not a fixed
+    # count: select_min_quality is the 0-100 Groq bar a moment must clear to ship, and
+    # select_hard_cap is the SAFETY CEILING on clips per run (each clip = one caption Groq
+    # call downstream, so this stops a runaway from burning the free tier overnight).
+    "select_hard_cap": 50,
+    "select_min_quality": 60,
     "layout": "blur_fill",         # vertical fill: "blur_fill" (whole frame, blurred bg)
                                    # or "crop_fill" (COVER + center-crop, crops edges)
     "blur_fg_zoom": 1.2,           # blur_fill foreground zoom: 1.0 = pure no-crop

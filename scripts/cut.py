@@ -25,13 +25,16 @@ CAPTION_TOP_Y = 175           # below the top 8% (~154px) TikTok UI safe zone
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
 # --- burned subtitle safe zone (from campaign/assets/Safezones *.png) ----------
-# The TikTok/IG safe box narrows on the RIGHT below ~45% height (the like/comment/
-# share/profile action rail) and the bottom ~18-20% is the caption+UI zone. Running
-# subtitles therefore sit CENTERED and NARROW in the lower-middle: clear of (a) the hook
-# caption plate up top, (b) the bottom-right watermark, and (c) the bottom UI zone. A
-# 640px centered box (x 220-860) stays inside the action-rail notch (~x<870).
+# Subtitles are pushed DOWN into the lower LETTERBOX / black band, OFF the footage frame
+# (user preference). In the default blur_fill layout a 16:9 source fit to the 1080 width
+# (with the default 1.2 fg-zoom) occupies roughly y 595-1325, so the band below ~1325 is
+# blurred/black dead space. We center the subtitle plate at ~1440: below the footage frame,
+# clear of the top hook caption, above the bottom ~18-20% TikTok caption/UI zone (~1536+),
+# and — at 640px wide, centered (x 220-860) — inside the right action-rail notch (~x<870)
+# and above the bottom-right watermark. So subtitles never sit on the footage, the
+# watermark, or the platform UI.
 SUBTITLE_BOX_W = 640
-SUBTITLE_CENTER_Y = 1240      # ~65% down: lower-middle, above the bottom UI zone (~1536)
+SUBTITLE_CENTER_Y = 1440      # ~75% down: in the lower black band, off the video frame
 
 # --- cold-open restructure (the biggest hook lever) ----------------------------
 COLD_OPEN_DUR = 2.0           # target length of the peak teaser (spec: 1.5–2.5s)
@@ -210,7 +213,7 @@ def _wrap_cells(cells, inner, max_lines):
 
 def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=6,
                        emoji=True):
-    """Bold white + black outline hook caption (flzsh: lowercase, emoji as punctuation).
+    """Bold white + black outline hook caption (Title Case, emoji as punctuation).
 
     When `emoji` is on we render emoji with a color-emoji font (Segoe UI Emoji / Noto)
     and DROP any glyph the font can't draw (never a tofu box). When off — or when no
@@ -339,7 +342,8 @@ def render_subtitle_png(text, out_path, cfg, box_w=SUBTITLE_BOX_W, max_lines=2, 
     plate, centered. TikTok-native, and a distinct style/layer from the hook caption.
     Returns the PNG height so the caller can vertically center it in the safe zone."""
     font_path = find_bold_font()
-    text = strip_to_ascii(text or "").strip() or " "
+    from captions import titlecase           # Title Case burned subtitles (same as captions)
+    text = titlecase(strip_to_ascii(text or "").strip()) or " "
     scratch = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
     inner = box_w - 2 * stroke - 24
     size, lines, tf = 60, [[]], None

@@ -22,8 +22,19 @@ import common as C
 
 POSTED = C.MEMORY / "posted_moments.json"
 MAX_CANDIDATES = 120     # cap what we hand Groq, to fit context
-MIN_LIVE_SCORE = 1       # drop only the model's flat-0 "dead" picks (countdown/hype);
-                         # everything else ships in relative-score order (original top-N)
+MIN_LIVE_SCORE = 1       # drop the model's flat-0 "dead" picks (countdown/hype/logistics)
+
+# SAFETY CEILING + QUALITY BAR (Task D). We hunt HIGHLIGHT-worthiness, not a fixed count.
+#   - HARD_CAP is a hard ceiling on how many clips one run can select, so a runaway can't
+#     burn the whole Groq free tier overnight (each selected clip costs a caption Groq call
+#     downstream). It is a CEILING, never a target — we do not pad up to it.
+#   - GOOD_SCORE is the "genuinely good" bar on Groq's 0-100 highlight score. Only moments a
+#     human would actually clip (funny / high-energy / chaotic / surprising peaks) clear it;
+#     within the ceiling we take exactly those and stop. If a stream has only 6 real
+#     highlights we ship 6, not 25. Both are overridable via config (select_hard_cap /
+#     select_min_quality) — see run.py DEFAULT_CONFIG.
+DEFAULT_HARD_CAP = 50
+DEFAULT_GOOD_SCORE = 60
 # Groq free tier is 6000 tokens/min AND 30 req/min. 97 moments in one call was
 # ~8.7k tokens -> 413 "Request too large". Batch the index into small chunks
 # (~15-20 moments ≈ under 5k tokens each), score each, then combine + rank.
@@ -80,18 +91,27 @@ def _is_junk(m):
     return top >= max(5, len(words) * 0.5)
 
 
-# The actual ACTION signal lives in the commentary, not the audio level (music/hype is
-# the loudest thing in the stream). Rank candidates by how much their transcript reads
-# like a physical event / payoff being called, so real moments reach the model instead
-# of countdown noise.
+# A moment worth clipping isn't only a crash — it's anything a person would clip watching
+# the whole stream: a physical event/payoff, a FUNNY beat, a wild reaction, chaos, or a
+# surprise. Audio level alone is a trap (music/hype is the loudest thing), so we rank
+# candidates by how much the surrounding commentary reads like one of those highlights,
+# breaking intensity ties toward real moments and away from countdown noise.
 ACTION_RE = re.compile(
-    r"\b(crash\w*|wreck\w*|flip\w*|fly\w*|overtak\w*|pass(?:es|ed|ing)?|"
+    r"\b("
+    # physical events / payoffs
+    r"crash\w*|wreck\w*|flip\w*|fly\w*|overtak\w*|pass(?:es|ed|ing)?|"
     r"wins?|won|winner|victory|finish\w*|photo ?finish|last lap|final lap|"
     r"disqualif\w*|dq|penalt\w*|knock\w*|wipeout|spun|spins? out|"
     r"lead|leads|takes the lead|neck and neck|comeback|from (?:last|behind)|"
-    r"dive[sd]?|jump\w*|collision|collide\w*|slam\w*|smash\w*|"
+    r"dive[sd]?|jump\w*|collision|collide\w*|slam\w*|smash\w*|goes down|down goes|"
+    # shock / disbelief / hype reactions
     r"insane|unbelievable|no way|no shot|can'?t believe|what a|incredible|"
-    r"robbed|goes down|down goes|let'?s go+|oh my|holy|nail ?biter|photo)\b", re.I)
+    r"robbed|let'?s go+|oh my|holy|nail ?biter|"
+    # funny / chaotic / surprising (highlight beats that aren't 'action')
+    r"hilarious|funny|lmao+|lmfao|rofl|crying|dying|bruh|bro|"
+    r"what the|wtf|diabolical|unserious|chaos|chaotic|"
+    r"caught|exposed|clip (?:it|that)|clip this|you have to see|wait (?:for|till|until))\b",
+    re.I)
 
 
 def _nearby_text(tr_segs, start, end, pre=8.0, post=4.0, limit=300):
@@ -198,26 +218,33 @@ def _score_batch(client, campaign, knowledge, batch, n):
     lines = [{"id": m["id"], "type": m["type"], "intensity": m.get("intensity"),
               "t": round(m["start"], 1), "peak": m.get("peak"),
               "text": (m.get("text") or "")[:160]} for m in batch]
-    system = ("You are an elite short-form clipper doing FIRST-PASS moment scoring for a "
-              "vertical clip campaign. A valid moment MUST contain an ACTUAL PHYSICAL EVENT "
-              "or PAYOFF — a hit, crash, overtake, knockout, win, wipeout, big reaction to "
-              "something that just happened. NOT anticipation of one. "
-              "SCORE 0-15 (dead — reject) for: pre-stream/countdown, intros, 'we're live' / "
-              "'starting soon', outros / 'thanks for tuning in', pre-fight or pre-race "
-              "BUILDUP before anything happens, and logistics/ticket/promo/sponsor talk. "
-              "These are visually dead even when loud or wordy — do not be fooled by an "
-              "audio spike over a countdown or crowd hype. "
-              "PRIMARY criterion for real moments: WOULD THE FIRST 2 SECONDS STOP A SCROLL? "
-              "A moment can be opened on its peak (field 'peak' = the loudest/chaos second); "
-              "score how hard that opening beat hits. Secondary: self-contained payoff, "
-              "chaos/emotion, fit with the campaign audience + rules below. "
+    system = ("You are an elite short-form clipper hunting HIGHLIGHTS in a livestream. Your "
+              "job: find the moments a person would actually clip if they watched the whole "
+              "stream — the FUNNY, HIGH-ENERGY, CHAOTIC, SURPRISING peaks. That includes a "
+              "hit/crash/overtake/knockout/win/wipeout, but EQUALLY a hilarious bit, a wild "
+              "or unhinged reaction, a clutch play, a brutal fail, a shocking take, a chaotic "
+              "meltdown — anything scroll-stopping and self-contained. "
+              "ENERGY IS A SIGNAL, NOT THE ANSWER: each moment carries an audio 'intensity' "
+              "and a 'peak' second (the loudest/most chaotic instant). A spike means something "
+              "MIGHT be happening — your job is to confirm it's actually GOOD, not just loud. "
+              "Do NOT reward a spike that's only music, a hype sting, crowd noise, a countdown, "
+              "or an intro. "
+              "SCORE 0-15 (dead — reject): pre-stream/countdown, intros, 'we're live' / "
+              "'starting soon', outros / 'thanks for tuning in', pre-event BUILDUP before "
+              "anything happens, and logistics/ticket/promo/sponsor talk — dead even when loud. "
+              "SCORE 70-100 (elite): only genuinely clip-worthy peaks a human would definitely "
+              "clip. Be a HARSH grader — most moments are mid; reserve high scores. "
+              "PRIMARY criterion: WOULD THE FIRST 2 SECONDS (opened on 'peak') STOP A SCROLL? "
+              "Secondary: is it funny/chaotic/surprising, self-contained, and a fit for the "
+              "campaign audience + rules below? "
               "Return ONLY a JSON array of objects "
               '{"id","score","reason"} with score 0-100. No prose.')
     user = (f"Campaign: {campaign}\n"
             f"Audience: {C.AUDIENCE_CONTEXT}\n\n"
             + (f"Campaign knowledge (apply this):\n{knowledge}\n\n" if knowledge else "")
-            + f"Score EVERY moment in this batch on the first-2-seconds scroll-stop "
-            f"first, moment quality second "
+            + f"Score EVERY moment on highlight-worthiness — would someone CLIP this? Judge "
+            f"the first-2-seconds scroll-stop (opened on 'peak') first, overall moment "
+            f"quality second. Confirm the audio spike is a real good moment, not just loud "
             f"(id, type, intensity, start seconds t, peak second, transcript text):\n"
             f"{json.dumps(lines, ensure_ascii=False)}")
     raw = C.groq_chat(client, system, user, temperature=0.4, max_tokens=900)
@@ -228,7 +255,7 @@ def _score_batch(client, campaign, knowledge, batch, n):
     return arr
 
 
-def _groq_scores(client, campaign, moments, n, min_sep):
+def _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap):
     # Candidate pool = top by audio INTENSITY (the original approach that surfaced the
     # batch-#1 keepers — loud crashes/fights/finishes). The fixed filler-kill + Groq's
     # dead-score drop remove the countdown/hype that used to slip through; action words
@@ -256,14 +283,10 @@ def _groq_scores(client, campaign, moments, n, min_sep):
 
     if not scored:
         C.warn("Groq scored no moments across all batches — falling back to heuristic.")
-        return _heuristic_scores(moments, n, min_sep)
+        return _heuristic_scores(moments, min(n, hard_cap), min_sep)
 
-    # NEVER pad the batch with dead moments just to hit N. A moment the model judged
-    # dead (buildup/countdown/hype/logistics = low score) must not ship — a handful of
-    # real clips beats 25 countdown picks. If everything scores low, that signals the
-    # candidate POOL has no action (e.g. spikes computed on the wrong audio track).
-    # Drop the model-judged-dead AND junk-text (dots/stutter/repetition) moments — the
-    # rest ship in relative-score order (original behavior), so we still deliver a batch.
+    # Drop model-judged-dead (buildup/countdown/hype/logistics) and junk-text
+    # (dots/stutter/repetition) moments — never ship those.
     alive = [m for m in scored if m["score"] >= MIN_LIVE_SCORE and not _is_junk(m)]
     dead = len(scored) - len(alive)
     if dead:
@@ -273,15 +296,33 @@ def _groq_scores(client, campaign, moments, n, min_sep):
         C.warn(f"select: EVERY candidate scored < {MIN_LIVE_SCORE} — the pool has no real "
                "action. This usually means moments.json spikes were built on the wrong "
                "audio track; recompute spike detection on the merged audio.")
+        return []
 
     alive.sort(key=lambda x: x["score"], reverse=True)
+
+    # HIGHLIGHT BAR + SAFETY CEILING. Prefer only the genuinely-good peaks (score >=
+    # min_quality) and take AS MANY as clear it, up to hard_cap — we do NOT pad to a target
+    # count. If a stream has 6 real highlights we ship 6; if it has 60 we still stop at the
+    # ceiling so downstream caption Groq calls can't run away. When NOTHING clears the bar
+    # (a flat stream) we don't fail — we ship the best available, but capped conservatively.
+    good = [m for m in alive if m["score"] >= min_quality]
+    if good:
+        pool, cap = good, hard_cap
+        C.log(f"select: {len(good)} moment(s) cleared the highlight bar "
+              f"(score >= {min_quality:g}); taking up to the {hard_cap} ceiling, no padding.")
+    else:
+        pool = alive
+        cap = max(1, min(hard_cap, n))
+        C.warn(f"select: no moment cleared the highlight bar (score >= {min_quality:g}) — this "
+               f"stream has no standout peaks. Shipping the {cap} best available instead.")
+
     picked, used = [], []
-    for m in alive:
+    for m in pool:
         if not _spread_ok(m, used, min_sep):
             continue
         picked.append(m)
         used.append(m)
-        if len(picked) >= n:
+        if len(picked) >= cap:
             break
     return picked
 
@@ -293,6 +334,9 @@ def run(state):
     cfg = state.get("config", {})
     n = int(cfg.get("clips_per_batch", 10))
     min_sep = float(cfg.get("min_separation_seconds", 60))
+    # Highlight bar + safety ceiling (Task D): the real limiters on how many clips ship.
+    hard_cap = int(cfg.get("select_hard_cap", DEFAULT_HARD_CAP))
+    min_quality = float(cfg.get("select_min_quality", DEFAULT_GOOD_SCORE))
     # merge_gap was 15s, which chained non-stop commentary into 400-550s blobs. Tight
     # gap (~7s) + a hard span cap keep a merged moment one real beat.
     merge_gap = float(cfg.get("merge_gap_seconds", 7))
@@ -320,9 +364,9 @@ def run(state):
     client = C.groq_client()
     if client is None:
         C.warn("offline mode — selecting via heuristic (no Groq).")
-        selected = _heuristic_scores(moments, n, min_sep)
+        selected = _heuristic_scores(moments, min(n, hard_cap), min_sep)
     else:
-        selected = _groq_scores(client, campaign, moments, n, min_sep)
+        selected = _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap)
 
     if not selected:
         C.fail("select found NO live moments (every candidate scored below "

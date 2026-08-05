@@ -293,11 +293,26 @@ def _strip_symbols(text):
     return re.sub(r"\s{2,}", " ", ascii_only).strip()
 
 
-def finalize_caption(text, emoji_in_caption=True):
-    """Every caption that reaches a clip is normalized here — flzsh DNA:
+def titlecase(text):
+    """Title Case (Like This): capitalize the first letter of each word, leaving the rest of
+    the word untouched so contractions and emoji survive ("don't" -> "Don't", "😭fire" ->
+    "😭Fire", a masked "b**" -> "B**"). A leading number leaves the word alone ("10v1").
+    This is the user-preferred caption/subtitle casing — it OVERRIDES the old lowercase
+    default (kept as a single choke point so both the hook caption and burned subtitles
+    agree)."""
+    def cap(word):
+        for i, ch in enumerate(word):
+            if ch.isalnum():
+                return (word[:i] + ch.upper() + word[i + 1:]) if ch.isalpha() else word
+        return word
+    return " ".join(cap(w) for w in (text or "").split())
 
-      - LOWERCASE energy, ALWAYS. Never Title Case (accountA.md: 'casual grammar,
-        lowercase energy'; canonical 'bro lost the whole run in 10 seconds 😭✌️').
+
+def finalize_caption(text, emoji_in_caption=True):
+    """Every caption that reaches a clip is normalized here:
+
+      - TITLE CASE (Like This), per user preference — overrides the old flzsh lowercase
+        default. Applied via titlecase() so both captions and burned subtitles share it.
       - Emoji are punctuation: kept when `emoji_in_caption` (default), stripped when off.
 
     The banned-word gauntlet and hook-pattern gate have already run upstream; this only
@@ -306,7 +321,7 @@ def finalize_caption(text, emoji_in_caption=True):
     text = " ".join((text or "").split())
     if not emoji_in_caption:
         text = _strip_symbols(text)
-    text = text.lower().strip()
+    text = titlecase(text).strip()
     return text or "clip"
 
 
