@@ -1,0 +1,6 @@
+﻿campaign/footage/
+*.mp4
+.venv/
+drafts/
+selftest_work/
+__pycache__/
