@@ -35,9 +35,13 @@ DEFAULT_CONFIG = {
     "clip_min_seconds": 15,        # allow tight action clips (don't over-pad)
     "clip_max_seconds": 30,        # hard cap — a tight 20-25s clip beats a padded 45s one
     "min_separation_seconds": 60,  # min gap between two selected moments (same source)
-    "merge_gap_seconds": 15,       # merge moments closer than this into one
+    "merge_gap_seconds": 7,        # merge moments closer than this into one (was 15 —
+                                   # chained non-stop commentary into 400-550s blobs)
+    "merge_max_span_seconds": 60,  # hard cap on a merged moment's span (stop merging past)
     "story_pre_seconds": 4,        # start AT the action — minimal setup lead-in (max)
     "story_post_seconds": 4,       # end near the payoff — minimal resolution tail (max)
+    "emoji_in_caption": True,      # flzsh DNA: keep emoji as caption punctuation
+    "subtitles_enabled": True,     # burn synced karaoke-style spoken-word subtitles
     "watermark_scale": 0.18,       # fraction of 1080px width
     "watermark_margin": 40,        # px from edges
     "watermark_file": None,        # exact/substring name in assets/; None = auto-pick

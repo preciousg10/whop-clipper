@@ -66,7 +66,26 @@ into `memory/longterm.md`.**
   Python's stdlib `select` (asyncio/httpx/subprocess on Linux) and breaks real runs.
 - Captions are rendered as PNGs with Pillow and overlaid by ffmpeg (see
   `cut.render_caption_png`), deliberately avoiding ffmpeg `drawtext` font/escaping
-  issues. `CLIPPER_FONT` overrides the bold TTF.
+  issues. `CLIPPER_FONT` overrides the bold TTF; `CLIPPER_EMOJI_FONT` the color-emoji TTF.
+- **Caption style is flzsh DNA: lowercase, emoji-as-punctuation** (`finalize_caption`
+  lowercases and NEVER Title Cases). `emoji_in_caption` (config, default true) keeps emoji;
+  cut renders them with a color-emoji font and DROPS any glyph the font can't draw so a
+  tofu box never ships. Tofu-detection uses fontTools' live cmap if installed, else a
+  curated allowlist (`cut._ALLOWED_EMOJI_CP`) — because Segoe UI Emoji draws unknown code
+  points as a visible box that a pixel probe can't distinguish from a real glyph.
+- **Burned subtitles** (`subtitles_enabled`, config default true; auto-off in offline
+  mode — needs whisper). Karaoke-style short phrase chunks, rendered as Pillow PNGs and
+  overlaid via `enable='between(t,…)'` (same PNG approach as captions). Timing is
+  edit-proof: cut RE-TRANSCRIBES the FINAL 30s clip (`cut.transcribe_clip_words`) rather
+  than remapping source timestamps, because cold-open reorder + dead-air trims desync the
+  source. **Campaign-banned words are masked before burn** (`cut._mask_banned_word`) and
+  re-checked per chunk (fail loud if one slips) — same gauntlet discipline as captions.
+  Subtitles sit centered in the lower-middle safe zone (`SUBTITLE_CENTER_Y`/`_BOX_W`),
+  clear of the hook plate, the watermark, and the bottom UI / right action-rail notch.
+- **Merge discipline (select):** `merge_gap_seconds` (7) + `merge_max_span_seconds` (60)
+  keep a merged moment one real beat; over-length moments are NOT clamped from the start —
+  `cut.clip_bounds` centers the clip window on the moment's peak. Every speech moment now
+  carries an RMS energy `peak` (`index._energy_peak`), so cold-open can fire on speech too.
 - `common.py` forces UTF-8 on stdout/stderr — Windows consoles are cp1252 and crash on
   caption emoji / status glyphs otherwise.
 - Grid/list card work lives in a different project (`scout`); this repo is unrelated.

@@ -62,7 +62,7 @@ def main():
 
         rms_arr = np.array(rms, dtype=np.float32)
         spikes = IX._spike_moments(rel, rms_arr)
-        speech = IX._speech_moments(rel, transcript)
+        speech = IX._speech_moments(rel, transcript, rms_arr)   # speech peaks from RMS
         C.log(f"  {name}: {len(spikes)} spike + {len(speech)} speech moment(s) "
               f"(transcript reused, {len(transcript)} segs).")
         out_sources.append({"source": rel, "duration_sec": round(duration, 2),

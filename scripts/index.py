@@ -171,14 +171,30 @@ def _spike_moments(source, rms):
     return moments
 
 
-def _speech_moments(source, transcript):
+def _energy_peak(rms, start, end):
+    """Absolute second of the loudest RMS window inside [start, end) — the most-
+    emphasized point of a speech moment. `rms` is the per-second RMS array. Returns None
+    if there's no RMS (e.g. offline mode never builds a transcript anyway)."""
+    if rms is None or len(rms) == 0:
+        return None
+    lo = max(0, min(int(np.floor(start)), len(rms) - 1))
+    hi = max(lo + 1, min(int(np.ceil(end)), len(rms)))
+    window = rms[lo:hi]
+    if len(window) == 0:
+        return None
+    return float(lo + int(np.argmax(window)))
+
+
+def _speech_moments(source, transcript, rms=None):
     out = []
     for seg in transcript:
-        # no audio-spike anchor for pure speech, so peak is None (cold-open only fires
-        # on separable audio peaks; speech clips play chronologically).
+        # Give EVERY speech moment an energy peak (loudest second in its span) so the
+        # cut stage's cold-open can fire on speech clips too — and so an over-length
+        # merged moment is centered on its peak instead of clamped from the start.
+        peak = _energy_peak(rms, seg["start"], seg["end"])
         out.append({"source": source, "start": seg["start"], "end": seg["end"],
                     "type": "speech", "intensity": round(len(seg["text"]) / 10.0, 2),
-                    "peak": None, "text": seg["text"]})
+                    "peak": peak, "text": seg["text"]})
     return out
 
 
@@ -230,7 +246,8 @@ def index_source(entry, state, do_transcribe):
         audio_wav.unlink()
 
     rms = np.array(rms_vals, dtype=np.float32)
-    moments = _spike_moments(entry["path"], rms) + _speech_moments(entry["path"], transcript)
+    moments = (_spike_moments(entry["path"], rms)
+               + _speech_moments(entry["path"], transcript, rms))
     return {"source": entry["path"], "duration_sec": round(duration, 2),
             "safe_margin": entry.get("safe_margin", False),
             "transcript": transcript, "moments": moments}

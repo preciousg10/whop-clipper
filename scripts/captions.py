@@ -209,13 +209,17 @@ def _nearby_transcript(tr_segs, start, end, pad_pre=10.0, pad_post=4.0, limit=40
     return " ".join(parts).strip()[:limit]
 
 
-def _groq_candidates(client, campaign, moment, style_notes, event=""):
+def _groq_candidates(client, campaign, moment, style_notes, event="", emoji_in_caption=True):
     event = (event or moment.get("text") or "").strip()
+    emoji_rule = (
+        "all lowercase, end with 1-2 emoji as punctuation (from: 😭 💀 🔥 👀 ✌️ 🥀 😳 🤣), "
+        if emoji_in_caption else
+        "all lowercase, NO emoji, ")
     system = (
         "You write TOP captions for viral vertical sports/gaming/racing clips. The "
         "caption's ONLY job is to make the payoff feel MANDATORY to watch, and it MUST "
         "reference the ACTUAL event in THIS clip (use the transcript / what happens), "
-        "NOT a generic phrase. RULES: ONE line, MAX 8 words, casual grammar, NO emoji, "
+        "NOT a generic phrase. RULES: ONE line, MAX 8 words, casual grammar, " + emoji_rule +
         "NO hashtags. Every caption MUST use one of these five proven hook patterns:\n"
         "  1) open question — 'how did the yellow hamster win THIS'\n"
         "  2) stakes — '$10k on the line and he does THIS'\n"
@@ -289,20 +293,21 @@ def _strip_symbols(text):
     return re.sub(r"\s{2,}", " ", ascii_only).strip()
 
 
-def title_case(text):
-    """Capitalize the first letter of every word (e.g. 'wait for the jump' -> 'Wait For
-    The Jump'). Only a leading ALPHA char is upper-cased, so digit-led words stay natural
-    ('2nd' -> '2nd', '38kg' -> '38kg'); the rest of each word is untouched ('THIS' stays
-    'THIS')."""
-    def cap(w):
-        return (w[0].upper() + w[1:]) if w[:1].isalpha() else w
-    return " ".join(cap(w) for w in text.split())
+def finalize_caption(text, emoji_in_caption=True):
+    """Every caption that reaches a clip is normalized here — flzsh DNA:
 
+      - LOWERCASE energy, ALWAYS. Never Title Case (accountA.md: 'casual grammar,
+        lowercase energy'; canonical 'bro lost the whole run in 10 seconds 😭✌️').
+      - Emoji are punctuation: kept when `emoji_in_caption` (default), stripped when off.
 
-def finalize_caption(text):
-    """Every caption that reaches a clip goes through here: emoji/symbols stripped,
-    then forced to Title Case. Applied to ALL clips, template fallbacks included."""
-    return title_case(_strip_symbols(text)) or "Clip"
+    The banned-word gauntlet and hook-pattern gate have already run upstream; this only
+    fixes case/emoji. Rendering (cut.render_caption_png) drops any emoji the font can't
+    draw, so a preserved emoji never becomes a tofu box."""
+    text = " ".join((text or "").split())
+    if not emoji_in_caption:
+        text = _strip_symbols(text)
+    text = text.lower().strip()
+    return text or "clip"
 
 
 def run(state):
@@ -313,6 +318,8 @@ def run(state):
     # Gauntlet screens both banned words AND banned topics from intake's analysis.
     banned = list(rules.get("banned_words", C.DEFAULT_BANNED_WORDS)) + list(rules.get("banned_topics", []))
     campaign = rules.get("campaign", state.get("campaign") or "campaign")
+    cfg = state.get("config", {})
+    emoji_in_caption = bool(cfg.get("emoji_in_caption", True))   # flzsh: emoji as punctuation
     # Per-source transcript, so a text-less audio_spike can borrow the caster's nearby
     # reaction and get a SPECIFIC caption instead of a generic template.
     moments_doc = C.load_json(C.MOMENTS_JSON) or {}
@@ -330,7 +337,8 @@ def run(state):
         event = (m.get("text") or "").strip() or _nearby_transcript(
             tr_by_source.get(m["source"], []), float(m["start"]), float(m["end"]))
         cands = _offline_candidates(m) if client is None else _groq_candidates(
-            client, campaign, m, "stakes+outcome+emotion, specific to the clip", event)
+            client, campaign, m, "stakes+outcome+emotion, specific to the clip", event,
+            emoji_in_caption)
         # normalize: one line, lowercase energy (flzsh)
         cands = [" ".join(c.split()).lower() for c in cands if c and c.strip()]
         # gauntlet 1: banned words (HARD — these can never ship)
@@ -357,9 +365,10 @@ def run(state):
             C.warn(f"moment {m['id']}: no usable Groq caption — generic curiosity fallback.")
             pool = ["you have to see this"]
         ranked = sorted(pool, key=score_caption, reverse=True)
-        # ALL captions on ALL clips: emoji-stripped + Title Case, no exceptions.
-        best = finalize_caption(ranked[0])
-        variant = finalize_caption(ranked[1]) if len(ranked) > 1 else None
+        # ALL captions on ALL clips: lowercase energy; emoji kept as punctuation unless
+        # the campaign config turns them off.
+        best = finalize_caption(ranked[0], emoji_in_caption)
+        variant = finalize_caption(ranked[1], emoji_in_caption) if len(ranked) > 1 else None
         clips.append({
             "moment_id": m["id"], "source": m["source"],
             "start": m["start"], "end": m["end"], "type": m["type"],

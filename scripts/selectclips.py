@@ -111,9 +111,14 @@ def _candidate_rank(m):
     return action * 4.0 + base * 2.0
 
 
-def merge_close(moments, gap):
+def merge_close(moments, gap, max_span=60.0):
     """Merge moments in the same source whose gap < `gap` seconds into one moment
-    (union bounds, max intensity, joined text). Kills same-event duplication."""
+    (union bounds, max intensity, joined text). Kills same-event duplication.
+
+    HARD CAP: never let a merged moment grow past `max_span` seconds. Non-stop
+    commentary used to chain into 400-550s blobs (m2440 spanned 552s) that the cut
+    stage then clamped to an arbitrary window — a tight gap plus this cap keeps a merged
+    moment a single real beat, and cut.clip_bounds centers the clip on its peak."""
     from collections import defaultdict
     by_src = defaultdict(list)
     for m in moments:
@@ -123,7 +128,8 @@ def merge_close(moments, gap):
         ms.sort(key=lambda x: x["start"])
         cur = None
         for m in ms:
-            if cur and m["start"] - cur["end"] <= gap:
+            if (cur and m["start"] - cur["end"] <= gap
+                    and max(cur["end"], m["end"]) - cur["start"] <= max_span):
                 cur["end"] = max(cur["end"], m["end"])
                 if m.get("intensity", 0) > cur.get("intensity", 0):
                     cur["intensity"] = m["intensity"]
@@ -287,7 +293,10 @@ def run(state):
     cfg = state.get("config", {})
     n = int(cfg.get("clips_per_batch", 10))
     min_sep = float(cfg.get("min_separation_seconds", 60))
-    merge_gap = float(cfg.get("merge_gap_seconds", 15))
+    # merge_gap was 15s, which chained non-stop commentary into 400-550s blobs. Tight
+    # gap (~7s) + a hard span cap keep a merged moment one real beat.
+    merge_gap = float(cfg.get("merge_gap_seconds", 7))
+    merge_max_span = float(cfg.get("merge_max_span_seconds", 60))
 
     moments = data.get("moments", [])
     raw_count = len(moments)
@@ -300,7 +309,7 @@ def run(state):
             m["text"] = _nearby_text(tr_by_source.get(m["source"], []),
                                      float(m["start"]), float(m["end"]))
     moments = [m for m in moments if not _is_filler(m)]                 # kill filler
-    moments = merge_close(moments, merge_gap)                           # merge same-event
+    moments = merge_close(moments, merge_gap, merge_max_span)           # merge same-event
     moments = dedup(moments)                                            # drop already-posted
     C.log(f"moments: {raw_count} raw -> {len(moments)} after filler-kill + merge + dedup.")
     if not moments:

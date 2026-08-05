@@ -24,6 +24,15 @@ CAPTION_BOX_W = 1000
 CAPTION_TOP_Y = 175           # below the top 8% (~154px) TikTok UI safe zone
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
+# --- burned subtitle safe zone (from campaign/assets/Safezones *.png) ----------
+# The TikTok/IG safe box narrows on the RIGHT below ~45% height (the like/comment/
+# share/profile action rail) and the bottom ~18-20% is the caption+UI zone. Running
+# subtitles therefore sit CENTERED and NARROW in the lower-middle: clear of (a) the hook
+# caption plate up top, (b) the bottom-right watermark, and (c) the bottom UI zone. A
+# 640px centered box (x 220-860) stays inside the action-rail notch (~x<870).
+SUBTITLE_BOX_W = 640
+SUBTITLE_CENTER_Y = 1240      # ~65% down: lower-middle, above the bottom UI zone (~1536)
+
 # --- cold-open restructure (the biggest hook lever) ----------------------------
 COLD_OPEN_DUR = 2.0           # target length of the peak teaser (spec: 1.5–2.5s)
 COLD_OPEN_MIN = 1.5           # never shorter than this or it reads as a glitch
@@ -81,6 +90,70 @@ def strip_emoji(text):
     return re.sub(r"\s{2,}", " ", EMOJI_RE.sub("", text)).strip()
 
 
+# --- emoji tofu handling -------------------------------------------------------
+# We can't read the emoji font's cmap without fontTools, and Segoe UI Emoji draws
+# UNSUPPORTED code points as a visible .notdef box that a pixel/bbox probe can't tell
+# apart from a real glyph. So to guarantee "drop a tofu, never render one" we render
+# only code points we KNOW the color-emoji fonts (Segoe UI Emoji / Noto) carry — the
+# flzsh punctuation set — and drop anything else. If fontTools ever gets installed we
+# honor the live cmap instead (more permissive). Combiners (VS16 / ZWJ / skin tones)
+# always pass through with their base glyph.
+_ALLOWED_EMOJI_CP = {
+    0x1F62D,  # 😭 loudly crying     0x1F480,  # 💀 skull
+    0x1F525,  # 🔥 fire              0x1F440,  # 👀 eyes
+    0x270C,   # ✌ victory hand      0x1F64F,  # 🙏 folded hands
+    0x1F940,  # 🥀 wilted flower     0x1F633,  # 😳 flushed
+    0x1F923,  # 🤣 rofl              0x1F602,  # 😂 joy
+    0x1F605,  # 😅 sweat smile       0x1F624,  # 😤 huffing
+    0x1F631,  # 😱 screaming         0x1F4AF,  # 💯 hundred
+    0x26A1,   # ⚡ high voltage       0x1F439,  # 🐹 hamster
+    0x1F3C1,  # 🏁 chequered flag    0x1F3CE,  # 🏎 racing car
+    0x1F971,  # 🥱 yawn              0x1F97A,  # 🥺 pleading
+    0x1F44F,  # 👏 clap              0x1F621,  # 😡 pouting
+}
+_EMOJI_COMBINER_CP = {0xFE0F, 0x200D}                 # VS16, zero-width joiner
+
+
+def _emoji_cmap(font_path):
+    """Live cmap of the emoji font via fontTools if it's installed, else None (we then
+    fall back to the curated allowlist). Cached per font path."""
+    cache = _emoji_cmap.__dict__.setdefault("_c", {})
+    if font_path not in cache:
+        try:
+            from fontTools.ttLib import TTFont
+            tt = TTFont(font_path, fontNumber=0, lazy=True)
+            cache[font_path] = tt.getBestCmap()
+            tt.close()
+        except Exception:
+            cache[font_path] = None
+    return cache[font_path]
+
+
+def _emoji_renderable(cp, font_path):
+    cmap = _emoji_cmap(font_path)
+    return (cp in cmap) if cmap is not None else (cp in _ALLOWED_EMOJI_CP)
+
+
+def _drop_unrenderable_emoji(text, font_path):
+    """Remove emoji code points the font can't draw (would be a tofu box); keep base
+    text, combiners, and skin-tone modifiers. Never raises."""
+    out = []
+    for ch in text:
+        cp = ord(ch)
+        is_emoji = bool(EMOJI_RE.match(ch)) and cp not in _EMOJI_COMBINER_CP \
+            and not (0x1F3FB <= cp <= 0x1F3FF)
+        if is_emoji and not _emoji_renderable(cp, font_path):
+            continue                                   # tofu → drop this emoji only
+        out.append(ch)
+    return re.sub(r"\s{2,}", " ", "".join(out)).strip()
+
+
+def _keep_ascii_and_emoji(text):
+    """Collapse whitespace, keep ASCII + emoji/combiners, drop stray other non-ASCII."""
+    out = [ch for ch in (text or "") if ord(ch) < 128 or EMOJI_RE.match(ch)]
+    return re.sub(r"\s{2,}", " ", "".join(out)).strip()
+
+
 def strip_to_ascii(text):
     """Drop EVERY non-ASCII character (all emoji + symbol glyphs, not just the ranges
     EMOJI_RE knows) and collapse the whitespace they leave behind. This is the hard,
@@ -135,13 +208,20 @@ def _wrap_cells(cells, inner, max_lines):
     return lines[:max_lines] if lines else [[]]
 
 
-def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=6):
-    """Bold white + black outline caption. ALL emoji and non-ASCII symbols are
-    hard-stripped here (the final render step) so none can ever reach the video,
-    regardless of what upstream produced or which emoji fonts are installed."""
+def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=6,
+                       emoji=True):
+    """Bold white + black outline hook caption (flzsh: lowercase, emoji as punctuation).
+
+    When `emoji` is on we render emoji with a color-emoji font (Segoe UI Emoji / Noto)
+    and DROP any glyph the font can't draw (never a tofu box). When off — or when no
+    emoji font is installed — every non-ASCII char is hard-stripped, the old guaranteed
+    no-emoji gate."""
     text_font_path = find_bold_font()
-    emoji_font_path = None                       # emoji are stripped, never rendered
-    text = strip_to_ascii(text or "clip")
+    emoji_font_path = find_emoji_font() if emoji else None
+    if emoji_font_path:
+        text = _drop_unrenderable_emoji(_keep_ascii_and_emoji(text), emoji_font_path)
+    else:
+        text = strip_to_ascii(text or "clip")
     text = (text or "clip").strip() or "clip"
 
     scratch = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
@@ -178,6 +258,171 @@ def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=
         y += line_h
     img.save(out_path)
     return out_path
+
+
+# --- burned karaoke-style subtitles --------------------------------------------
+# TIMING APPROACH: we RE-TRANSCRIBE the finished 30s clip rather than remapping source
+# word timestamps. The clip is restructured (cold-open reorder + dead-air trims), so
+# source timings would desync; a fresh 30s whisper pass is edit-proof and takes seconds
+# on CPU. Subtitles are a SEPARATE layer from the hook caption and are gated off in
+# offline mode (no whisper) and by config `subtitles_enabled=false`.
+_sub_model = None
+
+
+def _subtitle_model():
+    global _sub_model
+    if _sub_model is None:
+        from faster_whisper import WhisperModel        # lazy: cut.py must import w/o it
+        C.log("loading faster-whisper 'base' for subtitle timing (CPU, int8)…")
+        _sub_model = WhisperModel("base", device="cpu", compute_type="int8")
+    return _sub_model
+
+
+def transcribe_clip_words(clip_path):
+    """Clip-relative word timings from a whisper pass on the FINAL clip. Best-effort:
+    returns [] (ship without subtitles) if whisper is missing or transcription fails."""
+    try:
+        model = _subtitle_model()
+    except ImportError:
+        C.warn("faster-whisper not installed — skipping burned subtitles.")
+        return []
+    try:
+        segments, _info = model.transcribe(str(clip_path), word_timestamps=True)
+        words = []
+        for seg in segments:
+            for w in (seg.words or []):
+                t = (w.word or "").strip()
+                if t:
+                    words.append({"word": t, "start": float(w.start), "end": float(w.end)})
+        return words
+    except Exception as e:
+        C.warn(f"subtitle transcription failed ({e}) — shipping clip without subtitles.")
+        return []
+
+
+def _mask_banned_word(word, banned):
+    """Mask any campaign-banned word before it can be burned into a subtitle
+    ('bet' -> 'b**', 'gambling' -> 'g*******'). Surrounding punctuation is preserved;
+    clean words pass through untouched. A banned word in a subtitle = campaign violation,
+    so this is the FIRST line of defense (cut.py re-checks the whole chunk after)."""
+    from captions import banned_hit
+    m = re.match(r"^(\W*)(.*?)(\W*)$", word, re.S)
+    pre, core, post = m.group(1), m.group(2), m.group(3)
+    if core and banned_hit(core, banned):
+        core = (core[0] + "*" * (len(core) - 1)) if len(core) > 1 else "*"
+    return pre + core + post
+
+
+def _chunk_words(words, banned, size=3, max_gap=0.7):
+    """Group scrubbed words into short synced phrase chunks (<= `size` words; a new
+    chunk also starts after a >max_gap pause). Each chunk carries clip-relative start/end."""
+    chunks, cur = [], []
+    for w in words:
+        tok = _mask_banned_word(w["word"].strip(), banned)
+        if not tok:
+            continue
+        if cur and (len(cur) >= size or w["start"] - cur[-1]["end"] > max_gap):
+            chunks.append(_finish_chunk(cur)); cur = []
+        cur.append({"tok": tok, "start": w["start"], "end": w["end"]})
+    if cur:
+        chunks.append(_finish_chunk(cur))
+    return chunks
+
+
+def _finish_chunk(cur):
+    return {"text": " ".join(c["tok"] for c in cur).strip(),
+            "start": round(cur[0]["start"], 3), "end": round(cur[-1]["end"], 3)}
+
+
+def render_subtitle_png(text, out_path, cfg, box_w=SUBTITLE_BOX_W, max_lines=2, stroke=5):
+    """A subtitle phrase chunk: bold white + black outline on a semi-transparent rounded
+    plate, centered. TikTok-native, and a distinct style/layer from the hook caption.
+    Returns the PNG height so the caller can vertically center it in the safe zone."""
+    font_path = find_bold_font()
+    text = strip_to_ascii(text or "").strip() or " "
+    scratch = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
+    inner = box_w - 2 * stroke - 24
+    size, lines, tf = 60, [[]], None
+    while size >= 28:
+        tf = ImageFont.truetype(font_path, size)
+        lines = _wrap_cells(_cells(text, tf, None, scratch), inner, max_lines)
+        if len(_wrap_cells(_cells(text, tf, None, scratch), inner, max_lines + 1)) <= max_lines:
+            break
+        size -= 4
+    ascent, descent = tf.getmetrics()
+    line_h = ascent + descent + 6
+    pad_x, pad_y = 26, 14
+    maxw = max((sum(c["w"] for c in ln) for ln in lines), default=0.0)
+    img_h = line_h * len(lines) + 2 * pad_y
+    img = Image.new("RGBA", (box_w, img_h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    if bool(cfg.get("subtitle_plate", True)) and maxw > 0:
+        pw = min(float(box_w), maxw + 2 * pad_x)
+        px0 = (box_w - pw) / 2
+        d.rounded_rectangle([px0, 0, px0 + pw, img_h], radius=22, fill=(0, 0, 0, 130))
+    y = pad_y
+    for ln in lines:
+        total = sum(c["w"] for c in ln)
+        x = (box_w - total) / 2
+        for c in ln:
+            d.text((x, y), c["s"], font=c["font"], fill="white",
+                   stroke_width=stroke, stroke_fill="black")
+            x += c["w"]
+        y += line_h
+    img.save(out_path)
+    return img_h
+
+
+def _subtitle_overlay_cmd(body_path, out_path, chunks, cfg, has_audio):
+    center_y = int(cfg.get("subtitle_center_y", SUBTITLE_CENTER_Y))
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(body_path)]
+    for ch in chunks:
+        cmd += ["-i", str(ch["_png"])]
+    fc, prev = [], "[0:v]"
+    for i, ch in enumerate(chunks):
+        y = int(center_y - ch["_h"] / 2)
+        out = "[vout]" if i == len(chunks) - 1 else f"[sv{i}]"
+        # eof_action=repeat keeps the single-frame PNG available for the whole clip;
+        # enable gates it to the phrase's [start,end]. Audio is copied (no re-encode).
+        fc.append(f"{prev}[{i + 1}:v]overlay=x=(W-w)/2:y={y}:eof_action=repeat:"
+                  f"enable='between(t,{ch['start']:.3f},{ch['end']:.3f})'{out}")
+        prev = out
+    cmd += ["-filter_complex", ";".join(fc), "-map", "[vout]"]
+    if has_audio:
+        cmd += ["-map", "0:a?", "-c:a", "copy"]
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out_path)]
+    return cmd
+
+
+def burn_subtitles(body_path, out_path, cfg, banned, tag, has_audio):
+    """Transcribe the FINAL clip, chunk into short synced phrases, scrub banned words,
+    and overlay karaoke-style subtitle PNGs into `out_path`. Returns True if subtitles
+    were burned, False if there was nothing to burn (body moved to out_path as-is)."""
+    if not has_audio:
+        os.replace(body_path, out_path); return False
+    chunks = _chunk_words(transcribe_clip_words(body_path), banned)
+    if not chunks:
+        os.replace(body_path, out_path); return False
+
+    from captions import banned_hit
+    for i, ch in enumerate(chunks):
+        png = C.DRAFTS / f".sub_{tag:02d}_{i:03d}.png"
+        ch["_h"] = render_subtitle_png(ch["text"], png, cfg)
+        ch["_png"] = png
+        # DEFENSE-IN-DEPTH: same gauntlet pattern as captions — a banned word must never
+        # reach a burned subtitle. Masking above should have caught it; abort if not.
+        if banned_hit(ch["text"], banned):
+            for c in chunks:
+                if c.get("_png"):
+                    c["_png"].unlink(missing_ok=True)
+            C.fail(f"banned word slipped into a subtitle chunk ({ch['text']!r}) — aborting.")
+
+    C.run_cmd(_subtitle_overlay_cmd(body_path, out_path, chunks, cfg, has_audio),
+              desc=f"burning {len(chunks)} subtitle chunk(s) into {out_path.name}")
+    for ch in chunks:
+        ch["_png"].unlink(missing_ok=True)
+    return True
 
 
 # --- assets --------------------------------------------------------------------
@@ -218,11 +463,24 @@ def find_watermark(cfg=None):
 def clip_bounds(m, duration, cmin, cmax, pre=20.0, post=15.0):
     """Expand the moment to a complete beat: back to its setup (up to `pre`) and
     forward to its resolution (up to `post`), then clamp to [cmin, cmax] and the
-    source duration."""
+    source duration.
+
+    When the beat is longer than cmax we do NOT clamp from the start (that shipped an
+    arbitrary opening window off a long merged moment). Instead we CENTER the cmax window
+    on the moment's peak-intensity second (audio spike or, since Task 3, a speech moment's
+    loudest second), so the payoff stays in frame and the cold-open has its anchor."""
     s = float(m["start"]) - pre
     e = float(m["end"]) + post
-    if e - s > cmax:                 # too long: keep setup, cap length
-        e = s + cmax
+    if e - s > cmax:                 # too long: center the window on the peak
+        peak = m.get("peak")
+        try:
+            center = float(peak) if peak is not None else None
+        except (TypeError, ValueError):
+            center = None
+        if center is None:
+            center = (float(m["start"]) + float(m["end"])) / 2.0
+        s = center - cmax / 2.0
+        e = center + cmax / 2.0
     if e - s < cmin:                 # too short: pad symmetrically
         pad = (cmin - (e - s)) / 2
         s, e = s - pad, e + pad
@@ -482,8 +740,12 @@ def run(state):
     pre = float(cfg.get("story_pre_seconds", 20))
     post = float(cfg.get("story_post_seconds", 15))
     layout = str(cfg.get("layout", "blur_fill")).lower()
+    emoji_in_caption = bool(cfg.get("emoji_in_caption", True))
+    # Burned subtitles need a whisper pass on each final clip → off in offline mode.
+    subs_on = bool(cfg.get("subtitles_enabled", True)) and not C.offline_mode()
     C.log(f"== cut layout mode: {layout} "
-          f"({'whole frame on blurred bg, no crop' if layout != 'crop_fill' else 'COVER + center-crop'}) ==")
+          f"({'whole frame on blurred bg, no crop' if layout != 'crop_fill' else 'COVER + center-crop'}) "
+          f"| emoji_in_caption={emoji_in_caption} | subtitles={'on' if subs_on else 'off'} ==")
     watermark = find_watermark(cfg)
     C.log(f"watermark: {watermark.name}")
 
@@ -529,16 +791,27 @@ def run(state):
         name = f"{rank:02d}_{score_i:03d}_{slugify(c['caption'])}.mp4"
         out_path = C.DRAFTS / name
         cap_png = C.DRAFTS / f".cap_{rank:02d}.png"
-        render_caption_png(c["caption"], cap_png)
-        compose(src_path, start, end, segments, cold_open, cap_png, watermark, out_path,
-                cfg, has_audio, n_audio)
+        render_caption_png(c["caption"], cap_png, emoji=emoji_in_caption)
+        subtitled = False
+        if subs_on:
+            # Compose to a temp body, THEN transcribe + burn subtitles into out_path so
+            # the whisper pass sees the final (cut/reordered) edit.
+            body = C.DRAFTS / f".body_{rank:02d}.mp4"
+            compose(src_path, start, end, segments, cold_open, cap_png, watermark, body,
+                    cfg, has_audio, n_audio)
+            subtitled = burn_subtitles(body, out_path, cfg, banned, rank, has_audio)
+            body.unlink(missing_ok=True)
+        else:
+            compose(src_path, start, end, segments, cold_open, cap_png, watermark, out_path,
+                    cfg, has_audio, n_audio)
         cap_png.unlink(missing_ok=True)
-        C.log(f"  {'cold-open ' if cold_open else ''}cut {name}")
+        C.log(f"  {'cold-open ' if cold_open else ''}{'subtitled ' if subtitled else ''}cut {name}")
 
         manifest.append({
             "filename": name, "caption": c["caption"], "variant": c.get("variant"),
             "source": c["source"], "source_start": start, "source_end": end,
-            "cold_open": cold_open, "dead_air_trimmed": len(keeps) > 1, "score": c.get("score"),
+            "cold_open": cold_open, "dead_air_trimmed": len(keeps) > 1,
+            "subtitles": subtitled, "score": c.get("score"),
             "tiktok_caption": c["tiktok_caption"], "shorts_title": c["shorts_title"],
             "reels_hashtags": c["reels_hashtags"],
             "suggested_post_window": c["suggested_post_window"],
