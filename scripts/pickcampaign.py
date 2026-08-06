@@ -1,21 +1,26 @@
 """STAGE -1 — PICK CAMPAIGN. The Scout -> Clipper handoff.
 
 Scout ranks campaigns and writes them to scout/campaigns.json. This module reads that
-ranking, selects the #1 rankable campaign (by Scout's existing composite score), resolves
-it to something intake can actually run on, and writes the brief + footage links into
+ranking, WALKS it top-down (highest composite first), and picks the FIRST campaign that
+passes the clippability preconditions — writing its brief + footage links into
 campaign_inputs/ so `intake.py --from-pick` can take over. It is the front of the chain:
 
-    scout (rank) -> pickcampaign (select #1 + write inputs) -> intake (--from-pick) -> run
+    scout (rank) -> pickcampaign (walk -> first clippable + write inputs) -> intake -> run
 
-Fail-loud discipline (instructions.md): we NEVER silently proceed on a campaign we can't
-clip. A #1 pick with no footage links and no locator is reported and STOPS the chain — we
-do not skip to #2 (that would hide a ranking/scout problem), and we do not fabricate a
-source. Live re-scraping of Whop belongs to scout (it owns the logged-in browser); this
-module only reads what scout already captured and, when it can't, tells the user exactly
-what to open.
+Preconditions (dry, no downloads — we check for the PRESENCE of a footage link, we never
+fetch it here; the real download happens in intake): a campaign must (1) not be on scout's
+done list, (2) have readable rules (banned-word compliance depends on it — rules_unreadable
+campaigns are skipped), and (3) have at least one footage link (Drive folder / VOD / video).
 
-    python scripts/pickcampaign.py                     # pick #1 from scout/campaigns.json
-    python scripts/pickcampaign.py --rank 2            # manual override: take the Nth pick
+Fail-loud discipline (instructions.md): we never silently clip a campaign we can't verify.
+Every skipped campaign is printed with its specific reason. A SAFETY CAP (--max-walk, default
+10) bounds the walk: if none of the top N are clippable we STOP and fail loud with the full
+skip list — better than churning through 400. Live re-scraping of Whop belongs to scout (it
+owns the browser); this module only READS scout's campaigns.json, never writes to it.
+
+    python scripts/pickcampaign.py                     # walk from #1, pick first clippable
+    python scripts/pickcampaign.py --max-walk 20        # look deeper before giving up
+    python scripts/pickcampaign.py --rank 3            # manual override: force a specific rank
     python scripts/pickcampaign.py --scout-dir D:/whop/scout
 """
 import argparse
@@ -35,6 +40,8 @@ LINKS_TXT = INPUTS_DIR / "links.txt"
 PICK_JSON = INPUTS_DIR / "pick.json"
 
 RANKABLE_STATUSES = ("scraped", "refreshed")
+DEFAULT_MAX_WALK = 10        # safety cap: only walk the top N ranked campaigns looking for a
+                             # clippable one; if none pass, fail loud rather than churn 400.
 
 
 # --- ranking (mirrors scout/report.py sort so the clipper and scout agree on "#1") -----
@@ -188,6 +195,59 @@ def footage_links(c):
     return out
 
 
+# --- clippability preconditions (dry — presence checks only, no downloads) -----
+def _load_done_ids(scout_dir):
+    """Scout's campaign-level DONE list (completed_campaigns.json in the scout dir). Scout
+    already marks these status='completed' so they usually never reach the ranked set, but we
+    also honor the list directly in case campaigns.json wasn't regenerated after a --mark-done.
+    Accepts {"completed": [...]} or a bare list; ids may be strings or {"id": ...}. Never raises."""
+    p = os.path.join(scout_dir, "completed_campaigns.json")
+    if not os.path.exists(p):
+        return set()
+    try:
+        data = json.loads(open(p, encoding="utf-8").read())
+        items = data.get("completed", []) if isinstance(data, dict) else data
+        return {(x.get("id") if isinstance(x, dict) else x) for x in items if x}
+    except Exception:
+        return set()
+
+
+def _rules_readable(c):
+    """(readable, reason). Scout resolves rules_source per campaign; we must not clip one whose
+    banned-word list is unknown. rules_unreadable is a hard skip. Old records without the field
+    fall back to whether ANY rules text/doc was captured."""
+    if c.get("rules_unreadable"):
+        return False, "rules unreadable (rules only in a Notion page scout couldn't read)"
+    src = c.get("rules_source")
+    if src in ("modal", "gdoc", "notion"):
+        return True, None
+    if src in ("unreadable",):
+        return False, "rules unreadable"
+    if src == "none":
+        return False, "no readable rules found on the campaign"
+    # Older scout data without rules_source: allow only if some rules content was captured.
+    if c.get("modal_requirements_text") or (c.get("rules_text") or "").strip() or c.get("resource_links"):
+        return True, None
+    return False, "no rules captured (can't verify banned words)"
+
+
+def clippable(c, done_ids):
+    """(ok, reason) — dry preconditions a campaign must pass to be worth committing to, checked
+    WITHOUT downloading anything (presence of a footage link, not a fetch of it):
+      1. not on the done/posted list,
+      2. rules are readable (banned-word compliance depends on it),
+      3. has at least one footage link (Drive folder / VOD / video source).
+    Returns the FIRST failing reason so the skip line is specific."""
+    if c.get("id") in done_ids:
+        return False, "already done (on scout's completed list)"
+    ok, why = _rules_readable(c)
+    if not ok:
+        return False, why
+    if not footage_links(c):
+        return False, "no footage link (no Drive folder / VOD / video source)"
+    return True, None
+
+
 # --- main ----------------------------------------------------------------------
 def load_scout_campaigns(scout_json):
     if not os.path.exists(scout_json):
@@ -203,62 +263,14 @@ def load_scout_campaigns(scout_json):
     return campaigns
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Stage -1 — pick scout's #1 campaign for the clipper.")
-    ap.add_argument("--scout-dir", default=DEFAULT_SCOUT_DIR,
-                    help=f"scout project dir (default {DEFAULT_SCOUT_DIR})")
-    ap.add_argument("--scout-json", help="explicit path to scout's campaigns.json "
-                    "(overrides --scout-dir)")
-    ap.add_argument("--rank", type=int, default=1,
-                    help="1-based rank to pick (default 1 = scout's #1). A manual override; "
-                         "the default takes the top-ranked campaign.")
-    args = ap.parse_args()
-
-    scout_json = args.scout_json or os.path.join(args.scout_dir, "campaigns.json")
-    campaigns = load_scout_campaigns(scout_json)
-    ranked = rank_campaigns(campaigns)
-    if not ranked:
-        C.fail("no rankable campaigns in scout's output (all disqualified, UNKNOWN-only, or "
-               "zero composite). Nothing to clip — re-run scout.")
-
-    # Show the shortlist so the pick is transparent and a manual --rank is easy.
-    C.log(f"scout ranked {len(ranked)} clippable candidate(s) (from {scout_json}):")
-    for i, c in enumerate(ranked[:8], 1):
-        marker = "->" if i == args.rank else "  "
-        C.log(f"  {marker} #{i}  comp {_composite(c):.4f}  {_core_known(c)}/5 known  "
-              f"{len(footage_links(c))} link(s)  {c.get('name')!r}")
-
-    if args.rank < 1 or args.rank > len(ranked):
-        C.fail(f"--rank {args.rank} is out of range (1..{len(ranked)}).")
-    pick = ranked[args.rank - 1]
-
+def _commit_pick(pick, rank, scout_json):
+    """Write the intake inputs (brief.txt, links.txt, pick.json) for the chosen campaign and
+    print the summary + next steps. Only called AFTER `clippable` passed, so links is non-empty."""
     name = pick.get("name") or "(unnamed campaign)"
     locator, how = resolve_locator(pick)
     resources = _resource_links(pick)
     links = footage_links(pick)
 
-    # FAIL LOUD: strict #1 (or chosen rank) with no downloadable footage. We do NOT skip to the
-    # next campaign (that hides a scout/ranking gap) and we do NOT scrape Whop from here (scout
-    # owns the browser). Show the resource links so the user can check a rules doc for footage.
-    if not links:
-        res_txt = "\n".join(f"    - {r['label']}: {r['url']}" for r in resources) or "    (none)"
-        C.fail(
-            f"picked #{args.rank} '{name}' but scout captured NO downloadable footage link for "
-            f"it (no source_links, and no footage folder among its resource links), so there is "
-            f"nothing to download and clip.\n\n"
-            f"  Locator ({how}): {locator}\n"
-            f"  Campaign id (identifier): {pick.get('campaign_id') or 'not captured'}\n"
-            f"  On-modal stats: {_fmt_stats(pick.get('modal_stats')) or 'none'}\n"
-            f"  Resource links captured (a rules doc may itself link the footage):\n{res_txt}\n\n"
-            "This campaign cannot be clipped until a footage link is available. Options:\n"
-            "  1. Open a resource link above — if the footage lives inside a rules doc, add its\n"
-            "     Drive/VOD link, then re-run this picker.\n"
-            "  2. Re-run scout to re-capture the campaign's links.\n"
-            "  3. Mark it done in scout (python scout.py --mark-done <id>) to drop it, then\n"
-            "     re-run this picker for the next campaign.\n"
-            f"  (scout id: {pick.get('id')})")
-
-    # Resolved + clippable: write the intake inputs.
     INPUTS_DIR.mkdir(parents=True, exist_ok=True)
     BRIEF_TXT.write_text(build_brief(pick, locator, how, resources), encoding="utf-8")
     LINKS_TXT.write_text("\n".join(links) + "\n", encoding="utf-8")
@@ -270,9 +282,10 @@ def main():
         "locator": locator,
         "locator_how": how,
         "locator_missing": bool(pick.get("locator_missing")),
-        "rank": args.rank,
+        "rank": rank,
         "composite_score": _composite(pick),
         "core_signals_known": _core_known(pick),
+        "rules_source": pick.get("rules_source"),
         "footage_links": links,
         "resource_links": resources,
         "modal_stats": pick.get("modal_stats"),
@@ -285,10 +298,11 @@ def main():
     C.save_json(PICK_JSON, meta)
 
     print("\n" + "=" * 66)
-    print(f"PICKED #{args.rank}: {name}")
+    print(f"PICKED #{rank}: {name}")
     print("=" * 66)
     print(f"  composite     : {_composite(pick):.4f}  ({_core_known(pick)}/5 core signals known)")
     print(f"  locator       : {locator}  ({how})")
+    print(f"  rules source  : {pick.get('rules_source') or 'unknown'}")
     print(f"  on-modal stats: {_fmt_stats(pick.get('modal_stats')) or 'none'}")
     print(f"  on-modal rules: {'yes' if pick.get('modal_requirements_text') else 'no'}"
           f"  ({len(pick.get('modal_requirements_text') or '')} chars)")
@@ -305,6 +319,75 @@ def main():
     print("    python scripts/intake.py --from-pick")
     print("    python scripts/run.py")
     print("=" * 66 + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Stage -1 — walk scout's ranking and pick the first clippable campaign.")
+    ap.add_argument("--scout-dir", default=DEFAULT_SCOUT_DIR,
+                    help=f"scout project dir (default {DEFAULT_SCOUT_DIR})")
+    ap.add_argument("--scout-json", help="explicit path to scout's campaigns.json "
+                    "(overrides --scout-dir)")
+    ap.add_argument("--max-walk", type=int, default=DEFAULT_MAX_WALK,
+                    help=f"safety cap: only consider the top N ranked campaigns (default "
+                         f"{DEFAULT_MAX_WALK}). If none of the top N are clippable, fail loud "
+                         f"rather than descend the whole list.")
+    ap.add_argument("--rank", type=int, default=None,
+                    help="manual override: force this exact 1-based rank (must pass the "
+                         "clippability preconditions, else fail loud). Default: walk from #1.")
+    args = ap.parse_args()
+
+    scout_json = args.scout_json or os.path.join(args.scout_dir, "campaigns.json")
+    scout_dir = os.path.dirname(scout_json) or "."
+    campaigns = load_scout_campaigns(scout_json)
+    ranked = rank_campaigns(campaigns)
+    if not ranked:
+        C.fail("no rankable campaigns in scout's output (all disqualified, rules-unreadable, "
+               "UNKNOWN-only, or zero composite). Nothing to clip — re-run scout.")
+    done_ids = _load_done_ids(scout_dir)
+
+    # Show the shortlist so the pick is transparent.
+    C.log(f"scout ranked {len(ranked)} candidate(s) (from {scout_json}); "
+          f"walking the top {min(args.max_walk, len(ranked))} for the first clippable one:")
+    for i, c in enumerate(ranked[:max(args.max_walk, 8)], 1):
+        C.log(f"    #{i}  comp {_composite(c):.4f}  {_core_known(c)}/5 known  "
+              f"{len(footage_links(c))} footage-link(s)  {c.get('name')!r}")
+
+    # Manual override: force a specific rank (old strict behavior for that one campaign).
+    if args.rank is not None:
+        if args.rank < 1 or args.rank > len(ranked):
+            C.fail(f"--rank {args.rank} is out of range (1..{len(ranked)}).")
+        pick = ranked[args.rank - 1]
+        ok, why = clippable(pick, done_ids)
+        if not ok:
+            C.fail(f"--rank {args.rank} '{pick.get('name')}' is not clippable: {why}. "
+                   "Drop --rank to walk to the first clippable campaign instead.")
+        _commit_pick(pick, args.rank, scout_json)
+        return
+
+    # Walk the top N; take the FIRST that passes all preconditions, logging every skip + reason.
+    cap = max(1, args.max_walk)
+    walked = ranked[:cap]
+    skips = []
+    for i, c in enumerate(walked, 1):
+        ok, why = clippable(c, done_ids)
+        if ok:
+            for sr, sc, sw in skips:
+                C.log(f"  skip #{sr}  {sc.get('name')!r} — {sw}")
+            C.log(f"  -> clippable at #{i}: {c.get('name')!r}")
+            _commit_pick(c, i, scout_json)
+            return
+        skips.append((i, c, why))
+
+    # None of the top N were clippable — STOP; do NOT descend the rest of the list.
+    lines = [f"    #{r}  {sc.get('name')!r} — {sw}" for r, sc, sw in skips]
+    remaining = len(ranked) - len(walked)
+    C.fail(
+        f"none of the top {len(walked)} ranked campaign(s) are clippable — stopping (not "
+        f"descending the remaining {remaining}). Why each was skipped:\n"
+        + "\n".join(lines) + "\n\n"
+        "Fix a footage link (add the Drive/VOD source), confirm rules are readable, or raise "
+        "--max-walk to look deeper. Re-run scout if its captures are stale.")
 
 
 if __name__ == "__main__":
