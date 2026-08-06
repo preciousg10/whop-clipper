@@ -61,8 +61,9 @@ def rank_campaigns(campaigns):
         c for c in campaigns
         if c.get("status") in RANKABLE_STATUSES
         and not c.get("disqualified")
+        and not c.get("rules_unreadable")   # scout excluded it: rules only in an unreadable source
         and _composite(c) > 0
-        and _core_known(c) > 0            # skip UNKNOWN-only (ranked on neutrals alone)
+        and _core_known(c) > 0              # skip UNKNOWN-only (ranked on neutrals alone)
     ]
     rankable.sort(key=lambda c: (_composite(c), _core_known(c), _pre_score(c)), reverse=True)
     return rankable
