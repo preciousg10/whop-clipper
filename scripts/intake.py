@@ -364,7 +364,10 @@ def build_ambiguities(rules, resources, llm_used):
     amb = []
     if not rules.get("payout_terms"):
         amb.append("No payout terms found — confirm rate/budget before producing.")
-    if not any(r.get("type") == "watermark" for r in rules.get("required_elements", [])):
+    has_watermark = any(r.get("type") == "watermark" for r in rules.get("required_elements", []))
+    # watermark_required=False is an explicit human confirmation that NONE is needed — don't
+    # re-prompt once it's been settled (preserved across re-intake of the same campaign).
+    if not has_watermark and rules.get("watermark_required") is not False:
         amb.append("No watermark requirement detected — confirm whether one is mandatory.")
     if not rules.get("submission_process"):
         amb.append("No submission process / deadline found — confirm how to submit.")
@@ -504,6 +507,13 @@ def main():
         C.warn("offline / no GROQ_API_KEY — skipping LLM extraction; deterministic rules only.")
     rules = AN.merge_rules(floor, llm)
     rules["campaign"] = args.campaign
+
+    # Preserve a human-confirmed watermark decision across re-intake of the SAME campaign, so a
+    # "watermark not required" confirmation isn't lost (and re-prompted) on every re-run. Guarded
+    # by a campaign-name match so a leftover flag from a different campaign never carries over.
+    prior_rules = C.load_json(C.RULES_JSON) or {}
+    if prior_rules.get("campaign") == args.campaign and "watermark_required" in prior_rules:
+        rules["watermark_required"] = prior_rules["watermark_required"]
 
     # Spatial constraints from reference images (flagged — never auto-guess margins).
     rules["spatial_constraints"] = [{

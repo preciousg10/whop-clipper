@@ -689,16 +689,23 @@ def build_compose_cmd(source, start, end, segments, cold_open, caption_png, wate
                   f"crop='min(iw,{W})':'min(ih,{H})',setsar=1[fg];")
         fc.append(f"[bg][fg]overlay=(W-w)/2:(H-h)/2[base];")
     # eof_action=repeat keeps the single-frame caption/watermark PNGs on-screen for
-    # the whole clip (otherwise they'd show for one frame).
-    fc.append(f"[base][1:v]overlay=(W-w)/2:{CAPTION_TOP_Y}:eof_action=repeat[cap];")
-    fc.append(f"[2:v]scale={wm_w}:-2[wm];")
-    fc.append(f"[cap][wm]overlay=W-w-{wm_margin}:H-h-{wm_margin + 20}:eof_action=repeat[vout]")
+    # the whole clip (otherwise they'd show for one frame). The watermark is OPTIONAL: when
+    # the campaign confirms none is required (watermark_png is None), we overlay only the
+    # caption and add no watermark input — so no stale/wrong watermark is ever burned in.
+    if watermark_png:
+        fc.append(f"[base][1:v]overlay=(W-w)/2:{CAPTION_TOP_Y}:eof_action=repeat[cap];")
+        fc.append(f"[2:v]scale={wm_w}:-2[wm];")
+        fc.append(f"[cap][wm]overlay=W-w-{wm_margin}:H-h-{wm_margin + 20}:eof_action=repeat[vout]")
+    else:
+        fc.append(f"[base][1:v]overlay=(W-w)/2:{CAPTION_TOP_Y}:eof_action=repeat[vout]")
 
     dur = round(end - start, 3)
     cmd = ["ffmpeg", "-y", "-v", "error",
            "-ss", f"{start}", "-t", f"{dur}", "-i", str(source),
-           "-i", str(caption_png), "-i", str(watermark_png),
-           "-filter_complex", "".join(fc), "-map", "[vout]"]
+           "-i", str(caption_png)]
+    if watermark_png:
+        cmd += ["-i", str(watermark_png)]
+    cmd += ["-filter_complex", "".join(fc), "-map", "[vout]"]
     if has_audio:
         cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "160k"]
     cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
@@ -750,8 +757,16 @@ def run(state):
     C.log(f"== cut layout mode: {layout} "
           f"({'whole frame on blurred bg, no crop' if layout != 'crop_fill' else 'COVER + center-crop'}) "
           f"| emoji_in_caption={emoji_in_caption} | subtitles={'on' if subs_on else 'off'} ==")
-    watermark = find_watermark(cfg)
-    C.log(f"watermark: {watermark.name}")
+    # Watermark is applied unless the campaign explicitly confirms none is required
+    # (rules.json watermark_required=false). This both proceeds without a watermark AND
+    # guards against burning a STALE/wrong watermark left in assets/ from a prior campaign.
+    if rules.get("watermark_required") is False:
+        watermark = None
+        C.log("watermark: not required for this campaign (rules.watermark_required=false) — "
+              "skipping; no watermark will be burned in.")
+    else:
+        watermark = find_watermark(cfg)
+        C.log(f"watermark: {watermark.name}")
 
     C.DRAFTS.mkdir(parents=True, exist_ok=True)
     clips = sorted(caps["clips"], key=lambda c: (c.get("score") or 0), reverse=True)
