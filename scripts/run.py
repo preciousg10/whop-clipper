@@ -48,6 +48,10 @@ DEFAULT_CONFIG = {
     "story_post_seconds": 4,       # end near the payoff — minimal resolution tail (max)
     "emoji_in_caption": True,      # flzsh DNA: keep emoji as caption punctuation
     "subtitles_enabled": True,     # burn synced karaoke-style spoken-word subtitles
+    # Caption/subtitle readability (understated but always legible on any background). The dark
+    # plate guarantees white-text contrast; keep the outline thin so it stays clean.
+    "plate_opacity": 120,          # dark plate alpha behind caption+subtitles (0-255; 0 = off)
+    "caption_outline_width": 2,    # text outline stroke in px for both (0 = no outline)
     "watermark_scale": 0.18,       # fraction of 1080px width
     "watermark_margin": 40,        # px from edges
     "watermark_file": None,        # exact/substring name in assets/; None = auto-pick

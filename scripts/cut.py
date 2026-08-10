@@ -211,14 +211,22 @@ def _wrap_cells(cells, inner, max_lines):
     return lines[:max_lines] if lines else [[]]
 
 
-def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=6,
-                       emoji=True):
-    """Bold white + black outline hook caption (Title Case, emoji as punctuation).
+CAPTION_PLATE_PAD_X = 26
+CAPTION_PLATE_PAD_Y = 14
+CAPTION_PLATE_RADIUS = 22
 
-    When `emoji` is on we render emoji with a color-emoji font (Segoe UI Emoji / Noto)
-    and DROP any glyph the font can't draw (never a tofu box). When off — or when no
-    emoji font is installed — every non-ASCII char is hard-stripped, the old guaranteed
-    no-emoji gate."""
+
+def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=2,
+                       emoji=True, plate_opacity=120):
+    """Clean, understated hook caption (Title Case, emoji as punctuation): white text on a
+    SEMI-TRANSPARENT DARK PLATE so it stays legible on ANY background — bright, dark, or busy —
+    with only a THIN (or no) outline; the plate does the contrast work, not a heavy stroke.
+    `plate_opacity` (0-255, 0 = no plate) and `stroke` (0 = no outline) are the tunable knobs.
+
+    When `emoji` is on we render emoji with a color-emoji font (Segoe UI Emoji / Noto) and DROP
+    any glyph the font can't draw (never a tofu box); each emoji is vertically centered on the
+    text's optical midline so it sits inline, not offset. When off — or when no emoji font is
+    installed — every non-ASCII char is hard-stripped, the old guaranteed no-emoji gate."""
     text_font_path = find_bold_font()
     emoji_font_path = find_emoji_font() if emoji else None
     if emoji_font_path:
@@ -228,7 +236,8 @@ def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=
     text = (text or "clip").strip() or "clip"
 
     scratch = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
-    inner = box_w - 2 * stroke - 20
+    # Leave room inside the box for the plate padding so a full-width line still fits the plate.
+    inner = box_w - 2 * CAPTION_PLATE_PAD_X - 16
     size, lines, tf, ef = 84, [[]], None, None
     while size >= 30:
         tf = ImageFont.truetype(text_font_path, size)
@@ -241,22 +250,43 @@ def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=
 
     ascent, descent = tf.getmetrics()
     line_h = ascent + descent + 8
-    height = line_h * len(lines) + 2 * stroke + 10
-    img = Image.new("RGBA", (box_w, height), (0, 0, 0, 0))
+    pad_x, pad_y = CAPTION_PLATE_PAD_X, CAPTION_PLATE_PAD_Y
+    img_h = line_h * len(lines) + 2 * pad_y
+    img = Image.new("RGBA", (box_w, img_h), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    y = stroke + 5
+
+    # Semi-transparent dark plate hugging the widest line — guarantees white-on-anything
+    # contrast without a loud outline. plate_opacity<=0 disables it.
+    maxw = max((sum(c["w"] for c in ln) for ln in lines), default=0.0)
+    if plate_opacity > 0 and maxw > 0:
+        pw = min(float(box_w), maxw + 2 * pad_x)
+        px0 = (box_w - pw) / 2
+        d.rounded_rectangle([px0, 0, px0 + pw, img_h], radius=CAPTION_PLATE_RADIUS,
+                            fill=(0, 0, 0, int(plate_opacity)))
+
+    # Text optical midline (from a sample ascender+descender glyph) — emoji are centered on it.
+    tb = tf.getbbox("Ayg")
+    y = pad_y
     for line in lines:
         total = sum(c["w"] for c in line)
         x = (box_w - total) / 2
+        line_center = y + (tb[1] + tb[3]) / 2.0
         for c in line:
             if c["emoji"] and ef is not None:
                 try:
-                    d.text((x, y), c["s"], font=c["font"], embedded_color=True)
+                    eb = d.textbbox((0, 0), c["s"], font=c["font"], embedded_color=True)
+                    ey = line_center - (eb[1] + eb[3]) / 2.0   # center emoji box on text midline
+                except Exception:
+                    ey = y
+                try:
+                    d.text((x, ey), c["s"], font=c["font"], embedded_color=True)
                 except Exception:
                     pass
-            else:
+            elif stroke > 0:
                 d.text((x, y), c["s"], font=c["font"], fill="white",
                        stroke_width=stroke, stroke_fill="black")
+            else:
+                d.text((x, y), c["s"], font=c["font"], fill="white")
             x += c["w"]
         y += line_h
     img.save(out_path)
@@ -337,15 +367,20 @@ def _finish_chunk(cur):
             "start": round(cur[0]["start"], 3), "end": round(cur[-1]["end"], 3)}
 
 
-def render_subtitle_png(text, out_path, cfg, box_w=SUBTITLE_BOX_W, max_lines=2, stroke=5):
-    """A subtitle phrase chunk: bold white + black outline on a semi-transparent rounded
-    plate, centered. TikTok-native, and a distinct style/layer from the hook caption.
-    Returns the PNG height so the caller can vertically center it in the safe zone."""
+def render_subtitle_png(text, out_path, cfg, box_w=SUBTITLE_BOX_W, max_lines=2):
+    """A subtitle phrase chunk: clean white text on a SEMI-TRANSPARENT DARK PLATE (same
+    understated, always-readable treatment as the hook caption — the plate guarantees contrast
+    on any background, with only a thin/no outline). Tunable via `plate_opacity` and
+    `caption_outline_width` (shared with the caption). Returns the PNG height so the caller can
+    vertically center it in the lower-band safe zone."""
+    plate_opacity = int(cfg.get("plate_opacity", 120))
+    stroke = int(cfg.get("caption_outline_width", 2))
     font_path = find_bold_font()
     from captions import titlecase           # Title Case burned subtitles (same as captions)
     text = titlecase(strip_to_ascii(text or "").strip()) or " "
     scratch = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
-    inner = box_w - 2 * stroke - 24
+    pad_x, pad_y = 26, 14
+    inner = box_w - 2 * pad_x - 12
     size, lines, tf = 60, [[]], None
     while size >= 28:
         tf = ImageFont.truetype(font_path, size)
@@ -355,22 +390,25 @@ def render_subtitle_png(text, out_path, cfg, box_w=SUBTITLE_BOX_W, max_lines=2, 
         size -= 4
     ascent, descent = tf.getmetrics()
     line_h = ascent + descent + 6
-    pad_x, pad_y = 26, 14
     maxw = max((sum(c["w"] for c in ln) for ln in lines), default=0.0)
     img_h = line_h * len(lines) + 2 * pad_y
     img = Image.new("RGBA", (box_w, img_h), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    if bool(cfg.get("subtitle_plate", True)) and maxw > 0:
+    # subtitle_plate kept for back-compat; plate_opacity<=0 also disables the plate.
+    if bool(cfg.get("subtitle_plate", True)) and plate_opacity > 0 and maxw > 0:
         pw = min(float(box_w), maxw + 2 * pad_x)
         px0 = (box_w - pw) / 2
-        d.rounded_rectangle([px0, 0, px0 + pw, img_h], radius=22, fill=(0, 0, 0, 130))
+        d.rounded_rectangle([px0, 0, px0 + pw, img_h], radius=22, fill=(0, 0, 0, plate_opacity))
     y = pad_y
     for ln in lines:
         total = sum(c["w"] for c in ln)
         x = (box_w - total) / 2
         for c in ln:
-            d.text((x, y), c["s"], font=c["font"], fill="white",
-                   stroke_width=stroke, stroke_fill="black")
+            if stroke > 0:
+                d.text((x, y), c["s"], font=c["font"], fill="white",
+                       stroke_width=stroke, stroke_fill="black")
+            else:
+                d.text((x, y), c["s"], font=c["font"], fill="white")
             x += c["w"]
         y += line_h
     img.save(out_path)
@@ -767,6 +805,9 @@ def run(state):
     post = float(cfg.get("story_post_seconds", 15))
     layout = str(cfg.get("layout", "blur_fill")).lower()
     emoji_in_caption = bool(cfg.get("emoji_in_caption", True))
+    # Understated, always-readable caption/subtitle treatment (tunable without code edits):
+    plate_opacity = int(cfg.get("plate_opacity", 120))       # dark plate alpha (0-255; 0 = off)
+    caption_outline = int(cfg.get("caption_outline_width", 2))  # text stroke px (0 = none)
     # Burned subtitles need a whisper pass on each final clip → off in offline mode.
     subs_on = bool(cfg.get("subtitles_enabled", True)) and not C.offline_mode()
     C.log(f"== cut layout mode: {layout} "
@@ -825,7 +866,8 @@ def run(state):
         name = f"{rank:02d}_{score_i:03d}_{slugify(c['caption'])}.mp4"
         out_path = C.DRAFTS / name
         cap_png = C.DRAFTS / f".cap_{rank:02d}.png"
-        render_caption_png(c["caption"], cap_png, emoji=emoji_in_caption)
+        render_caption_png(c["caption"], cap_png, emoji=emoji_in_caption,
+                           stroke=caption_outline, plate_opacity=plate_opacity)
         subtitled = False
         if subs_on:
             # Compose to a temp body, THEN transcribe + burn subtitles into out_path so
