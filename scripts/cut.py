@@ -379,7 +379,9 @@ def render_subtitle_png(text, out_path, cfg, box_w=SUBTITLE_BOX_W, max_lines=2, 
 
 def _subtitle_overlay_cmd(body_path, out_path, chunks, cfg, has_audio):
     center_y = int(cfg.get("subtitle_center_y", SUBTITLE_CENTER_Y))
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(body_path)]
+    threads = str(max(1, int(cfg.get("ffmpeg_threads", 2) or 2)))
+    cmd = ["ffmpeg", "-y", "-v", "error",
+           "-filter_complex_threads", threads, "-threads", threads, "-i", str(body_path)]
     for ch in chunks:
         cmd += ["-i", str(ch["_png"])]
     fc, prev = [], "[0:v]"
@@ -659,6 +661,15 @@ def build_compose_cmd(source, start, end, segments, cold_open, caption_png, wate
     if has_audio:
         fc.append(f"{audio_label}{LOUDNORM}[aout];")
 
+    # Downscale the source to max_source_height BEFORE any blur-fill/scale/overlay work, so the
+    # WHOLE filtergraph runs on <=720p frames. 4K (3840x2160) through split+scale+overlay
+    # exhausts RAM ("Cannot allocate memory -12"); the final output is 1080x1920 regardless, so
+    # a 720 source loses nothing visible. Quoted min() protects the inner comma; -2 keeps the
+    # width even for yuv420p; a source already <= max_h is left unchanged.
+    max_src_h = int(cfg.get("max_source_height", 720) or 720)
+    fc.append(f"{vsrc}scale=-2:'min(ih,{max_src_h})'[dsrc];")
+    vsrc = "[dsrc]"
+
     # Vertical fill. Default BLUR-FILL keeps the ENTIRE source frame visible (no
     # cropping): a COVER-scaled + heavily-blurred copy fills the 1080x1920 canvas as
     # a background, and the full frame (fit to 1080 width) is letterboxed onto it,
@@ -699,8 +710,12 @@ def build_compose_cmd(source, start, end, segments, cold_open, caption_png, wate
     else:
         fc.append(f"[base][1:v]overlay=(W-w)/2:{CAPTION_TOP_Y}:eof_action=repeat[vout]")
 
+    # Cap ffmpeg threads: each decode/filter/encode thread buffers frames, so fewer threads =
+    # much lower peak RAM (helps avoid the 4K OOM alongside the downscale above). Default 2.
+    threads = str(max(1, int(cfg.get("ffmpeg_threads", 2) or 2)))
     dur = round(end - start, 3)
     cmd = ["ffmpeg", "-y", "-v", "error",
+           "-filter_complex_threads", threads, "-threads", threads,
            "-ss", f"{start}", "-t", f"{dur}", "-i", str(source),
            "-i", str(caption_png)]
     if watermark_png:

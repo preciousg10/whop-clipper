@@ -401,7 +401,14 @@ def download_source(url, cookies_from_browser=None, max_source_height=720, origi
                                     original=original,
                                     cookies_from_browser=cookies_from_browser)
         else:
-            raw = _fetch_ytdlp(url, staging, cookies_from_browser=cookies_from_browser)
+            # VOD (YouTube/Kick/Twitch) / direct http: cap the format at max_source_height so
+            # yt-dlp never pulls 4K (its default 'best' does). Prefer best video+audio at or
+            # below the cap, then a combined stream at the cap; final '/b' is a last resort for
+            # a rare source with no stream <= the cap (the cut stage downscales anyway).
+            h = int(max_source_height or 720)
+            fmt = f"bv*[height<={h}]+ba/b[height<={h}]/wv*+ba/b"
+            raw = _fetch_ytdlp(url, staging, cookies_from_browser=cookies_from_browser,
+                               format_id=fmt)
 
         entries = []
         for p in raw:

@@ -51,7 +51,11 @@ DEFAULT_CONFIG = {
     "watermark_scale": 0.18,       # fraction of 1080px width
     "watermark_margin": 40,        # px from edges
     "watermark_file": None,        # exact/substring name in assets/; None = auto-pick
-    "max_source_height": 720,      # cap for Drive transcoded preview streams (px)
+    "max_source_height": 720,      # cap for downloads AND the render: cut downscales the
+                                   # source to this height before the blur-fill graph (4K
+                                   # frames through split+scale+overlay OOM), and download.py
+                                   # caps the yt-dlp format at this height (never pull 4K).
+    "ffmpeg_threads": 2,           # fewer threads = lower peak RAM in the cut stage
 }
 
 _COOKIES = None                   # browser for cookies during the download stage
