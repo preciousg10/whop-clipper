@@ -211,17 +211,27 @@ def _wrap_cells(cells, inner, max_lines):
     return lines[:max_lines] if lines else [[]]
 
 
-CAPTION_PLATE_PAD_X = 26
-CAPTION_PLATE_PAD_Y = 14
-CAPTION_PLATE_RADIUS = 22
+# Plates hug the text — kept tight so neither caption reads as a bulky block. The HOOK is
+# the scroll-stopper (bigger text, denser plate); SUBTITLES are quieter readability support
+# (smaller text, lighter/tighter plate). Each treatment is independently tunable via config:
+# hook_font_scale / hook_plate_opacity vs subtitle_font_scale / subtitle_plate_opacity.
+CAPTION_PLATE_PAD_X = 20
+CAPTION_PLATE_PAD_Y = 9
+CAPTION_PLATE_RADIUS = 18
+
+SUBTITLE_PLATE_PAD_X = 14
+SUBTITLE_PLATE_PAD_Y = 6
+SUBTITLE_PLATE_RADIUS = 14
 
 
 def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=2,
-                       emoji=True, plate_opacity=120):
-    """Clean, understated hook caption (Title Case, emoji as punctuation): white text on a
-    SEMI-TRANSPARENT DARK PLATE so it stays legible on ANY background — bright, dark, or busy —
-    with only a THIN (or no) outline; the plate does the contrast work, not a heavy stroke.
-    `plate_opacity` (0-255, 0 = no plate) and `stroke` (0 = no outline) are the tunable knobs.
+                       emoji=True, plate_opacity=105, font_scale=1.0):
+    """The HOOK caption — the scroll-stopper, so it is the PROMINENT of the two text layers
+    (larger/bolder than the burned subtitles). Clean, understated (Title Case, emoji as
+    punctuation): white text on a SEMI-TRANSPARENT DARK PLATE so it stays legible on ANY
+    background — bright, dark, or busy — with only a THIN (or no) outline; the plate does the
+    contrast work, not a heavy stroke. `plate_opacity` (0-255, 0 = no plate), `font_scale`
+    (>1 = larger/bolder-looking) and `stroke` (0 = no outline) are the tunable knobs.
 
     When `emoji` is on we render emoji with a color-emoji font (Segoe UI Emoji / Noto) and DROP
     any glyph the font can't draw (never a tofu box); each emoji is vertically centered on the
@@ -238,8 +248,10 @@ def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=
     scratch = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
     # Leave room inside the box for the plate padding so a full-width line still fits the plate.
     inner = box_w - 2 * CAPTION_PLATE_PAD_X - 16
-    size, lines, tf, ef = 84, [[]], None, None
-    while size >= 30:
+    smax = max(int(round(84 * font_scale)), 34)   # hook runs larger than the subtitles
+    smin = max(int(round(30 * font_scale)), 20)
+    size, lines, tf, ef = smax, [[]], None, None
+    while size >= smin:
         tf = ImageFont.truetype(text_font_path, size)
         ef = ImageFont.truetype(emoji_font_path, size) if emoji_font_path else None
         lines = _wrap_cells(_cells(text, tf, ef, scratch), inner, max_lines)
@@ -368,21 +380,25 @@ def _finish_chunk(cur):
 
 
 def render_subtitle_png(text, out_path, cfg, box_w=SUBTITLE_BOX_W, max_lines=2):
-    """A subtitle phrase chunk: clean white text on a SEMI-TRANSPARENT DARK PLATE (same
-    understated, always-readable treatment as the hook caption — the plate guarantees contrast
-    on any background, with only a thin/no outline). Tunable via `plate_opacity` and
-    `caption_outline_width` (shared with the caption). Returns the PNG height so the caller can
-    vertically center it in the lower-band safe zone."""
-    plate_opacity = int(cfg.get("plate_opacity", 120))
+    """A subtitle phrase chunk — readability SUPPORT, deliberately SECONDARY to the hook
+    caption so it recedes rather than competing as a second headline: smaller text on a
+    LIGHTER / more transparent, tighter plate. Still clean white-on-dark for always-on
+    contrast with only a thin/no outline. Tunable independently of the hook via
+    `subtitle_font_scale` and `subtitle_plate_opacity` (plus shared `caption_outline_width`).
+    Returns the PNG height so the caller can vertically center it in the lower-band safe zone."""
+    plate_opacity = int(cfg.get("subtitle_plate_opacity", 70))   # lighter than the hook plate
+    font_scale = float(cfg.get("subtitle_font_scale", 0.82))     # smaller than the hook text
     stroke = int(cfg.get("caption_outline_width", 2))
     font_path = find_bold_font()
     from captions import titlecase           # Title Case burned subtitles (same as captions)
     text = titlecase(strip_to_ascii(text or "").strip()) or " "
     scratch = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
-    pad_x, pad_y = 26, 14
+    pad_x, pad_y = SUBTITLE_PLATE_PAD_X, SUBTITLE_PLATE_PAD_Y
     inner = box_w - 2 * pad_x - 12
-    size, lines, tf = 60, [[]], None
-    while size >= 28:
+    smax = max(int(round(60 * font_scale)), 26)
+    smin = max(int(round(28 * font_scale)), 16)
+    size, lines, tf = smax, [[]], None
+    while size >= smin:
         tf = ImageFont.truetype(font_path, size)
         lines = _wrap_cells(_cells(text, tf, None, scratch), inner, max_lines)
         if len(_wrap_cells(_cells(text, tf, None, scratch), inner, max_lines + 1)) <= max_lines:
@@ -398,7 +414,8 @@ def render_subtitle_png(text, out_path, cfg, box_w=SUBTITLE_BOX_W, max_lines=2):
     if bool(cfg.get("subtitle_plate", True)) and plate_opacity > 0 and maxw > 0:
         pw = min(float(box_w), maxw + 2 * pad_x)
         px0 = (box_w - pw) / 2
-        d.rounded_rectangle([px0, 0, px0 + pw, img_h], radius=22, fill=(0, 0, 0, plate_opacity))
+        d.rounded_rectangle([px0, 0, px0 + pw, img_h], radius=SUBTITLE_PLATE_RADIUS,
+                            fill=(0, 0, 0, plate_opacity))
     y = pad_y
     for ln in lines:
         total = sum(c["w"] for c in ln)
@@ -805,8 +822,13 @@ def run(state):
     post = float(cfg.get("story_post_seconds", 15))
     layout = str(cfg.get("layout", "blur_fill")).lower()
     emoji_in_caption = bool(cfg.get("emoji_in_caption", True))
-    # Understated, always-readable caption/subtitle treatment (tunable without code edits):
-    plate_opacity = int(cfg.get("plate_opacity", 120))       # dark plate alpha (0-255; 0 = off)
+    # Hook vs subtitle are visually DISTINCT and independently tunable. The HOOK is the
+    # scroll-stopper (larger text, denser plate); SUBTITLES recede as readability support
+    # (smaller text, lighter plate — read inside render_subtitle_png). Both plates hug the
+    # text and run at reduced opacity so neither is a bulky block. `plate_opacity` (legacy,
+    # shared) is superseded by hook_/subtitle_ specific knobs.
+    hook_plate_opacity = int(cfg.get("hook_plate_opacity", 105))  # dark plate alpha (0-255; 0=off)
+    hook_font_scale = float(cfg.get("hook_font_scale", 1.06))     # >1 = larger/bolder hook
     caption_outline = int(cfg.get("caption_outline_width", 2))  # text stroke px (0 = none)
     # Burned subtitles need a whisper pass on each final clip → off in offline mode.
     subs_on = bool(cfg.get("subtitles_enabled", True)) and not C.offline_mode()
@@ -867,7 +889,8 @@ def run(state):
         out_path = C.DRAFTS / name
         cap_png = C.DRAFTS / f".cap_{rank:02d}.png"
         render_caption_png(c["caption"], cap_png, emoji=emoji_in_caption,
-                           stroke=caption_outline, plate_opacity=plate_opacity)
+                           stroke=caption_outline, plate_opacity=hook_plate_opacity,
+                           font_scale=hook_font_scale)
         subtitled = False
         if subs_on:
             # Compose to a temp body, THEN transcribe + burn subtitles into out_path so
