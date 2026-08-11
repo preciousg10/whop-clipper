@@ -31,6 +31,7 @@ DOCS = CAMPAIGN / "docs"          # brand guides / rule docs / sheets / pdfs
 OTHER = CAMPAIGN / "other"        # kept-but-unhandled files (never silently dropped)
 TRANSCRIPTS = CAMPAIGN / "transcripts"
 DRAFTS = ROOT / "drafts"
+DRAFTS_ARCHIVE = ROOT / "drafts_archive"   # prior-campaign drafts moved here (never deleted)
 MEMORY = ROOT / "memory"
 STATE_PATH = ROOT / "state.json"
 
@@ -150,6 +151,56 @@ def mark_stage(state, name, **extra):
 
 def stage_meta(state, name):
     return state.get("stages", {}).get(name, {})
+
+
+def _archive_drafts(label):
+    """Move everything under drafts/ into drafts_archive/<label>-<timestamp>/ so a new
+    campaign never mixes its clips with the previous one's. Never deletes — always moves."""
+    if not DRAFTS.exists():
+        return
+    items = [p for p in DRAFTS.iterdir()]
+    if not items:
+        return
+    slug = re.sub(r"[^a-z0-9]+", "-", (label or "prev").lower()).strip("-") or "prev"
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = DRAFTS_ARCHIVE / f"{slug}-{stamp}"
+    dest.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for p in items:
+        try:
+            shutil.move(str(p), str(dest / p.name))
+            moved += 1
+        except Exception as e:
+            warn(f"could not archive draft {p.name}: {e}")
+    if moved:
+        log(f"archived {moved} prior draft item(s) → {dest.relative_to(ROOT)}")
+
+
+def activate_campaign(state, name):
+    """Scope stage checkpoints PER-CAMPAIGN so a NEW campaign runs fresh without --force
+    and never inherits the prior campaign's 'done' stages or its drafts.
+
+    No-op when `name` is already active (so re-running intake or a stage on the SAME
+    campaign keeps its checkpoints — still resumable). On a real switch: stash the
+    outgoing campaign's stages under state['campaigns'][old], archive its drafts, then
+    restore the incoming campaign's stages (empty for a brand-new one → clean run).
+    Returns the (possibly mutated) state."""
+    if not name:
+        return state
+    old = state.get("campaign")
+    if old == name:
+        return state
+    camps = state.setdefault("campaigns", {})
+    if old:
+        camps[old] = {"stages": state.get("stages", {})}
+        _archive_drafts(old)
+    elif DRAFTS.exists() and any(DRAFTS.iterdir()):
+        # legacy state with drafts but no recorded campaign — don't let them bleed through
+        _archive_drafts("previous")
+    state["stages"] = camps.get(name, {}).get("stages", {})
+    state["campaign"] = name
+    save_state(state)
+    return state
 
 
 # --- external tools ------------------------------------------------------------

@@ -531,7 +531,10 @@ def main():
     write_knowledge_md(args.campaign, rules, resources, harvested, other_urls, len(corpus), llm_used)
 
     state = C.load_state()
-    state["campaign"] = args.campaign
+    # Scope checkpoints per-campaign: if this is a NEW campaign, stash the prior campaign's
+    # stages + archive its drafts so downstream stages run fresh (no --force) and old clips
+    # don't mix in. No-op when re-intaking the SAME campaign (keeps its checkpoints).
+    C.activate_campaign(state, args.campaign)
     C.mark_stage(state, "intake", footage_hours=manifest["footage_total_hours"],
                  banned_words=len(rules.get("banned_words", [])), resources=len(resources))
 

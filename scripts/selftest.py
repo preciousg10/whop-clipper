@@ -47,6 +47,7 @@ def _redirect_common_paths(base):
     C.OTHER = C.CAMPAIGN / "other"
     C.TRANSCRIPTS = C.CAMPAIGN / "transcripts"
     C.DRAFTS = base / "drafts"
+    C.DRAFTS_ARCHIVE = base / "drafts_archive"
     C.MEMORY = base / "memory"
     C.STATE_PATH = base / "state.json"
     C.BRIEF_MD = C.CAMPAIGN / "brief.md"
@@ -124,7 +125,7 @@ def _assert_sandboxed():
     the run loudly instead of wiping the user's real campaign/ again."""
     sb = str(_SANDBOX.resolve())
     for p in (C.CAMPAIGN, C.FOOTAGE, C.ASSETS, C.DOCS, C.OTHER, C.TRANSCRIPTS,
-              C.DRAFTS, C.MEMORY, C.STATE_PATH, C.RULES_JSON):
+              C.DRAFTS, C.DRAFTS_ARCHIVE, C.MEMORY, C.STATE_PATH, C.RULES_JSON):
         if not str(Path(p).resolve()).startswith(sb):
             C.fail(f"SAFETY ABORT: self-test path {p} is outside the sandbox {sb}. "
                    "Refusing to touch real data.")

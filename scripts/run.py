@@ -151,6 +151,12 @@ def main():
     require_intake()
 
     state = C.load_state()
+    # Defensive: if the campaign on disk (rules.json) differs from the state's active one,
+    # scope stages to it so we never skip stages left 'done' by a PRIOR campaign (that made
+    # run.py think everything was already built and mixed old drafts in). No-op in the
+    # normal flow where intake already switched.
+    rules_campaign = (C.load_json(C.RULES_JSON) or {}).get("campaign")
+    C.activate_campaign(state, rules_campaign)
     cfg = {**DEFAULT_CONFIG, **state.get("config", {})}
     if args.clips_per_batch:
         cfg["clips_per_batch"] = args.clips_per_batch

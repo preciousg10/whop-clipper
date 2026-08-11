@@ -77,6 +77,12 @@ into `memory/longterm.md`.**
   and stop. Intake flags ambiguities for the user rather than inventing rules.
 - **Everything is resumable.** New work must checkpoint to `state.json` (and to disk)
   before the next step. `index.py` checkpoints per 5-min VOD chunk — preserve that.
+- **Stage checkpoints are per-campaign.** `common.activate_campaign(state, name)` scopes
+  `state["stages"]` to the active campaign (inactive ones stashed under
+  `state["campaigns"][name]`); switching campaigns runs fresh WITHOUT `--force` and moves
+  the prior campaign's `drafts/` into `drafts_archive/` (moved, never deleted). Called by
+  `intake.py` (primary) and `run.py` (defensive, keyed off `rules.json`'s campaign) — a
+  no-op on the same campaign, so re-runs stay resumable.
 - **Offline mode** (`common.offline_mode()`) must keep working so the self-test runs
   without Groq/model downloads.
 - **Campaign rules never leak into memory/longterm.md** — see instructions.md MEMORY.
