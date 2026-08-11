@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common as C
@@ -379,16 +379,39 @@ def _finish_chunk(cur):
             "start": round(cur[0]["start"], 3), "end": round(cur[-1]["end"], 3)}
 
 
+def _draw_text_lines(d, lines, box_w, y0, line_h, fill, stroke=0, stroke_fill="black", x_off=0):
+    """Draw already-wrapped text `lines` centered in `box_w`, top-down from y0."""
+    y = y0
+    for ln in lines:
+        total = sum(c["w"] for c in ln)
+        x = (box_w - total) / 2 + x_off
+        for c in ln:
+            if stroke > 0:
+                d.text((x, y), c["s"], font=c["font"], fill=fill,
+                       stroke_width=stroke, stroke_fill=stroke_fill)
+            else:
+                d.text((x, y), c["s"], font=c["font"], fill=fill)
+            x += c["w"]
+        y += line_h
+
+
 def render_subtitle_png(text, out_path, cfg, box_w=SUBTITLE_BOX_W, max_lines=2):
-    """A subtitle phrase chunk — readability SUPPORT, deliberately SECONDARY to the hook
-    caption so it recedes rather than competing as a second headline: smaller text on a
-    LIGHTER / more transparent, tighter plate. Still clean white-on-dark for always-on
-    contrast with only a thin/no outline. Tunable independently of the hook via
-    `subtitle_font_scale` and `subtitle_plate_opacity` (plus shared `caption_outline_width`).
-    Returns the PNG height so the caller can vertically center it in the lower-band safe zone."""
-    plate_opacity = int(cfg.get("subtitle_plate_opacity", 70))   # lighter than the hook plate
+    """A subtitle phrase chunk — DELIBERATELY a different KIND of element from the plated
+    hook, not just a smaller version of it. Default is clean white text FLOATING with a
+    soft drop shadow + thin outline (NO box), so it reads as plain spoken-word text while
+    the hook stays the plated headline. `subtitle_plate` (config, default FALSE) brings the
+    dark plate back if wanted. Smaller than the hook (`subtitle_font_scale`). Returns the
+    PNG height so the caller can vertically center it in the lower-band safe zone."""
+    plate_on = bool(cfg.get("subtitle_plate", False))            # default: NO plate — floats
+    plate_opacity = int(cfg.get("subtitle_plate_opacity", 70))
     font_scale = float(cfg.get("subtitle_font_scale", 0.82))     # smaller than the hook text
-    stroke = int(cfg.get("caption_outline_width", 2))
+    stroke = int(cfg.get("caption_outline_width", 2))            # thin outline for legibility
+    # Soft drop-shadow (only when no plate) — carries legibility on bright OR dark footage
+    # without a box. Down-offset + blur reads as a natural shadow, not a second outline.
+    sh_blur = float(cfg.get("subtitle_shadow_blur", 4))
+    sh_dx = int(cfg.get("subtitle_shadow_dx", 0))
+    sh_dy = int(cfg.get("subtitle_shadow_dy", 4))
+    sh_op = int(cfg.get("subtitle_shadow_opacity", 200))
     font_path = find_bold_font()
     from captions import titlecase           # Title Case burned subtitles (same as captions)
     text = titlecase(strip_to_ascii(text or "").strip()) or " "
@@ -407,27 +430,31 @@ def render_subtitle_png(text, out_path, cfg, box_w=SUBTITLE_BOX_W, max_lines=2):
     ascent, descent = tf.getmetrics()
     line_h = ascent + descent + 6
     maxw = max((sum(c["w"] for c in ln) for ln in lines), default=0.0)
-    img_h = line_h * len(lines) + 2 * pad_y
+
+    # Reserve margin for the soft-shadow bleed (blur + offset) when there's no plate, so
+    # the shadow isn't clipped at the PNG edges.
+    sh_margin = 0 if plate_on else int(round(sh_blur * 2 + max(abs(sh_dx), abs(sh_dy)) + stroke))
+    top = pad_y + sh_margin
+    img_h = line_h * len(lines) + 2 * pad_y + 2 * sh_margin
     img = Image.new("RGBA", (box_w, img_h), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    # subtitle_plate kept for back-compat; plate_opacity<=0 also disables the plate.
-    if bool(cfg.get("subtitle_plate", True)) and plate_opacity > 0 and maxw > 0:
+
+    if plate_on and plate_opacity > 0 and maxw > 0:
         pw = min(float(box_w), maxw + 2 * pad_x)
         px0 = (box_w - pw) / 2
-        d.rounded_rectangle([px0, 0, px0 + pw, img_h], radius=SUBTITLE_PLATE_RADIUS,
-                            fill=(0, 0, 0, plate_opacity))
-    y = pad_y
-    for ln in lines:
-        total = sum(c["w"] for c in ln)
-        x = (box_w - total) / 2
-        for c in ln:
-            if stroke > 0:
-                d.text((x, y), c["s"], font=c["font"], fill="white",
-                       stroke_width=stroke, stroke_fill="black")
-            else:
-                d.text((x, y), c["s"], font=c["font"], fill="white")
-            x += c["w"]
-        y += line_h
+        d.rounded_rectangle([px0, top - pad_y, px0 + pw, top - pad_y + line_h * len(lines) + 2 * pad_y],
+                            radius=SUBTITLE_PLATE_RADIUS, fill=(0, 0, 0, plate_opacity))
+    elif not plate_on and maxw > 0:
+        # SOFT DROP SHADOW (no box): draw the phrase black on its own layer (offset), blur
+        # it, and composite under the white text.
+        shadow = Image.new("RGBA", (box_w, img_h), (0, 0, 0, 0))
+        _draw_text_lines(ImageDraw.Draw(shadow), lines, box_w, top + sh_dy, line_h,
+                         fill=(0, 0, 0, sh_op), stroke=0, x_off=sh_dx)
+        img.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(sh_blur)))
+        d = ImageDraw.Draw(img)
+
+    _draw_text_lines(d, lines, box_w, top, line_h, fill="white",
+                     stroke=stroke, stroke_fill="black")
     img.save(out_path)
     return img_h
 

@@ -62,6 +62,81 @@ GIVEAWAY_RE = re.compile(
     r"\b(he|she|they|it|the \w+)\s+(won|lost|crashed|died|scored|beat|smashed|flipped|"
     r"finished|ended|fell|missed|nailed|dropped|broke)\b", re.I)
 
+# --- hook GROUNDING (Task 2: no invented / mis-transcribed nouns) --------------
+# A hook must be about what THIS clip actually contains. A hook may freely use structural
+# hook words + generic reactions (below); but any OTHER content word must appear in the
+# moment's transcript. A specific word that is neither — a name/brand/object the model
+# invented or a mis-transcription ("hibush"), or an example-bleed noun ("hamster" on a
+# jewelry clip) — marks the candidate as UNGROUNDED, and we drop it rather than ship
+# catchy nonsense. (Only enforced when we actually have transcript to ground on.)
+GENERIC_HOOK_VOCAB = frozenset("""
+a an the this that these those it its he she her him his they them their you your yours we
+us our my mine i me is are was were be been being am do does did doing done has have had
+having will would can could should shall may might must cant cannot dont doesnt didnt isnt
+arent wasnt werent wont couldnt shouldnt wouldnt aint not no nope yes yep and or but so
+then than as at by for from in into of off on onto out to up down with without within over
+under above below near about after before again just even still only really actually
+literally lowkey highkey fr ong deadass bro bruh nah yo omg lol lmao lmfao istg pov wait
+waiting watch watching keep keeps look looks looking see seen how why what who when where
+which whose whats hows whys whos way ways shot real unreal insane crazy craziest wild
+wildest nuts mad diabolical unserious chaos chaotic peak wilding goes go going gone went
+here there comes coming came told tell telling gonna tryna wanna finna yall till until
+moment moments thing things stuff someone something anything nothing everything everyone
+everybody nobody anyone first last next best worst most least more less super so very too
+much many few big small huge tiny new old good bad better worse wow whoa damn hell heck
+bruv fam man dude guy guys girl girls people ever never always almost about gotta got get
+gets getting make makes made makin making happen happens happening happened turn turns
+turned drop drops dropped pull pulls pulled hold holds held put puts break breaks broke
+run runs ran hit hits win wins won lose loses lost end ends ended way thats theres
+heres lets let bruhh nahh deadset ongod
+""".split())
+
+_GROUND_WORD_RE = re.compile(r"[a-z']+")
+
+
+def _transcript_vocab(event):
+    """Lowercase word set of the moment's transcript/event text — the words a hook is
+    allowed to be specific about."""
+    return {w.strip("'") for w in _GROUND_WORD_RE.findall((event or "").lower())}
+
+
+def _word_grounded(w, tvocab):
+    """True if caption word `w` is supported by the transcript. Exact match, or a >=4-char
+    shared prefix so simple morphology (diamond/diamonds, rolex/rolexes) still counts."""
+    if w in tvocab:
+        return True
+    if len(w) >= 4:
+        p = w[:4]
+        for tv in tvocab:
+            if tv.startswith(p) or (len(tv) >= 4 and w.startswith(tv[:4])):
+                return True
+    return False
+
+
+def _ungrounded_terms(caption, tvocab):
+    """Content words in `caption` that are neither generic hook vocabulary nor present in
+    the transcript — i.e. specifics the model likely invented/mis-transcribed. Tokens <=2
+    chars and pure numbers are ignored (never 'names')."""
+    out = []
+    for w in _GROUND_WORD_RE.findall((caption or "").lower()):
+        w = w.strip("'")
+        if len(w) <= 2 or w in GENERIC_HOOK_VOCAB:
+            continue
+        if not _word_grounded(w, tvocab):
+            out.append(w)
+    return out
+
+
+# Neutral hooks that assert NOTHING specific — every word is generic hook vocabulary, so
+# they are always grounded. Used only when no grounded Groq caption survives (better a
+# plain accurate hook than a catchy invented one).
+GROUNDED_FALLBACKS = [
+    "wait for the end 👀",
+    "you have to see this 😳",
+    "watch this till the end 👀",
+    "nah this is actually crazy 😭",
+]
+
 OFFLINE_TEMPLATES = [
     "how did this even happen 😭",
     "no way this actually happened 💀",
@@ -216,18 +291,23 @@ def _groq_candidates(client, campaign, moment, style_notes, event="", emoji_in_c
         if emoji_in_caption else
         "all lowercase, NO emoji, ")
     system = (
-        "You write TOP captions for viral vertical sports/gaming/racing clips. The "
+        "You write TOP captions for viral vertical short-form clips. The "
         "caption's ONLY job is to make the payoff feel MANDATORY to watch, and it MUST "
         "reference the ACTUAL event in THIS clip (use the transcript / what happens), "
         "NOT a generic phrase. RULES: ONE line, MAX 8 words, casual grammar, " + emoji_rule +
         "NO hashtags. Every caption MUST use one of these five proven hook patterns:\n"
-        "  1) open question — 'how did the yellow hamster win THIS'\n"
-        "  2) stakes — '$10k on the line and he does THIS'\n"
-        "  3) disbelief — 'no way that overtake just happened'\n"
-        "  4) controversy — 'that lap should NOT have counted'\n"
-        "  5) direct address — 'wait for the jump at the last second'\n"
-        "BANNED: vague filler ('what just happened', bare 'wait for it', 'why does he "
-        "have the lead'), descriptions, past-tense summaries, or GIVING AWAY who won. "
+        "  1) open question — 'how did this even happen'\n"
+        "  2) stakes — '$10k on the line and then THIS'\n"
+        "  3) disbelief — 'no way that just happened'\n"
+        "  4) controversy — 'this should NOT have counted'\n"
+        "  5) direct address — 'wait for the very last second'\n"
+        "GROUNDING (CRITICAL): use ONLY the names, people, brands, places, and objects that "
+        "appear in the transcript below. NEVER invent, guess, or borrow a name from these "
+        "instructions — if the transcript doesn't name it, don't name it (say 'this', "
+        "'that', 'him', 'them' instead). A specific noun that isn't in the clip is an "
+        "automatic reject. When in doubt, be PLAIN and ACCURATE, not catchy and wrong.\n"
+        "BANNED: vague filler ('what just happened', bare 'wait for it'), descriptions, "
+        "past-tense summaries, or GIVING AWAY the payoff. "
         "Be SPECIFIC to this clip. Respect the campaign banned words/topics in the "
         "knowledge below. "
         f"Return {N_CANDIDATES} captions, ONE PER LINE — no numbering, no quotes, no JSON.")
@@ -366,11 +446,33 @@ def run(state):
                 killed.append({"caption": c, "reason": reason})
             else:
                 kept.append(c)
-        # Prefer hook-passing captions; but if the quality gate empties the pool, keep the
-        # best banned-clean Groq line (still SPECIFIC to this clip) rather than dropping to
-        # a generic template. Generic template is the last resort only when Groq gave us
-        # nothing usable at all.
-        if kept:
+        # GROUNDING (Task 2): a hook may only be specific about words that are in THIS
+        # moment's transcript. Drop candidates that name something invented/mis-transcribed
+        # (e.g. "hibush") or bled from the prompt examples ("hamster" on a jewelry clip).
+        # Only enforced when we actually have transcript to ground on.
+        tvocab = _transcript_vocab(event)
+        enforce_ground = len(tvocab) >= 3
+
+        def _grounded_only(cands):
+            if not enforce_ground:
+                return list(cands)
+            return [c for c in cands if not _ungrounded_terms(c, tvocab)]
+
+        kept_g, clean_g = _grounded_only(kept), _grounded_only(banned_clean)
+        # Prefer grounded hook-passing captions; then any grounded banned-clean line (plain
+        # but accurate). If grounding is enforced and nothing grounded survives, use a
+        # NEUTRAL fallback that asserts nothing specific — never a catchy invented hook.
+        if kept_g:
+            pool = kept_g
+        elif clean_g:
+            C.warn(f"moment {m['id']}: no grounded hook-passing caption — using best grounded "
+                   f"Groq line (plain + accurate over catchy nonsense).")
+            pool = clean_g
+        elif enforce_ground:
+            C.warn(f"moment {m['id']}: every candidate named something not in the transcript "
+                   f"(invented/mis-transcribed) — falling back to a neutral grounded hook.")
+            pool = GROUNDED_FALLBACKS
+        elif kept:
             pool = kept
         elif banned_clean:
             C.warn(f"moment {m['id']}: no candidate hit a hook pattern — keeping best raw "
@@ -378,7 +480,7 @@ def run(state):
             pool = banned_clean
         else:
             C.warn(f"moment {m['id']}: no usable Groq caption — generic curiosity fallback.")
-            pool = ["you have to see this"]
+            pool = GROUNDED_FALLBACKS
         ranked = sorted(pool, key=score_caption, reverse=True)
         # ALL captions on ALL clips: lowercase energy; emoji kept as punctuation unless
         # the campaign config turns them off.
