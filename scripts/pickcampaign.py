@@ -69,6 +69,7 @@ def rank_campaigns(campaigns):
         if c.get("status") in RANKABLE_STATUSES
         and not c.get("disqualified")
         and not c.get("rules_unreadable")   # scout excluded it: rules only in an unreadable source
+        and not c.get("excluded_prohibited")  # scout excluded it: prohibited/vice category
         and _composite(c) > 0
         and _core_known(c) > 0              # skip UNKNOWN-only (ranked on neutrals alone)
     ]
