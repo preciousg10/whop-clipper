@@ -4,17 +4,21 @@ Per selected clip: extract the moment, tighten dead air, render to vertical
 1080x1920, burn the flzsh caption at top (safe-zone aware), overlay the mandatory
 watermark, and write drafts/NN_score_slug.mp4 (best first) + drafts/manifest.json.
 
-Captions are rendered to a transparent PNG with Pillow (bold white, black outline,
-top-center, <=2 lines, auto font-size) and overlaid by ffmpeg — this dodges ffmpeg
-drawtext font/escaping issues and is identical across OSes. Watermark is the campaign
-PNG from campaign/assets/. Fail loud if anything essential is missing.
+The top HOOK caption is rendered to a transparent PNG with Pillow (bold white, black
+outline, top-center, <=2 lines, auto font-size) and overlaid by ffmpeg — this dodges
+ffmpeg drawtext font/escaping issues and is identical across OSes. A SECOND, distinct
+layer — word-level karaoke SUBTITLES lower-center — is rendered via ASS/libass (see
+build_ass): the full spoken line shows with the currently-spoken word popped in an accent
+colour + upscale, timings mapped through the cold-open reorder onto the final timeline.
+Watermark is the campaign PNG from campaign/assets/. Fail loud if anything essential is
+missing.
 """
 import os
 import re
 import subprocess
 import sys
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common as C
@@ -28,11 +32,13 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 # Subtitles are pushed DOWN into the lower LETTERBOX / black band, OFF the footage frame
 # (user preference). In the default blur_fill layout a 16:9 source fit to the 1080 width
 # (with the default 1.2 fg-zoom) occupies roughly y 595-1325, so the band below ~1325 is
-# blurred/black dead space. We center the subtitle plate at ~1440: below the footage frame,
-# clear of the top hook caption, above the bottom ~18-20% TikTok caption/UI zone (~1536+),
-# and — at 640px wide, centered (x 220-860) — inside the right action-rail notch (~x<870)
-# and above the bottom-right watermark. So subtitles never sit on the footage, the
-# watermark, or the platform UI.
+# blurred/black dead space. We anchor the karaoke subtitle line near ~1440: below the footage
+# frame, clear of the top hook caption, above the bottom ~18-20% TikTok caption/UI zone
+# (~1536+), and — at 640px wide, centered (x 220-860) — inside the right action-rail notch
+# (~x<870) and above the bottom-right watermark. So subtitles never sit on the footage, the
+# watermark, or the platform UI. These feed the ASS style (see _ass_header): SUBTITLE_BOX_W
+# → MarginL/MarginR (the safe-box width), SUBTITLE_CENTER_Y → MarginV (distance up from the
+# frame bottom for the bottom-center alignment). Both are config-overridable.
 SUBTITLE_BOX_W = 640
 SUBTITLE_CENTER_Y = 1440      # ~75% down: in the lower black band, off the video frame
 
@@ -211,17 +217,13 @@ def _wrap_cells(cells, inner, max_lines):
     return lines[:max_lines] if lines else [[]]
 
 
-# Plates hug the text — kept tight so neither caption reads as a bulky block. The HOOK is
-# the scroll-stopper (bigger text, denser plate); SUBTITLES are quieter readability support
-# (smaller text, lighter/tighter plate). Each treatment is independently tunable via config:
-# hook_font_scale / hook_plate_opacity vs subtitle_font_scale / subtitle_plate_opacity.
+# The HOOK plate hugs the text — kept tight so the caption doesn't read as a bulky block.
+# It is the scroll-stopper (bigger text, denser plate), independently tunable via config
+# (hook_font_scale / hook_plate_opacity). The spoken-word SUBTITLES are a separate layer,
+# rendered as word-level karaoke via ASS/libass (see build_ass), not a Pillow plate.
 CAPTION_PLATE_PAD_X = 20
 CAPTION_PLATE_PAD_Y = 9
 CAPTION_PLATE_RADIUS = 18
-
-SUBTITLE_PLATE_PAD_X = 14
-SUBTITLE_PLATE_PAD_Y = 6
-SUBTITLE_PLATE_RADIUS = 14
 
 
 def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=2,
@@ -305,51 +307,28 @@ def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=
     return out_path
 
 
-# --- burned karaoke-style subtitles --------------------------------------------
-# TIMING APPROACH: we RE-TRANSCRIBE the finished 30s clip rather than remapping source
-# word timestamps. The clip is restructured (cold-open reorder + dead-air trims), so
-# source timings would desync; a fresh 30s whisper pass is edit-proof and takes seconds
-# on CPU. Subtitles are a SEPARATE layer from the hook caption and are gated off in
-# offline mode (no whisper) and by config `subtitles_enabled=false`.
-_sub_model = None
-
-
-def _subtitle_model():
-    global _sub_model
-    if _sub_model is None:
-        from faster_whisper import WhisperModel        # lazy: cut.py must import w/o it
-        C.log("loading faster-whisper 'base' for subtitle timing (CPU, int8)…")
-        _sub_model = WhisperModel("base", device="cpu", compute_type="int8")
-    return _sub_model
-
-
-def transcribe_clip_words(clip_path):
-    """Clip-relative word timings from a whisper pass on the FINAL clip. Best-effort:
-    returns [] (ship without subtitles) if whisper is missing or transcription fails."""
-    try:
-        model = _subtitle_model()
-    except ImportError:
-        C.warn("faster-whisper not installed — skipping burned subtitles.")
-        return []
-    try:
-        segments, _info = model.transcribe(str(clip_path), word_timestamps=True)
-        words = []
-        for seg in segments:
-            for w in (seg.words or []):
-                t = (w.word or "").strip()
-                if t:
-                    words.append({"word": t, "start": float(w.start), "end": float(w.end)})
-        return words
-    except Exception as e:
-        C.warn(f"subtitle transcription failed ({e}) — shipping clip without subtitles.")
-        return []
+# --- burned karaoke-style subtitles (word-level, rendered via ASS/libass) -------
+# TIMING APPROACH: we DO NOT re-transcribe the clip. index.py persists per-word
+# {word,start,end} (whisper word_timestamps) into moments.json, and here we MAP those
+# SOURCE-absolute word timings through the EXACT same segment list the compose graph
+# plays — cold-open teaser (peak shown first), dead-air trims, and the cmax tail cut.
+# So a word can legitimately appear twice (once in the cold-open, once in the setup) and
+# each occurrence lands on the FINAL output timeline. Get the mapping wrong and captions
+# drift silently, so map_words_to_output() is driven by the very `segments` compose uses.
+#
+# RENDERING: one ASS Dialogue event per word, each covering that word's slice of the line;
+# the event shows the FULL line with only the currently-spoken word wrapped in an accent
+# colour + upscale override ({\c&Hbbggrr&\fscx..\fscy..}) so it POPS, then reverts as the
+# next word speaks. libass (ffmpeg `ass` filter) burns it AFTER the 1080x1920 blur-fill so
+# subs render at output resolution. Gated off in offline mode (no word timings) and by
+# `subtitles_enabled=false`.
 
 
 def _mask_banned_word(word, banned):
     """Mask any campaign-banned word before it can be burned into a subtitle
     ('bet' -> 'b**', 'gambling' -> 'g*******'). Surrounding punctuation is preserved;
     clean words pass through untouched. A banned word in a subtitle = campaign violation,
-    so this is the FIRST line of defense (cut.py re-checks the whole chunk after)."""
+    so this is the FIRST line of defense (cut.py re-checks the whole line after)."""
     from captions import banned_hit
     m = re.match(r"^(\W*)(.*?)(\W*)$", word, re.S)
     pre, core, post = m.group(1), m.group(2), m.group(3)
@@ -358,159 +337,222 @@ def _mask_banned_word(word, banned):
     return pre + core + post
 
 
-def _chunk_words(words, banned, size=3, max_gap=0.7):
-    """Group scrubbed words into short synced phrase chunks (<= `size` words; a new
-    chunk also starts after a >max_gap pause). Each chunk carries clip-relative start/end."""
-    chunks, cur = [], []
+def map_words_to_output(words, start, segments):
+    """Map SOURCE-absolute word timings onto the FINAL output (clip) timeline.
+
+    `words`    : [{word,start,end}] in source-absolute seconds (already limited to the clip).
+    `start`    : the clip's source start — `segments` are relative to it (see compose: the
+                 input is seeked with -ss start, then trim=a:b runs on that seeked stream).
+    `segments` : the ordered clip-relative (a,b) spans compose PLAYS, in order — cold-open
+                 teaser first (when present), then the dead-air-trimmed body, already passed
+                 through cap_segments. This is the SAME list build_compose_cmd consumes.
+
+    Returns [{word,start,end}] in output seconds, sorted by start — each word rendered ONCE
+    per time it is actually HEARD in the output. Two dedup passes make that true:
+      (1) exact-duplicate SOURCE words are dropped first (whisper/index can emit the same
+          {word,start,end} twice — e.g. a re-indexed VOD — which otherwise renders "That
+          That"); and
+      (2) a single source word that straddles a played-segment BOUNDARY produces contiguous
+          output fragments, which we MERGE back into one event (tracked by source-word index).
+    A source word that plays in TWO non-adjacent segments — the cold-open teaser AND again in
+    the setup — is genuinely heard twice, so those two events are kept (they're far apart, not
+    contiguous). Fades/scale/loudnorm don't shift time, so the output timeline is exactly the
+    concatenation of the played segment durations."""
+    # (1) drop exact-duplicate source words (same text at the same source instant).
+    seen, uw = set(), []
     for w in words:
-        tok = _mask_banned_word(w["word"].strip(), banned)
+        key = (w["word"], round(float(w["start"]), 3), round(float(w["end"]), 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        uw.append(w)
+
+    raw, out_off = [], 0.0
+    for (a, b) in segments:
+        seg_dur = b - a
+        src_lo, src_hi = start + a, start + b            # source window this segment covers
+        for wi, w in enumerate(uw):
+            lo = max(float(w["start"]), src_lo)
+            hi = min(float(w["end"]), src_hi)
+            if hi <= lo:
+                continue
+            raw.append({"wi": wi, "word": w["word"],
+                        "start": out_off + (lo - src_lo),
+                        "end": out_off + (hi - src_lo)})
+        out_off += seg_dur
+    raw.sort(key=lambda e: (e["start"], e["end"]))
+
+    # (2) merge output-contiguous fragments of the SAME source word (boundary split). A gap
+    # (cold-open replay) leaves the two events apart, so they stay separate = heard twice.
+    events = []
+    for e in raw:
+        if events and events[-1]["wi"] == e["wi"] and e["start"] <= events[-1]["end"] + 0.06:
+            events[-1]["end"] = max(events[-1]["end"], e["end"])
+        else:
+            events.append(dict(e))
+    for e in events:
+        e.pop("wi", None)
+    return events
+
+
+def _group_lines(events, banned, max_words=5, max_gap=0.6):
+    """Group per-word events into short on-screen LINES (karaoke lines). A new line starts
+    after `max_words`, after a pause > `max_gap`, or once a word ends a sentence (. ! ?).
+    Each word is Title-Cased and banned-word-masked here (before it can reach the burn)."""
+    from captions import titlecase
+    lines, cur = [], []
+
+    def flush():
+        if cur:
+            lines.append(cur[:])
+            cur.clear()
+
+    for e in events:
+        raw = (e["word"] or "").strip()
+        tok = titlecase(strip_to_ascii(_mask_banned_word(raw, banned)))
         if not tok:
             continue
-        if cur and (len(cur) >= size or w["start"] - cur[-1]["end"] > max_gap):
-            chunks.append(_finish_chunk(cur)); cur = []
-        cur.append({"tok": tok, "start": w["start"], "end": w["end"]})
-    if cur:
-        chunks.append(_finish_chunk(cur))
-    return chunks
+        if cur and (len(cur) >= max_words or e["start"] - cur[-1]["end"] > max_gap):
+            flush()
+        cur.append({"tok": tok, "start": float(e["start"]), "end": float(e["end"])})
+        if re.search(r"[.!?]$", raw):
+            flush()
+    flush()
+    return lines
 
 
-def _finish_chunk(cur):
-    return {"text": " ".join(c["tok"] for c in cur).strip(),
-            "start": round(cur[0]["start"], 3), "end": round(cur[-1]["end"], 3)}
+def _ass_time(t):
+    """Seconds -> ASS timestamp H:MM:SS.cc (centiseconds)."""
+    t = max(0.0, float(t))
+    cs = int(round(t * 100))
+    h, cs = divmod(cs, 360000)
+    m, cs = divmod(cs, 6000)
+    s, cs = divmod(cs, 100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def _draw_text_lines(d, lines, box_w, y0, line_h, fill, stroke=0, stroke_fill="black", x_off=0):
-    """Draw already-wrapped text `lines` centered in `box_w`, top-down from y0."""
-    y = y0
-    for ln in lines:
-        total = sum(c["w"] for c in ln)
-        x = (box_w - total) / 2 + x_off
-        for c in ln:
-            if stroke > 0:
-                d.text((x, y), c["s"], font=c["font"], fill=fill,
-                       stroke_width=stroke, stroke_fill=stroke_fill)
-            else:
-                d.text((x, y), c["s"], font=c["font"], fill=fill)
-            x += c["w"]
-        y += line_h
+def _ass_escape(text):
+    """Neutralize ASS override syntax in literal subtitle text: braces open an override
+    block and backslash starts an escape, so remap them to safe look-alikes."""
+    return (text or "").replace("\\", "/").replace("{", "(").replace("}", ")")
 
 
-def render_subtitle_png(text, out_path, cfg, box_w=SUBTITLE_BOX_W, max_lines=2):
-    """A subtitle phrase chunk — DELIBERATELY a different KIND of element from the plated
-    hook, not just a smaller version of it. Default is clean white text FLOATING with a
-    soft drop shadow + thin outline (NO box), so it reads as plain spoken-word text while
-    the hook stays the plated headline. `subtitle_plate` (config, default FALSE) brings the
-    dark plate back if wanted. Smaller than the hook (`subtitle_font_scale`). Returns the
-    PNG height so the caller can vertically center it in the lower-band safe zone."""
-    plate_on = bool(cfg.get("subtitle_plate", False))            # default: NO plate — floats
-    plate_opacity = int(cfg.get("subtitle_plate_opacity", 70))
-    font_scale = float(cfg.get("subtitle_font_scale", 0.82))     # smaller than the hook text
-    stroke = int(cfg.get("caption_outline_width", 2))            # thin outline for legibility
-    # Soft drop-shadow (only when no plate) — carries legibility on bright OR dark footage
-    # without a box. Down-offset + blur reads as a natural shadow, not a second outline.
-    sh_blur = float(cfg.get("subtitle_shadow_blur", 4))
-    sh_dx = int(cfg.get("subtitle_shadow_dx", 0))
-    sh_dy = int(cfg.get("subtitle_shadow_dy", 4))
-    sh_op = int(cfg.get("subtitle_shadow_opacity", 200))
-    font_path = find_bold_font()
-    from captions import titlecase           # Title Case burned subtitles (same as captions)
-    text = titlecase(strip_to_ascii(text or "").strip()) or " "
-    scratch = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
-    pad_x, pad_y = SUBTITLE_PLATE_PAD_X, SUBTITLE_PLATE_PAD_Y
-    inner = box_w - 2 * pad_x - 12
-    smax = max(int(round(60 * font_scale)), 26)
-    smin = max(int(round(28 * font_scale)), 16)
-    size, lines, tf = smax, [[]], None
-    while size >= smin:
-        tf = ImageFont.truetype(font_path, size)
-        lines = _wrap_cells(_cells(text, tf, None, scratch), inner, max_lines)
-        if len(_wrap_cells(_cells(text, tf, None, scratch), inner, max_lines + 1)) <= max_lines:
-            break
-        size -= 4
-    ascent, descent = tf.getmetrics()
-    line_h = ascent + descent + 6
-    maxw = max((sum(c["w"] for c in ln) for ln in lines), default=0.0)
-
-    # Reserve margin for the soft-shadow bleed (blur + offset) when there's no plate, so
-    # the shadow isn't clipped at the PNG edges.
-    sh_margin = 0 if plate_on else int(round(sh_blur * 2 + max(abs(sh_dx), abs(sh_dy)) + stroke))
-    top = pad_y + sh_margin
-    img_h = line_h * len(lines) + 2 * pad_y + 2 * sh_margin
-    img = Image.new("RGBA", (box_w, img_h), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-
-    if plate_on and plate_opacity > 0 and maxw > 0:
-        pw = min(float(box_w), maxw + 2 * pad_x)
-        px0 = (box_w - pw) / 2
-        d.rounded_rectangle([px0, top - pad_y, px0 + pw, top - pad_y + line_h * len(lines) + 2 * pad_y],
-                            radius=SUBTITLE_PLATE_RADIUS, fill=(0, 0, 0, plate_opacity))
-    elif not plate_on and maxw > 0:
-        # SOFT DROP SHADOW (no box): draw the phrase black on its own layer (offset), blur
-        # it, and composite under the white text.
-        shadow = Image.new("RGBA", (box_w, img_h), (0, 0, 0, 0))
-        _draw_text_lines(ImageDraw.Draw(shadow), lines, box_w, top + sh_dy, line_h,
-                         fill=(0, 0, 0, sh_op), stroke=0, x_off=sh_dx)
-        img.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(sh_blur)))
-        d = ImageDraw.Draw(img)
-
-    _draw_text_lines(d, lines, box_w, top, line_h, fill="white",
-                     stroke=stroke, stroke_fill="black")
-    img.save(out_path)
-    return img_h
+def blur_fill_footage_bottom(src_w, src_h, zoom):
+    """Y (on the 1080x1920 canvas) of the BOTTOM edge of the footage rectangle under the
+    blur_fill layout — computed from the SAME geometry build_compose_cmd uses (fit the whole
+    frame into W*zoom x H preserving aspect, then center it vertically). Returns None if the
+    source dims are unknown, or if the footage fills the full height (a portrait/near-square
+    source leaves no letterbox band). Below this Y is the lower blurred/black band."""
+    try:
+        sw, sh = float(src_w), float(src_h)
+    except (TypeError, ValueError):
+        return None
+    if sw <= 0 or sh <= 0:
+        return None
+    zoom = max(1.0, float(zoom))
+    scale = min((W * zoom) / sw, H / sh)             # force_original_aspect_ratio=decrease
+    vis_h = min(sh * scale, H)                        # crop clamps height to the canvas
+    if vis_h >= H - 2:
+        return None                                  # no band — footage fills the frame
+    return (H + vis_h) / 2.0
 
 
-def _subtitle_overlay_cmd(body_path, out_path, chunks, cfg, has_audio):
-    center_y = int(cfg.get("subtitle_center_y", SUBTITLE_CENTER_Y))
-    threads = str(max(1, int(cfg.get("ffmpeg_threads", 2) or 2)))
-    cmd = ["ffmpeg", "-y", "-v", "error",
-           "-filter_complex_threads", threads, "-threads", threads, "-i", str(body_path)]
-    for ch in chunks:
-        cmd += ["-i", str(ch["_png"])]
-    fc, prev = [], "[0:v]"
-    for i, ch in enumerate(chunks):
-        y = int(center_y - ch["_h"] / 2)
-        out = "[vout]" if i == len(chunks) - 1 else f"[sv{i}]"
-        # eof_action=repeat keeps the single-frame PNG available for the whole clip;
-        # enable gates it to the phrase's [start,end]. Audio is copied (no re-encode).
-        fc.append(f"{prev}[{i + 1}:v]overlay=x=(W-w)/2:y={y}:eof_action=repeat:"
-                  f"enable='between(t,{ch['start']:.3f},{ch['end']:.3f})'{out}")
-        prev = out
-    cmd += ["-filter_complex", ";".join(fc), "-map", "[vout]"]
-    if has_audio:
-        cmd += ["-map", "0:a?", "-c:a", "copy"]
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out_path)]
-    return cmd
+def subtitle_top_y(cfg, src_w=None, src_h=None):
+    """Y (from the top of the 1920 canvas) at which the karaoke line's TOP should sit, so it
+    lands in the lower letterbox band BELOW the footage and never overlaps it. In blur_fill we
+    pin it `subtitle_band_margin` px under the computed footage bottom; without a band (crop_fill
+    or a full-height source) we fall back to `subtitle_center_y`. Config `subtitle_top_y` forces
+    an explicit value."""
+    forced = cfg.get("subtitle_top_y")
+    if forced is not None:
+        return int(forced)
+    margin = int(cfg.get("subtitle_band_margin", 28))
+    layout = str(cfg.get("layout", "blur_fill")).lower()
+    if layout != "crop_fill":
+        fb = blur_fill_footage_bottom(src_w, src_h, cfg.get("blur_fg_zoom", 1.2))
+        if fb is not None:
+            # keep it inside the band (leave room below for a 2nd line before the very bottom)
+            return int(min(fb + margin, H - 220))
+    return int(cfg.get("subtitle_center_y", SUBTITLE_CENTER_Y))
 
 
-def burn_subtitles(body_path, out_path, cfg, banned, tag, has_audio):
-    """Transcribe the FINAL clip, chunk into short synced phrases, scrub banned words,
-    and overlay karaoke-style subtitle PNGs into `out_path`. Returns True if subtitles
-    were burned, False if there was nothing to burn (body moved to out_path as-is)."""
-    if not has_audio:
-        os.replace(body_path, out_path); return False
-    chunks = _chunk_words(transcribe_clip_words(body_path), banned)
-    if not chunks:
-        os.replace(body_path, out_path); return False
+def _ass_header(cfg, top_y):
+    box_w = int(cfg.get("subtitle_box_w", SUBTITLE_BOX_W))
+    font = str(cfg.get("subtitle_font_name", "Arial"))
+    fontsize = int(cfg.get("subtitle_ass_fontsize", 54))
+    outline = int(cfg.get("subtitle_outline", cfg.get("caption_outline_width", 3)) or 0)
+    shadow = int(cfg.get("subtitle_shadow", 1))
+    side = max(0, (W - box_w) // 2)                  # keep text inside the safe box (x)
+    # Alignment 8 = TOP-center: MarginV is the gap from the FRAME TOP down to the text top, so
+    # the line starts at `top_y` (just under the footage) and any 2nd line grows DOWN into the
+    # band — it can never ride UP onto the footage. PrimaryColour white, OutlineColour black,
+    # semi-opaque shadow. &HAABBGGRR (AA=00 opaque).
+    margin_v = max(0, int(top_y))
+    return (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        "WrapStyle: 0\n"
+        "ScaledBorderAndShadow: yes\n"
+        f"PlayResX: {W}\n"
+        f"PlayResY: {H}\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Sub,{font},{fontsize},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,"
+        f"-1,0,0,0,100,100,0,0,1,{outline},{shadow},8,{side},{side},{margin_v},1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
 
+
+def build_ass(events, cfg, banned, out_path, top_y):
+    """Write a word-level karaoke ASS file for one clip and return its path, or None if
+    there's nothing to burn. Emits one Dialogue per word: the full line is shown, and the
+    active word is wrapped in an accent-colour + upscale override so it POPS, reverting as
+    the next word speaks. `top_y` pins the line's top into the lower letterbox band (see
+    subtitle_top_y). Re-checks each finished line for banned words (fail-loud)."""
+    lines = _group_lines(events, banned)
+    if not lines:
+        return None
     from captions import banned_hit
-    for i, ch in enumerate(chunks):
-        png = C.DRAFTS / f".sub_{tag:02d}_{i:03d}.png"
-        ch["_h"] = render_subtitle_png(ch["text"], png, cfg)
-        ch["_png"] = png
-        # DEFENSE-IN-DEPTH: same gauntlet pattern as captions — a banned word must never
-        # reach a burned subtitle. Masking above should have caught it; abort if not.
-        if banned_hit(ch["text"], banned):
-            for c in chunks:
-                if c.get("_png"):
-                    c["_png"].unlink(missing_ok=True)
-            C.fail(f"banned word slipped into a subtitle chunk ({ch['text']!r}) — aborting.")
+    accent = str(cfg.get("subtitle_accent_color", "&H00FFFF&"))   # ASS &HBBGGRR (default yellow)
+    scale = int(cfg.get("subtitle_active_scale", 110))            # % upscale of the active word
+    hold = float(cfg.get("subtitle_hold", 0.25))                  # linger after the last word
+    dialogues = []
+    for li, line in enumerate(lines):
+        toks = [w["tok"] for w in line]
+        # defense-in-depth: masking ran per-word already; abort if a banned word survived.
+        if banned_hit(" ".join(toks), banned):
+            C.fail(f"banned word slipped into a subtitle line ({' '.join(toks)!r}) — aborting.")
+        next_start = lines[li + 1][0]["start"] if li + 1 < len(lines) else None
+        line_end = line[-1]["end"] + hold
+        if next_start is not None:
+            line_end = min(line_end, next_start - 0.03)
+        for k, w in enumerate(line):
+            ev_start = w["start"]
+            ev_end = line[k + 1]["start"] if k + 1 < len(line) else max(w["end"], line_end)
+            if ev_end <= ev_start:
+                ev_end = ev_start + 0.05
+            parts = []
+            for j, tok in enumerate(toks):
+                safe = _ass_escape(tok)
+                if j == k:
+                    parts.append(f"{{\\c{accent}\\fscx{scale}\\fscy{scale}}}{safe}{{\\r}}")
+                else:
+                    parts.append(safe)
+            text = " ".join(parts)
+            dialogues.append(
+                f"Dialogue: 0,{_ass_time(ev_start)},{_ass_time(ev_end)},Sub,,0,0,0,,{text}")
+    out_path.write_text(_ass_header(cfg, top_y) + "\n".join(dialogues) + "\n", encoding="utf-8")
+    return out_path
 
-    C.run_cmd(_subtitle_overlay_cmd(body_path, out_path, chunks, cfg, has_audio),
-              desc=f"burning {len(chunks)} subtitle chunk(s) into {out_path.name}")
-    for ch in chunks:
-        ch["_png"].unlink(missing_ok=True)
-    return True
+
+def _ass_filter_arg(path):
+    """Escape an absolute path for use as the ffmpeg `ass` filter value: forward slashes,
+    escaped drive colon, single-quoted. Verified on Windows (C\\:/…/x.ass)."""
+    p = str(path).replace("\\", "/").replace(":", "\\:")
+    return f"ass='{p}'"
 
 
 # --- assets --------------------------------------------------------------------
@@ -685,15 +727,33 @@ def has_audio_stream(path):
     return bool((proc.stdout or "").strip())
 
 
+def probe_dimensions(path):
+    """(width, height) of the source's first video stream, or (None, None). Used to compute
+    the blur_fill letterbox band so subtitles land below the footage (see subtitle_top_y)."""
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    out = (proc.stdout or "").strip()
+    try:
+        w, h = out.split("x")[:2]
+        return int(w), int(h)
+    except (ValueError, IndexError):
+        return None, None
+
+
 def build_compose_cmd(source, start, end, segments, cold_open, caption_png, watermark_png,
-                      out_path, cfg, has_audio, n_audio=1):
+                      out_path, cfg, has_audio, n_audio=1, ass_path=None):
     """`segments` are clip-relative (a, b) spans played in order. When cold_open is set,
     segment 0 is the peak teaser (opened on the payoff) and segment 1 is the setup —
     a 2-frame fade straddles that cut so it reads as intentional. Remaining segments are
     the dead-air-trimmed body.
 
     Audio: ALL source tracks are merged (amix) so no audio is ever lost — this VOD keeps
-    the commentary/action on a 2nd track, and first-track-only left clips silent."""
+    the commentary/action on a 2nd track, and first-track-only left clips silent.
+
+    `ass_path` (optional): a word-level karaoke ASS file whose timings were mapped through
+    THESE same `segments` — burned last via libass, at 1080x1920 output resolution."""
     wm_scale = cfg.get("watermark_scale", 0.18)
     wm_margin = cfg.get("watermark_margin", 40)
     wm_w = int(W * wm_scale)
@@ -785,12 +845,18 @@ def build_compose_cmd(source, start, end, segments, cold_open, caption_png, wate
     # the whole clip (otherwise they'd show for one frame). The watermark is OPTIONAL: when
     # the campaign confirms none is required (watermark_png is None), we overlay only the
     # caption and add no watermark input — so no stale/wrong watermark is ever burned in.
+    # `vlast` is the composited-video label. When we have karaoke subtitles we burn them
+    # LAST (after the blur-fill + caption + watermark, so libass renders at 1080x1920 output
+    # res) by chaining the `ass` filter onto this label → [vout].
+    vlast = "[vpre]" if ass_path else "[vout]"
     if watermark_png:
         fc.append(f"[base][1:v]overlay=(W-w)/2:{CAPTION_TOP_Y}:eof_action=repeat[cap];")
         fc.append(f"[2:v]scale={wm_w}:-2[wm];")
-        fc.append(f"[cap][wm]overlay=W-w-{wm_margin}:H-h-{wm_margin + 20}:eof_action=repeat[vout]")
+        fc.append(f"[cap][wm]overlay=W-w-{wm_margin}:H-h-{wm_margin + 20}:eof_action=repeat{vlast}")
     else:
-        fc.append(f"[base][1:v]overlay=(W-w)/2:{CAPTION_TOP_Y}:eof_action=repeat[vout]")
+        fc.append(f"[base][1:v]overlay=(W-w)/2:{CAPTION_TOP_Y}:eof_action=repeat{vlast}")
+    if ass_path:
+        fc.append(f";[vpre]{_ass_filter_arg(ass_path)}[vout]")
 
     # Cap ffmpeg threads: each decode/filter/encode thread buffers frames, so fewer threads =
     # much lower peak RAM (helps avoid the 4K OOM alongside the downscale above). Default 2.
@@ -811,9 +877,9 @@ def build_compose_cmd(source, start, end, segments, cold_open, caption_png, wate
 
 
 def compose(source, start, end, segments, cold_open, caption_png, watermark_png, out_path,
-            cfg, has_audio, n_audio=1):
+            cfg, has_audio, n_audio=1, ass_path=None):
     cmd = build_compose_cmd(source, start, end, segments, cold_open, caption_png,
-                            watermark_png, out_path, cfg, has_audio, n_audio)
+                            watermark_png, out_path, cfg, has_audio, n_audio, ass_path)
     C.run_cmd(cmd, desc=f"cutting {out_path.name}")
 
 
@@ -841,6 +907,10 @@ def run(state):
         C.log("loaded campaign/knowledge.md for campaign context.")
     moments = C.load_json(C.MOMENTS_JSON) or {"sources": []}
     durations = _durations(moments.get("sources", []))
+    # Per-source word timings (index.py's whisper word_timestamps), mapped through each
+    # clip's segment reorder to drive the karaoke subtitles. Absent on a moments.json built
+    # before this feature — subtitles then no-op (re-run index to populate them).
+    words_by_source = {s["source"]: s.get("words", []) for s in moments.get("sources", [])}
 
     cfg = state.get("config", {})
     cmin = float(cfg.get("clip_min_seconds", 15))
@@ -849,16 +919,20 @@ def run(state):
     post = float(cfg.get("story_post_seconds", 15))
     layout = str(cfg.get("layout", "blur_fill")).lower()
     emoji_in_caption = bool(cfg.get("emoji_in_caption", True))
-    # Hook vs subtitle are visually DISTINCT and independently tunable. The HOOK is the
-    # scroll-stopper (larger text, denser plate); SUBTITLES recede as readability support
-    # (smaller text, lighter plate — read inside render_subtitle_png). Both plates hug the
-    # text and run at reduced opacity so neither is a bulky block. `plate_opacity` (legacy,
-    # shared) is superseded by hook_/subtitle_ specific knobs.
+    # Hook vs subtitle are visually DISTINCT layers. The HOOK is the plated scroll-stopper
+    # at the top (Pillow PNG, larger text, denser plate — hook_font_scale / hook_plate_opacity).
+    # The SUBTITLES are word-level karaoke lower-center (ASS/libass, build_ass) — a different
+    # KIND of element, not a smaller plate.
     hook_plate_opacity = int(cfg.get("hook_plate_opacity", 105))  # dark plate alpha (0-255; 0=off)
     hook_font_scale = float(cfg.get("hook_font_scale", 1.06))     # >1 = larger/bolder hook
     caption_outline = int(cfg.get("caption_outline_width", 2))  # text stroke px (0 = none)
-    # Burned subtitles need a whisper pass on each final clip → off in offline mode.
+    # Karaoke subtitles need per-word timings from index (whisper) → off in offline mode
+    # (index skips whisper) and when moments.json predates the feature (no words stored).
     subs_on = bool(cfg.get("subtitles_enabled", True)) and not C.offline_mode()
+    if subs_on and not any(words_by_source.values()):
+        C.warn("subtitles enabled but moments.json has no word timings — re-run the index "
+               "stage to populate them. Shipping clips WITHOUT karaoke subtitles.")
+        subs_on = False
     C.log(f"== cut layout mode: {layout} "
           f"({'whole frame on blurred bg, no crop' if layout != 'crop_fill' else 'COVER + center-crop'}) "
           f"| emoji_in_caption={emoji_in_caption} | subtitles={'on' if subs_on else 'off'} ==")
@@ -876,6 +950,7 @@ def run(state):
     C.DRAFTS.mkdir(parents=True, exist_ok=True)
     clips = sorted(caps["clips"], key=lambda c: (c.get("score") or 0), reverse=True)
     audio_cache = {}
+    dim_cache = {}
     manifest = []
     for rank, c in enumerate(clips, 1):
         # final rules gate (defensive — the gauntlet already filtered)
@@ -918,19 +993,31 @@ def run(state):
         render_caption_png(c["caption"], cap_png, emoji=emoji_in_caption,
                            stroke=caption_outline, plate_opacity=hook_plate_opacity,
                            font_scale=hook_font_scale)
-        subtitled = False
-        if subs_on:
-            # Compose to a temp body, THEN transcribe + burn subtitles into out_path so
-            # the whisper pass sees the final (cut/reordered) edit.
-            body = C.DRAFTS / f".body_{rank:02d}.mp4"
-            compose(src_path, start, end, segments, cold_open, cap_png, watermark, body,
-                    cfg, has_audio, n_audio)
-            subtitled = burn_subtitles(body, out_path, cfg, banned, rank, has_audio)
-            body.unlink(missing_ok=True)
-        else:
-            compose(src_path, start, end, segments, cold_open, cap_png, watermark, out_path,
-                    cfg, has_audio, n_audio)
+
+        # KARAOKE SUBTITLES: take the clip's source words, map them through the SAME
+        # `segments` compose plays (cold-open reorder + dead-air trims), and write an ASS
+        # file whose per-word events land on the final output timeline. build_compose_cmd
+        # burns it last (after the blur-fill), so it stays synced to the reordered edit.
+        ass_path = None
+        if subs_on and has_audio:
+            src_words = [w for w in words_by_source.get(c["source"], [])
+                         if float(w["end"]) > start and float(w["start"]) < end]
+            events = map_words_to_output(src_words, start, segments)
+            # Pin the karaoke line into the lower letterbox band BELOW the footage, using the
+            # same blur_fill geometry compose renders (source aspect drives the band height).
+            if c["source"] not in dim_cache:
+                dim_cache[c["source"]] = probe_dimensions(src_path)
+            sw, sh = dim_cache[c["source"]]
+            top_y = subtitle_top_y(cfg, sw, sh)
+            ass_file = C.DRAFTS / f".sub_{rank:02d}.ass"
+            ass_path = build_ass(events, cfg, banned, ass_file, top_y)
+        subtitled = ass_path is not None
+
+        compose(src_path, start, end, segments, cold_open, cap_png, watermark, out_path,
+                cfg, has_audio, n_audio, ass_path=ass_path)
         cap_png.unlink(missing_ok=True)
+        if ass_path:
+            ass_path.unlink(missing_ok=True)
         C.log(f"  {'cold-open ' if cold_open else ''}{'subtitled ' if subtitled else ''}cut {name}")
 
         manifest.append({

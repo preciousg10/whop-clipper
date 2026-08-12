@@ -52,7 +52,7 @@ hand-placed files (fail-loud if the pick or its files are missing).
 
 `intake.py` (brief+links) → `campaign/{brief.md, rules.json, knowledge.md, manifest.json}`
 + `footage/ assets/ docs/ other/`
-→ `index.py` → `campaign/moments.json` (whisper transcript + audio-spike moments)
+→ `index.py` → `campaign/moments.json` (whisper transcript + per-word timings + audio-spike moments)
 → `selectclips.py` → `campaign/selected.json`
 → `captions.py` → `campaign/captions.json`
 → `cut.py` → `drafts/NN_score_slug.mp4` + `drafts/manifest.json`.
@@ -76,7 +76,10 @@ into `memory/longterm.md`.**
 - **Fail loud, never guess.** Missing tool / ambiguous rule / no footage → `C.fail(...)`
   and stop. Intake flags ambiguities for the user rather than inventing rules.
 - **Everything is resumable.** New work must checkpoint to `state.json` (and to disk)
-  before the next step. `index.py` checkpoints per 5-min VOD chunk — preserve that.
+  before the next step. `index.py` checkpoints per 5-min VOD chunk — preserve that. It
+  REUSES the on-disk transcript/rms/words partials ONLY when `chunks_done > 0` (a genuine
+  resume); a fresh start or `--force` (which resets `chunks_done` to 0) ignores the stale
+  partials and rebuilds — appending to them instead DOUBLES the transcript/words.
 - **Stage checkpoints are per-campaign.** `common.activate_campaign(state, name)` scopes
   `state["stages"]` to the active campaign (inactive ones stashed under
   `state["campaigns"][name]`); switching campaigns runs fresh WITHOUT `--force` and moves
@@ -105,24 +108,42 @@ into `memory/longterm.md`.**
   nothing clears it we ship the best available, capped conservatively.
 - **Caption + subtitle case is Title Case (Like This), per user preference** —
   `captions.titlecase` is the single choke point, applied in `finalize_caption` (hook caption)
-  AND `cut.render_subtitle_png` (burned subtitles). It capitalizes each word's first letter and
-  leaves the rest untouched, so contractions and emoji survive ("don't"→"Don't", masked
-  "b**"→"B**"). This OVERRODE the old lowercase default. `emoji_in_caption` (config, default true) keeps emoji;
-  cut renders them with a color-emoji font and DROPS any glyph the font can't draw so a
-  tofu box never ships. Tofu-detection uses fontTools' live cmap if installed, else a
-  curated allowlist (`cut._ALLOWED_EMOJI_CP`) — because Segoe UI Emoji draws unknown code
-  points as a visible box that a pixel probe can't distinguish from a real glyph.
-- **Burned subtitles** (`subtitles_enabled`, config default true; auto-off in offline
-  mode — needs whisper). Karaoke-style short phrase chunks, rendered as Pillow PNGs and
-  overlaid via `enable='between(t,…)'` (same PNG approach as captions). Timing is
-  edit-proof: cut RE-TRANSCRIBES the FINAL 30s clip (`cut.transcribe_clip_words`) rather
-  than remapping source timestamps, because cold-open reorder + dead-air trims desync the
-  source. **Campaign-banned words are masked before burn** (`cut._mask_banned_word`) and
-  re-checked per chunk (fail loud if one slips) — same gauntlet discipline as captions.
-  Subtitles are pushed DOWN into the lower letterbox/black band, OFF the footage frame
-  (`SUBTITLE_CENTER_Y`=1440 ≈ 75% down, `_BOX_W`=640 centered): below the footage (which in
-  blur_fill occupies ~y595-1325), clear of the top hook plate, the bottom-right watermark, and
-  the bottom UI / right action-rail notch.
+  AND `cut._group_lines` (per subtitle word, before it reaches the ASS). It capitalizes each
+  word's first letter and leaves the rest untouched, so contractions survive ("don't"→"Don't",
+  masked "b**"→"B**"). This OVERRODE the old lowercase default. `emoji_in_caption` (config,
+  default true) keeps emoji IN THE HOOK caption; cut renders them with a color-emoji font and
+  DROPS any glyph the font can't draw so a tofu box never ships. Tofu-detection uses fontTools'
+  live cmap if installed, else a curated allowlist (`cut._ALLOWED_EMOJI_CP`) — because Segoe UI
+  Emoji draws unknown code points as a visible box that a pixel probe can't distinguish from a
+  real glyph. (Karaoke subtitles are ASCII-only — spoken words, no emoji.)
+- **Word-level karaoke subtitles** (`subtitles_enabled`, config default true; auto-off in
+  offline mode and when moments.json predates the feature — both lack word timings).
+  Rendered via **ASS/libass** (`cut.build_ass`), NOT Pillow/drawtext: one ASS Dialogue per
+  word shows the FULL line with only the currently-spoken word wrapped in an accent colour +
+  upscale override (`{\c<accent>\fscxNNN\fscyNNN}word{\r}`) so it POPS, reverting as the next
+  word speaks. Accent is a per-account config value in ASS `&HBBGGRR` order (reversed hex),
+  `subtitle_accent_color`, default punchy yellow `&H00FFFF&`. **Timing (the critical part):**
+  index.py stores per-word `{word,start,end}` (whisper `word_timestamps`) in moments.json;
+  cut.py's `map_words_to_output` maps those SOURCE-absolute times through the EXACT same
+  `segments` list compose plays (cold-open reorder + dead-air trims + cmax tail cut), so a word
+  shown in the cold-open teaser AND again in the setup lands correctly in both — **do NOT
+  remap against source order or captions drift silently.** `map_words_to_output` renders each
+  word ONCE PER TIME IT IS HEARD via two dedup passes: it drops exact-duplicate SOURCE words
+  (whisper/index can emit the same `{word,start,end}` twice — e.g. a re-indexed VOD — which
+  otherwise burned "That That"), and merges the contiguous output fragments a single word
+  produces when it straddles a segment boundary; the two far-apart events from a real cold-open
+  replay are KEPT (heard twice). The `ass` filter is chained LAST in `build_compose_cmd` (after
+  the 1080x1920 blur-fill) so subs render at output res; its Windows path is escaped via
+  `_ass_filter_arg` (`ass='C\:/…/x.ass'`). **Campaign-banned words are masked before burn**
+  (`cut._mask_banned_word`) and each finished line is re-checked (fail loud if one slips) —
+  same gauntlet discipline as captions. **Placement** must never sit on the footage: the line's
+  TOP is pinned into the lower letterbox band via ASS Alignment 8 (top-center) + MarginV=`top_y`,
+  where `subtitle_top_y` computes the footage-rectangle bottom from the SAME blur_fill geometry
+  compose renders (`blur_fill_footage_bottom`, driven by the source aspect via `probe_dimensions`)
+  and drops `subtitle_band_margin` px below it — so a 2nd line grows DOWN into the band, never up
+  onto the footage. `SUBTITLE_BOX_W`=640 → MarginL/R (safe box); `SUBTITLE_CENTER_Y`=1440 is only
+  the fallback (crop_fill / full-height source with no band). Clear of the top hook plate, the
+  bottom-right watermark, and the bottom UI / right action-rail notch.
 - **Merge discipline (select):** `merge_gap_seconds` (7) + `merge_max_span_seconds` (60)
   keep a merged moment one real beat; over-length moments are NOT clamped from the start —
   `cut.clip_bounds` centers the clip window on the moment's peak. Every speech moment now

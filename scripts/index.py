@@ -128,18 +128,30 @@ def _rms_per_second(audio):
 def _transcribe_audio(audio, offset):
     """Transcribe an in-memory 16kHz mono chunk. faster-whisper accepts a float32 numpy
     array in [-1, 1], so we normalize the int16-scaled samples here (we already hold the
-    samples — no need to re-open a file)."""
+    samples — no need to re-open a file).
+
+    Returns (segments, words): segment-level text (as before) AND per-word timings
+    {word,start,end}. Word timings power the karaoke-style burned subtitles in cut.py,
+    which maps them through the cold-open reorder onto the FINAL clip timeline — so we
+    persist them at INDEX time (one whisper pass) instead of re-transcribing every clip.
+    Both are offset to ABSOLUTE source seconds (chunk offset + segment/word time)."""
     model = _get_model()
     segments, _info = model.transcribe(audio / 32768.0, word_timestamps=True)
-    out = []
+    segs, words = [], []
     for seg in segments:
         text = (seg.text or "").strip()
-        if not text:
-            continue
-        out.append({"start": round(offset + seg.start, 2),
-                    "end": round(offset + seg.end, 2),
-                    "text": text})
-    return out
+        if text:
+            segs.append({"start": round(offset + seg.start, 2),
+                         "end": round(offset + seg.end, 2),
+                         "text": text})
+        for w in (seg.words or []):
+            wt = (w.word or "").strip()
+            if not wt:
+                continue
+            words.append({"word": wt,
+                          "start": round(offset + float(w.start), 3),
+                          "end": round(offset + float(w.end), 3)})
+    return segs, words
 
 
 # --- moment construction -------------------------------------------------------
@@ -201,7 +213,8 @@ def _speech_moments(source, transcript, rms=None):
 # --- per-source indexing (chunked + resumable) ---------------------------------
 def _partial_paths(name):
     return (C.TRANSCRIPTS / f"{name}.transcript.json",
-            C.TRANSCRIPTS / f"{name}.rms.json")
+            C.TRANSCRIPTS / f"{name}.rms.json",
+            C.TRANSCRIPTS / f"{name}.words.json")
 
 
 def index_source(entry, state, do_transcribe):
@@ -214,9 +227,15 @@ def index_source(entry, state, do_transcribe):
     ss = idx_state["sources"].setdefault(name, {"chunks_total": chunks_total, "chunks_done": 0})
     ss["chunks_total"] = chunks_total
 
-    tr_path, rms_path = _partial_paths(name)
-    transcript = C.load_json(tr_path, default=[]) or []
-    rms_vals = C.load_json(rms_path, default=[]) or []
+    tr_path, rms_path, words_path = _partial_paths(name)
+    # Only REUSE the on-disk partials when we're genuinely resuming (chunks_done > 0). On a
+    # fresh start — a brand-new source or a --force re-run (which pops the stage so chunks_done
+    # resets to 0) — the old partials are stale: appending to them DOUBLES the transcript/words
+    # (each re-run walks every chunk again). Start empty and let the per-chunk save overwrite.
+    resuming = ss["chunks_done"] > 0
+    transcript = (C.load_json(tr_path, default=[]) or []) if resuming else []
+    rms_vals = (C.load_json(rms_path, default=[]) or []) if resuming else []
+    words = (C.load_json(words_path, default=[]) or []) if resuming else []
 
     # Extract the whole audio track ONCE to a small wav (resumes reuse it — it's only
     # deleted after every chunk is done), then walk it in CHUNK_SEC slices. The multi-GB
@@ -232,10 +251,13 @@ def index_source(entry, state, do_transcribe):
         audio = _read_wav_slice(audio_wav, start, dur)
         rms_vals.extend([round(float(v), 2) for v in _rms_per_second(audio)])
         if do_transcribe:
-            transcript.extend(_transcribe_audio(audio, start))
+            segs, chunk_words = _transcribe_audio(audio, start)
+            transcript.extend(segs)
+            words.extend(chunk_words)
         # checkpoint after each chunk
         C.save_json(tr_path, transcript)
         C.save_json(rms_path, rms_vals)
+        C.save_json(words_path, words)
         ss["chunks_done"] = ci + 1
         C.save_state(state)
         done_min = int((ci + 1) * CHUNK_SEC / 60)
@@ -250,7 +272,7 @@ def index_source(entry, state, do_transcribe):
                + _speech_moments(entry["path"], transcript, rms))
     return {"source": entry["path"], "duration_sec": round(duration, 2),
             "safe_margin": entry.get("safe_margin", False),
-            "transcript": transcript, "moments": moments}
+            "transcript": transcript, "words": words, "moments": moments}
 
 
 def run(state):

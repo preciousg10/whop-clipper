@@ -47,7 +47,15 @@ DEFAULT_CONFIG = {
     "story_pre_seconds": 4,        # start AT the action — minimal setup lead-in (max)
     "story_post_seconds": 4,       # end near the payoff — minimal resolution tail (max)
     "emoji_in_caption": True,      # flzsh DNA: keep emoji as caption punctuation
-    "subtitles_enabled": True,     # burn synced karaoke-style spoken-word subtitles
+    "subtitles_enabled": True,     # burn word-level karaoke spoken-word subtitles (ASS/libass)
+    # Karaoke subtitle look (lower-center, ASS/libass). The active (currently-spoken) word
+    # pops in the accent colour + upscale, then reverts as the next word speaks. Accent is a
+    # per-account/config value in ASS &HBBGGRR order (reversed hex) — default punchy yellow.
+    "subtitle_accent_color": "&H00FFFF&",  # active-word colour (ASS &HBBGGRR); yellow
+    "subtitle_active_scale": 110,  # % upscale applied to the active word (the "pop")
+    "subtitle_ass_fontsize": 54,   # subtitle font size at 1080x1920 output res
+    "subtitle_band_margin": 28,    # px below the footage rectangle to pin the karaoke line
+                                   # (blur_fill) so it sits in the lower black band, off the video
     # Caption/subtitle readability (understated but always legible on any background). The dark
     # plate guarantees white-text contrast; keep the outline thin so it stays clean.
     "plate_opacity": 120,          # dark plate alpha behind caption+subtitles (0-255; 0 = off)
