@@ -247,7 +247,7 @@ def _score_batch(client, campaign, knowledge, batch, n):
             f"quality second. Confirm the audio spike is a real good moment, not just loud "
             f"(id, type, intensity, start seconds t, peak second, transcript text):\n"
             f"{json.dumps(lines, ensure_ascii=False)}")
-    raw = C.groq_chat(client, system, user, temperature=0.4, max_tokens=900)
+    raw = C.llm_chat(client, system, user, temperature=0.4, max_tokens=900)
     arr = _parse_json_array(raw)
     if not arr:
         C.warn("Groq returned unparseable scores for a batch — skipping it.")
@@ -373,11 +373,12 @@ def run(state):
 
     campaign = (C.load_json(C.RULES_JSON) or {}).get("campaign", state.get("campaign") or "campaign")
 
-    client = C.groq_client()
+    client = C.llm_client(cfg)
     if client is None:
-        C.warn("offline mode — selecting via heuristic (no Groq).")
+        C.warn("offline mode — selecting via heuristic (no LLM).")
         selected = _heuristic_scores(moments, min(n, hard_cap), min_sep)
     else:
+        C.log(f"select: LLM provider = {client.status()}")
         selected = _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap)
 
     if not selected:

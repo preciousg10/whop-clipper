@@ -337,7 +337,7 @@ def _label_sound_beats(client, context, beats):
     user = (f"Surrounding transcript: {context!r}\n"
             f"Audience: {C.AUDIENCE_CONTEXT}\n"
             f"Non-speech moments (index, loudness intensity): {json.dumps(payload)}")
-    raw = C.groq_chat(client, system, user, temperature=0.3, max_tokens=200)
+    raw = C.llm_chat(client, system, user, temperature=0.3, max_tokens=200)
     m = re.search(r"\[.*\]", raw, re.S)
     if not m:
         return []
@@ -396,7 +396,7 @@ def _groq_candidates(client, campaign, moment, style_notes, event="", emoji_in_c
               f"referencing the actual moment.")
     last = ""
     for _attempt in range(3):                          # initial + up to 2 retries
-        last = C.groq_chat(client, system, user, temperature=0.9, max_tokens=320)
+        last = C.llm_chat(client, system, user, temperature=0.9, max_tokens=320)
         cands = [c for c in _parse_caption_lines(last) if c][:N_CANDIDATES]
         if len(cands) >= 3:
             return cands
@@ -496,9 +496,11 @@ def run(state):
     for mm in moments_doc.get("moments", []):
         if mm.get("type") == "audio_spike":
             spikes_by_source.setdefault(mm["source"], []).append(mm)
-    client = C.groq_client()
+    client = C.llm_client(cfg)
     if client is None:
-        C.warn("offline mode — generating captions from templates (no Groq).")
+        C.warn("offline mode — generating captions from templates (no LLM).")
+    else:
+        C.log(f"captions: LLM provider = {client.status()}")
 
     # RESUME (Unit 2b): reload any clips already captioned (checkpointed after each one) so a
     # prior DAILY-cap stop doesn't re-spend Groq on completed clips. We skip done moment ids,

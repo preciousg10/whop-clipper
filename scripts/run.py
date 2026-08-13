@@ -33,6 +33,10 @@ DEFAULT_CONFIG = {
     # call downstream, so this stops a runaway from burning the free tier overnight).
     "select_hard_cap": 50,
     "select_min_quality": 60,
+    # LLM failover chain order (Unit: never dead-end on one provider's daily cap). All free-tier;
+    # keys come ONLY from env (GROQ_API_KEY / GEMINI_API_KEY / CEREBRAS_API_KEY). Drop a name to
+    # disable it, or reorder. A provider with a missing key/library is skipped automatically.
+    "llm_providers": ["groq", "gemini", "cerebras"],
     "layout": "blur_fill",         # vertical fill: "blur_fill" (whole frame, blurred bg)
                                    # or "crop_fill" (COVER + center-crop, crops edges)
     "blur_fg_zoom": 1.2,           # blur_fill foreground zoom: 1.0 = pure no-crop

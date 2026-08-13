@@ -53,6 +53,10 @@ CAPTIONS_PARTIAL = CAMPAIGN / "captions_partial.json"
 # selection and caption quality. 70B scores consistently with sensible reasons.
 # Override with GROQ_MODEL=llama-3.1-8b-instant if you hit free-tier daily token limits.
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+# LLM FAILOVER CHAIN models (all free-tier). Order + enable via config `llm_providers`.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+CEREBRAS_MODEL = os.environ.get("CEREBRAS_MODEL", "llama-3.3-70b")
+DEFAULT_LLM_PROVIDERS = ["groq", "gemini", "cerebras"]
 
 # The mandatory blocklist floor for the current campaign context (WTF Leagues).
 # Intake merges these with anything it finds in the brief.
@@ -283,81 +287,244 @@ def audio_stream_count(path):
     return len([ln for ln in (proc.stdout or "").splitlines() if ln.strip()])
 
 
-# --- groq ----------------------------------------------------------------------
-def groq_client():
-    """Return a Groq client, or None in offline mode. Fail loud if the key/package
-    is missing in a normal (non-offline) run."""
-    if offline_mode():
-        return None
-    key = os.environ.get("GROQ_API_KEY")
-    if not key:
-        fail("GROQ_API_KEY is not set. Set it (export GROQ_API_KEY=...) or run in "
-             "offline test mode with CLIPPER_OFFLINE=1.")
-    try:
-        from groq import Groq
-    except ImportError:
-        fail("the 'groq' package is not installed. Run: pip install -r requirements.txt")
-    return Groq(api_key=key)
-
-
-# A required wait longer than this is a DAILY cap, not a per-minute one (per-minute waits are
-# seconds; daily waits are minutes/hours). Retrying into a daily cap only hangs the run.
-_MAX_MINUTE_WAIT_S = 90.0
+# --- LLM failover chain: Groq -> Gemini -> Cerebras --------------------------------
+# All three are free-tier; stacking them ~triples daily capacity. Keys come ONLY from env
+# vars — never hardcoded, never written to disk. On a DAILY cap (or a very long retry-after)
+# we switch to the NEXT provider for the rest of the run and STAY there; short per-minute
+# limits back off + retry on the CURRENT provider first. All three capped -> GroqDailyCapError
+# (the caller checkpoints + stops resumably). Every provider returns a PLAIN STRING so the
+# existing select/caption JSON parsers are unchanged.
+_MAX_MINUTE_WAIT_S = 90.0     # a required wait longer than this reads as a daily cap
 
 
 def _parse_wait_seconds(msg):
-    """Seconds from a Groq 'try again in 5m30s' / '8.5s' / '2h34m' hint, or None."""
+    """Seconds from a provider's retry hint — Groq 'try again in 5m30s', Gemini
+    'retry_delay { seconds: N }', or 'retry after Ns' — or None."""
     m = re.search(r"try again in ([0-9hms.\s]+)", msg, re.I)
-    if not m:
-        return None
-    total, found = 0.0, False
-    for val, unit in re.findall(r"([\d.]+)\s*(h|m|s)", m.group(1), re.I):
-        found = True
-        total += float(val) * {"h": 3600, "m": 60, "s": 1}[unit.lower()]
-    return total if found else None
+    if m:
+        total, found = 0.0, False
+        for val, unit in re.findall(r"([\d.]+)\s*(h|m|s)", m.group(1), re.I):
+            found = True
+            total += float(val) * {"h": 3600, "m": 60, "s": 1}[unit.lower()]
+        if found:
+            return total
+    m = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", msg, re.I)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"retry[\s_-]*after[\"'\s:]*(\d+)", msg, re.I)
+    if m:
+        return float(m.group(1))
+    return None
 
 
 def classify_rate_limit(msg):
-    """('daily' | 'minute' | 'error', wait_seconds_or_None). Mirrors scout's classifier: 'daily'
-    = TPD/RPD/'per day' or a wait longer than a per-minute window (retrying can't help today);
-    'minute' = a short recoverable per-minute (TPM/RPM) limit; 'error' = a non-rate failure."""
+    """('daily' | 'minute' | 'error', wait_seconds_or_None) — works across Groq (TPD/RPD),
+    Gemini (…PerDay/…PerMinute quota, ResourceExhausted) and Cerebras/OpenAI (429 rate limit).
+    'daily' = per-day quota or a wait longer than a per-minute window (switch providers);
+    'minute' = a short recoverable per-minute limit (back off, retry same); 'error' = non-rate."""
     low = msg.lower()
     is_rate = ("429" in msg or "rate limit" in low or "rate_limit" in low
-               or "tpm" in low or "tpd" in low or "rpm" in low or "rpd" in low)
+               or "tpm" in low or "tpd" in low or "rpm" in low or "rpd" in low
+               or "quota" in low or "resource_exhausted" in low or "resourceexhausted" in low
+               or "insufficient_quota" in low)
     if not is_rate:
         return "error", None
     wait = _parse_wait_seconds(msg)
-    is_daily = ("per day" in low or "tpd" in low or "rpd" in low or "daily" in low
-                or (wait is not None and wait > _MAX_MINUTE_WAIT_S))
-    return ("daily" if is_daily else "minute"), wait
+    daily = any(k in low for k in ("per day", "perday", "per_day", "tpd", "rpd", "daily",
+                                   "requests per day", "tokens per day"))
+    minute = any(k in low for k in ("per minute", "perminute", "per_minute", "tpm", "rpm"))
+    if daily and not minute:
+        return "daily", wait
+    if minute and not daily:
+        return "minute", wait
+    # ambiguous (bare 'quota' / 'resource_exhausted'): decide by the wait hint.
+    if wait is not None and wait > _MAX_MINUTE_WAIT_S:
+        return "daily", wait
+    return "minute", wait
+
+
+# --- per-provider adapters (each returns a PLAIN STRING; keys read from env only) ----------
+class _GroqProvider:
+    name = "GROQ"
+
+    def __init__(self):
+        from groq import Groq
+        self.model = GROQ_MODEL
+        self._client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+    def complete(self, system, user, temperature, max_tokens):
+        resp = self._client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            temperature=temperature, max_tokens=max_tokens)
+        return resp.choices[0].message.content or ""
+
+
+class _GeminiProvider:
+    name = "GEMINI"
+
+    def __init__(self):
+        import warnings
+        with warnings.catch_warnings():          # hush the lib's own deprecation FutureWarning
+            warnings.simplefilter("ignore")
+            import google.generativeai as genai
+        self.model = GEMINI_MODEL
+        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+        self._genai = genai
+
+    def complete(self, system, user, temperature, max_tokens):
+        model = self._genai.GenerativeModel(self.model, system_instruction=system)
+        resp = model.generate_content(
+            user, generation_config={"temperature": temperature,
+                                     "max_output_tokens": max_tokens})
+        # Normalize to a plain string like the OpenAI-shaped providers. `.text` raises when a
+        # response was blocked/empty — fall back to stitching candidate parts, else "".
+        try:
+            return resp.text or ""
+        except Exception:
+            out = []
+            for cand in (getattr(resp, "candidates", None) or []):
+                for part in (getattr(getattr(cand, "content", None), "parts", None) or []):
+                    if getattr(part, "text", None):
+                        out.append(part.text)
+            return "".join(out)
+
+
+class _CerebrasProvider:
+    name = "CEREBRAS"
+
+    def __init__(self):
+        from openai import OpenAI          # Cerebras exposes an OpenAI-compatible endpoint
+        self.model = CEREBRAS_MODEL
+        self._client = OpenAI(api_key=os.environ["CEREBRAS_API_KEY"],
+                              base_url="https://api.cerebras.ai/v1")
+
+    def complete(self, system, user, temperature, max_tokens):
+        resp = self._client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            temperature=temperature, max_tokens=max_tokens)
+        return resp.choices[0].message.content or ""
+
+
+_PROVIDER_SPECS = {
+    "groq": ("GROQ_API_KEY", _GroqProvider),
+    "gemini": ("GEMINI_API_KEY", _GeminiProvider),
+    "cerebras": ("CEREBRAS_API_KEY", _CerebrasProvider),
+}
+_MISSING_WARNED = set()      # warn once per missing provider
+
+
+def _make_provider(name):
+    """Build a provider if its key is set and its library imports; else None (skip it)."""
+    spec = _PROVIDER_SPECS.get(name)
+    if not spec:
+        warn(f"unknown LLM provider '{name}' in llm_providers — skipping.")
+        return None
+    env_key, cls = spec
+    if not os.environ.get(env_key):
+        if name not in _MISSING_WARNED:
+            warn(f"LLM provider {name.upper()} skipped — {env_key} not set.")
+            _MISSING_WARNED.add(name)
+        return None
+    try:
+        return cls()
+    except Exception as e:
+        if name not in _MISSING_WARNED:
+            warn(f"LLM provider {name.upper()} unavailable ({e.__class__.__name__}: {e}) — skipping.")
+            _MISSING_WARNED.add(name)
+        return None
+
+
+class LLMChain:
+    """An ordered chain of available providers with a CURRENT pointer. On a daily cap the
+    pointer advances (and never rewinds within the process); per-minute limits retry in place.
+    A process restart (a fresh `run.py`) rebuilds the chain at the front (Groq)."""
+
+    def __init__(self, providers):
+        self.providers = providers
+        self.idx = 0
+        self._answered = set()
+
+    def status(self):
+        chain = "→".join(p.name for p in self.providers)
+        return f"{chain} (active: {self.providers[self.idx].name})"
+
+    def _try(self, p, system, user, temperature, max_tokens, retries):
+        """(text, 'ok', None) on success, or (None, 'failover', reason). Backs off + retries a
+        short per-minute limit (or transient error) on THIS provider before giving up."""
+        for attempt in range(retries + 1):
+            try:
+                return p.complete(system, user, temperature, max_tokens), "ok", None
+            except Exception as e:
+                kind, wait = classify_rate_limit(str(e))
+                if kind == "daily":
+                    return None, "failover", f"{p.name} DAILY cap"
+                if attempt < retries:
+                    w = (wait + 0.5) if (wait and kind == "minute") else min(2.0 * (attempt + 1), 20.0)
+                    warn(f"{p.name} {'rate limit' if kind == 'minute' else 'error'} "
+                         f"({str(e)[:80]}) — retry in {w:.1f}s ({attempt + 1}/{retries})…")
+                    time.sleep(w)
+                    continue
+                return None, "failover", (f"{p.name} per-minute limit persisted"
+                                          if kind == "minute" else f"{p.name} error: {str(e)[:80]}")
+
+    def chat(self, system, user, temperature=0.8, max_tokens=1024, retries=6):
+        tried = []
+        while self.idx < len(self.providers):
+            p = self.providers[self.idx]
+            text, action, reason = self._try(p, system, user, temperature, max_tokens, retries)
+            if action == "ok":
+                if p.name not in self._answered:      # log which provider answered (once each)
+                    log(f"LLM: answered by {p.name} ({p.model}).")
+                    self._answered.add(p.name)
+                return text
+            tried.append(p.name)
+            nxt = self.providers[self.idx + 1].name if self.idx + 1 < len(self.providers) else None
+            if nxt:
+                warn(f"{reason} — failing over to {nxt}.")
+            else:
+                warn(f"{reason} — no more providers in the chain.")
+            self.idx += 1
+        raise GroqDailyCapError(
+            f"all LLM providers capped/unavailable ({', '.join(tried)}) — checkpoint and "
+            f"--resume after a quota resets.")
+
+
+_LLM_CHAIN = None
+
+
+def llm_client(cfg=None):
+    """The process-wide LLM failover chain (Groq→Gemini→Cerebras by default), or None in offline
+    mode. Built ONCE: order/enable comes from cfg['llm_providers']; a provider with a missing key
+    or library is dropped (warned once). Fail loud only if NONE are available."""
+    global _LLM_CHAIN
+    if offline_mode():
+        return None
+    if _LLM_CHAIN is None:
+        order = list((cfg or {}).get("llm_providers") or DEFAULT_LLM_PROVIDERS)
+        providers = [p for p in (_make_provider(str(n).lower().strip()) for n in order) if p]
+        if not providers:
+            fail("no LLM provider available — set at least one of GROQ_API_KEY / GEMINI_API_KEY "
+                 "/ CEREBRAS_API_KEY (or run offline with CLIPPER_OFFLINE=1).")
+        _LLM_CHAIN = LLMChain(providers)
+        log(f"LLM chain ready: {_LLM_CHAIN.status()}")
+    return _LLM_CHAIN
+
+
+def llm_chat(chain, system, user, temperature=0.8, max_tokens=1024, retries=6):
+    """One completion through the failover chain. Raises GroqDailyCapError only when EVERY
+    provider is capped/unavailable (caller then checkpoints + stops resumably)."""
+    return chain.chat(system, user, temperature=temperature, max_tokens=max_tokens, retries=retries)
+
+
+# Back-compat aliases — existing call sites (intake/analyze) get failover with no changes.
+def groq_client():
+    return llm_client()
 
 
 def groq_chat(client, system, user, temperature=0.8, max_tokens=1024, retries=6):
-    """One chat completion. A short PER-MINUTE rate limit (429 TPM/RPM) is transient: back off
-    and retry, honoring Groq's 'try again in Xs' hint. A DAILY cap (TPD/RPD, or a wait longer
-    than a per-minute window) raises GroqDailyCapError immediately — retrying a dead daily quota
-    only hangs the run; the caller checkpoints + stops resumably. Any other error fails loud."""
-    for attempt in range(retries + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": user}],
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            return resp.choices[0].message.content or ""
-        except GroqDailyCapError:
-            raise
-        except Exception as e:
-            msg = str(e)
-            kind, wait = classify_rate_limit(msg)
-            if kind == "daily":
-                raise GroqDailyCapError(msg, retry_after=wait)
-            if kind == "minute" and attempt < retries:
-                w = (wait + 0.5) if wait else min(2.0 * (attempt + 1), 20.0)
-                warn(f"Groq rate limit — waiting {w:.1f}s then retrying "
-                     f"(attempt {attempt + 1}/{retries})…")
-                time.sleep(w)
-                continue
-            fail(f"Groq API call failed ({GROQ_MODEL}): {e}")
+    return llm_chat(client, system, user, temperature=temperature, max_tokens=max_tokens,
+                    retries=retries)
