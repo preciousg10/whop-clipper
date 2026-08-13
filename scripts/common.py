@@ -54,7 +54,9 @@ CAPTIONS_PARTIAL = CAMPAIGN / "captions_partial.json"
 # Override with GROQ_MODEL=llama-3.1-8b-instant if you hit free-tier daily token limits.
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 # LLM FAILOVER CHAIN models (all free-tier). Order + enable via config `llm_providers`.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+# NOTE: gemini-2.0-flash was retired by Google (404) mid-2026 — default is now the current
+# free-tier gemini-2.5-flash. Groq/Cerebras 70B defaults are still live. Override any via env.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 CEREBRAS_MODEL = os.environ.get("CEREBRAS_MODEL", "llama-3.3-70b")
 DEFAULT_LLM_PROVIDERS = ["groq", "gemini", "cerebras"]
 
@@ -317,6 +319,23 @@ def _parse_wait_seconds(msg):
     return None
 
 
+def is_dead_model_error(msg):
+    """True when the provider says the MODEL itself is gone/unusable — a 404 / model-not-found
+    (e.g. Gemini retired gemini-2.0-flash). This is NOT transient: retrying the same provider
+    just re-404s, so the chain must skip it IMMEDIATELY rather than burn all its retries."""
+    low = msg.lower()
+    if "model_not_found" in low or "modelnotfound" in low:
+        return True
+    # a bare 404 from any provider means the endpoint/model isn't there — never a rate limit
+    if "404" in msg and "429" not in msg:
+        return True
+    model_words = ("model" in low or "models/" in low)
+    gone = ("not found" in low or "does not exist" in low or "is not supported" in low
+            or "not available" in low or "deprecated" in low or "has been removed" in low
+            or "no longer available" in low)
+    return model_words and gone
+
+
 def classify_rate_limit(msg):
     """('daily' | 'minute' | 'error', wait_seconds_or_None) — works across Groq (TPD/RPD),
     Gemini (…PerDay/…PerMinute quota, ResourceExhausted) and Cerebras/OpenAI (429 rate limit).
@@ -459,6 +478,9 @@ class LLMChain:
             try:
                 return p.complete(system, user, temperature, max_tokens), "ok", None
             except Exception as e:
+                if is_dead_model_error(str(e)):     # 404/model-gone: not transient, skip NOW
+                    return None, "failover", (f"{p.name} model '{p.model}' unavailable "
+                                              f"(404/model-not-found) — {str(e)[:80]}")
                 kind, wait = classify_rate_limit(str(e))
                 if kind == "daily":
                     return None, "failover", f"{p.name} DAILY cap"
