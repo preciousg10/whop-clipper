@@ -40,6 +40,7 @@ INPUTS_DIR = C.ROOT / "campaign_inputs"
 BRIEF_TXT = INPUTS_DIR / "brief.txt"
 LINKS_TXT = INPUTS_DIR / "links.txt"
 PICK_JSON = INPUTS_DIR / "pick.json"
+PREEDITED_CACHE = INPUTS_DIR / "preedited_cache.json"   # sticky footage-length verdicts (Unit 1)
 
 RANKABLE_STATUSES = ("scraped", "refreshed")
 DEFAULT_MAX_WALK = 10        # safety cap: only walk the top N ranked campaigns looking for a
@@ -403,20 +404,30 @@ def _probe_duration(url, timeout=20, attempts=3):
     return None
 
 
-def _list_drive_folder(url):
+def _list_drive_folder(url, attempts=3):
     """[(id, name), ...] for a Drive folder WITHOUT downloading (gdown skip_download), or
-    None if it can't be listed (then the caller fails open)."""
+    None if it genuinely can't be listed. RETRIES on transient failure (rate-limited / flaky
+    listing) with short backoff — a single hiccup must not read as 'unlistable' (that was the
+    fail-open bug that let LETSGO through)."""
     try:
         import gdown
     except ImportError:
         return None
-    try:
-        files = gdown.download_folder(url=url, skip_download=True, quiet=True, use_cookies=False)
-    except Exception:
-        return None
-    out = [(getattr(f, "id", None), getattr(f, "path", None) or "") for f in (files or [])]
-    out = [(fid, name) for fid, name in out if fid]
-    return out or None
+    import time as _t
+    for a in range(attempts):
+        try:
+            files = gdown.download_folder(url=url, skip_download=True, quiet=True,
+                                          use_cookies=False)
+            out = [(getattr(f, "id", None), getattr(f, "path", None) or "") for f in (files or [])]
+            out = [(fid, name) for fid, name in out if fid]
+            if out:
+                return out
+            # Empty listing is suspicious (a shared folder has files) — treat as transient.
+        except Exception:
+            pass
+        if a < attempts - 1:
+            _t.sleep(1.5 * (a + 1))
+    return None
 
 
 def _short_name(s, n=34):
@@ -424,24 +435,47 @@ def _short_name(s, n=34):
     return (s[:n - 1] + "…") if len(s) > n else s
 
 
-def preedited_footage_skip(c, min_seconds=DEFAULT_PREEDITED_MIN_SECONDS,
-                           max_probe=DEFAULT_PREEDITED_MAX_PROBE):
-    """(skip, reason) — True only when the campaign's footage is ENTIRELY pre-edited short
-    clips: it has resolvable footage AND every file we could measure is < `min_seconds`,
-    with nothing left unmeasurable. Any raw channel/playlist, any file >= threshold, or any
-    unmeasurable source makes us FAIL OPEN (skip=False). Metadata only — never downloads."""
-    links = footage_links(c)
-    if not links:
-        return False, None                            # 'no footage' is clippable()'s job
+# --- measurement cache (fix: a transient measurement failure must NOT flip a known verdict) --
+def _links_fingerprint(links):
+    """Stable fingerprint of a campaign's footage links — the cache key alongside campaign id.
+    If the links change, the fingerprint changes and we re-measure; if they don't, the cached
+    verdict is reused (a campaign skipped as pre-edited STAYS skipped)."""
+    return "|".join(sorted(str(u).strip() for u in (links or []) if str(u).strip()))
+
+
+def _load_preedited_cache():
+    try:
+        return C.load_json(PREEDITED_CACHE) or {}
+    except Exception:
+        return {}
+
+
+def _cache_put(cache, cid, fp, verdict, reason, name):
+    cache[cid] = {"fingerprint": fp, "verdict": verdict, "reason": reason,
+                  "name": name, "measured_at": C.now_iso()}
+    try:
+        PREEDITED_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        C.save_json(PREEDITED_CACHE, cache)
+    except Exception as e:
+        C.warn(f"    pre-edited: could not persist measurement cache ({e}).")
+
+
+def _measure_preedited(c, links, min_seconds, max_probe):
+    """Actually measure the footage lengths (download-free). Returns (verdict, reason) where
+    verdict is one of:
+      'pass'         — a raw channel/playlist, OR a file >= min_seconds (a real VOD → clippable);
+      'skip'         — measured a clear majority of files and EVERY one is short (pre-edited);
+      'unmeasurable' — couldn't measure enough to decide (transient/unknown) → caller uses cache
+                       or fails open. Distinct from 'skip'/'pass' so the caller can tell them apart."""
     to_probe, source_unknown, sampled_note = [], False, ""
     for url in links:
         kind = _footage_kind(url)
         if kind == "raw_channel":
-            return False, None                        # raw VOD source -> clippable
+            return "pass", "raw YouTube channel/playlist (full VODs — not pre-edited)"
         if kind == "drive_folder":
             entries = _list_drive_folder(url)
             if entries is None:
-                source_unknown = True                 # can't even list it -> could be a VOD
+                source_unknown = True                 # couldn't list even after retries
                 continue
             vids = [(f"https://drive.google.com/file/d/{fid}/view", name)
                     for fid, name in entries if _looks_video(name)]
@@ -454,31 +488,78 @@ def preedited_footage_skip(c, min_seconds=DEFAULT_PREEDITED_MIN_SECONDS,
             to_probe.extend(vids)
         else:                                         # single vod / drive file
             to_probe.append((url, url))
-    if source_unknown or not to_probe:
-        return False, None                            # a whole source is unknowable -> fail open
+    if not to_probe:
+        return "unmeasurable", ("could not list any Drive footage folder (rate-limited/flaky)"
+                                if source_unknown else "no measurable footage source")
 
     from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=5) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         results = list(ex.map(lambda t: (t[1], _probe_duration(t[0])), to_probe))
 
     measured, unreadable = [], 0
     for name, d in results:
         if d is None:
-            unreadable += 1                           # a single file we couldn't read
+            unreadable += 1
         elif d >= min_seconds:
-            return False, None                        # a real VOD present -> clippable
+            return "pass", f"a footage file is >= {min_seconds}s ({_short_name(name)}={d:.0f}s)"
         else:
             measured.append((name, d))
-    # Skip only when a clear MAJORITY of files measured AND every one is short. A minority of
-    # transient/unreadable probes is tolerated (retries already ran); if most files are
-    # unreadable we treat the length as genuinely unknowable and fail open.
-    if measured and len(measured) >= max(1, unreadable):
+    # SKIP requires a clear majority measured, every one short, and NO whole source we failed to
+    # list (that source could be a VOD). Otherwise it's genuinely unmeasurable → the caller
+    # decides via cache / fail-open (NOT a silent skip).
+    if measured and len(measured) >= max(1, unreadable) and not source_unknown:
         lens = ", ".join(f"{_short_name(n)}={d:.0f}s" for n, d in measured[:6])
         more = f", +{len(measured) - 6} more" if len(measured) > 6 else ""
         extra = f", {unreadable} unreadable" if unreadable else ""
-        return True, (f"pre-edited footage — {len(measured)} measured file(s) < "
-                      f"{min_seconds}s{sampled_note}{extra} [{lens}{more}]")
-    return False, None                                # too little measured -> fail open
+        return "skip", (f"pre-edited footage — {len(measured)} measured file(s) < "
+                        f"{min_seconds}s{sampled_note}{extra} [{lens}{more}]")
+    bits = f"{len(measured)} measured short, {unreadable} unreadable"
+    if source_unknown:
+        bits += ", a folder was unlistable"
+    return "unmeasurable", f"too little measured to decide ({bits})"
+
+
+def preedited_footage_skip(c, min_seconds=DEFAULT_PREEDITED_MIN_SECONDS,
+                           max_probe=DEFAULT_PREEDITED_MAX_PROBE, use_cache=True):
+    """(skip, reason) — True only when the footage is ENTIRELY pre-edited short clips. Robust to
+    flaky no-download measurements via a STICKY per-campaign cache (keyed by id + footage-links
+    fingerprint): once measured, the verdict is reused as long as the links don't change, so a
+    later transient failure can never flip a known 'skip' to a fail-open pass. Every call logs
+    exactly ONE of: CACHED / MEASURED→SKIP / MEASURED→PASS / UNMEASURABLE(→cache|→fail-open) —
+    it is never silent. Metadata only — never downloads."""
+    links = footage_links(c)
+    if not links:
+        return False, None                            # 'no footage' is clippable()'s job
+    fp = _links_fingerprint(links)
+    cid = str(c.get("id") or c.get("name") or fp)
+    cache = _load_preedited_cache() if use_cache else {}
+    cached = cache.get(cid) if use_cache else None
+    cached_ok = bool(cached and cached.get("fingerprint") == fp
+                     and cached.get("verdict") in ("skip", "pass"))
+
+    # STICKY REUSE (fix #4): same campaign + same links → reuse the prior verdict WITHOUT
+    # re-measuring, so a transient failure can't sneak a pre-edited campaign through.
+    if cached_ok:
+        v = cached["verdict"]
+        C.log(f"    pre-edited: [CACHED {v.upper()}] measured {str(cached.get('measured_at'))[:19]}, "
+              f"links unchanged — {cached.get('reason')}")
+        return (v == "skip"), cached.get("reason")
+
+    # No usable cache (new campaign, or links changed) → measure now (with retries inside).
+    verdict, reason = _measure_preedited(c, links, min_seconds, max_probe)
+    if verdict in ("skip", "pass"):
+        C.log(f"    pre-edited: [MEASURED → {verdict.upper()}] {reason}")
+        if use_cache:
+            _cache_put(cache, cid, fp, verdict, reason, c.get("name"))
+        return (verdict == "skip"), (reason if verdict == "skip" else None)
+
+    # UNMEASURABLE: reuse a stale-but-same-links cache if we somehow have one; else fail open.
+    if cached and cached.get("fingerprint") == fp and cached.get("verdict") in ("skip", "pass"):
+        v = cached["verdict"]
+        C.warn(f"    pre-edited: [UNMEASURABLE now → reusing CACHED {v.upper()}] {reason}")
+        return (v == "skip"), cached.get("reason")
+    C.warn(f"    pre-edited: [UNMEASURABLE, no cache → FAIL OPEN, letting it through] {reason}")
+    return False, None
 
 
 # --- main ----------------------------------------------------------------------
@@ -628,6 +709,9 @@ def main():
                          f"{DEFAULT_PREEDITED_MAX_PROBE}).")
     ap.add_argument("--no-preedited-filter", action="store_true",
                     help="disable the pre-edited-footage skip (walk exactly as before).")
+    ap.add_argument("--preedited-refresh", action="store_true",
+                    help="ignore the cached footage-length verdicts and re-measure from scratch "
+                         "(otherwise a measured campaign reuses its sticky verdict).")
     ap.add_argument("--exclude-id", action="append", default=[], metavar="SCOUT_ID",
                     help="scout campaign id to SKIP during the walk (repeatable). Used by "
                          "run.py --auto-advance to move past a campaign that produced nothing.")
@@ -690,7 +774,8 @@ def main():
         if ok and not args.no_preedited_filter:
             C.log(f"    #{i} {c.get('name')!r}: checking footage length (no download)…")
             skip_pe, why_pe = preedited_footage_skip(
-                c, min_seconds=args.preedited_min_seconds, max_probe=args.preedited_max_probe)
+                c, min_seconds=args.preedited_min_seconds, max_probe=args.preedited_max_probe,
+                use_cache=not args.preedited_refresh)
             if skip_pe:
                 ok, why = False, why_pe
         if ok:

@@ -61,7 +61,16 @@ metadata (`extract_info download=False`), probed concurrently with retries. YouT
 channels/playlists are raw VOD sources and PASS without probing; any file ≥ threshold PASSES.
 FAILS OPEN on anything unmeasurable (unlistable folder, majority-unreadable) — never wrongly
 excludes; `--rank` forces a skipped one anyway. pickcampaign has NO state.json config — these
-are CLI args, so no state key to add.
+are CLI args, so no state key to add. **Measurement is flake-proof:** `_measure_preedited`
+returns a 3-way verdict — `skip` / `pass` / `unmeasurable` — and `preedited_footage_skip` logs
+EXACTLY one outcome every call (never silent): `[MEASURED → SKIP/PASS]`, `[CACHED SKIP/PASS]`,
+or `[UNMEASURABLE … → FAIL OPEN]`. Both the Drive folder listing (`_list_drive_folder`) and the
+per-file duration probe (`_probe_duration`) RETRY on transient errors. A **sticky cache**
+(`campaign_inputs/preedited_cache.json`, keyed by campaign id + footage-links fingerprint)
+persists a successful verdict: once a campaign measured all-short it STAYS skipped on later runs
+(reused without re-measuring while the links are unchanged), so a transient listing/probe
+failure can never flip a known `skip` into a fail-open pass — the bug where LETSGO measured fine
+one run and slipped through the next. `--preedited-refresh` ignores the cache and re-measures.
 **Stale-board warning** (`warn_if_stale_board`, Unit 2d): scout's once-daily 20h guard skips
 its scrape SILENTLY (exit 0), so the chained `whop.bat` run could pick from a day-old board
 unnoticed. pickcampaign reads the top-level `generated_at` from `campaigns.json` and, if the
