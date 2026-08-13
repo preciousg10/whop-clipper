@@ -268,10 +268,21 @@ def _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap):
     # Batch to stay under the free-tier token/request caps, then combine + rank all
     # batch results together to pick the final top clips.
     batches = [cand[i:i + BATCH_MOMENTS] for i in range(0, len(cand), BATCH_MOMENTS)]
-    scored, seen = [], set()
+    # RESUME (Unit 2b): reload batch scores checkpointed on a prior run so a DAILY-cap stop
+    # doesn't re-score completed batches. Batches are deterministic (moments.json + posted are
+    # stable), so a fully-scored batch is skipped by id. GroqDailyCapError propagates to run.py.
+    partial = C.load_json(C.SELECT_PARTIAL) or {}
+    scored = list(partial.get("scored", []))
+    seen = {s["id"] for s in scored}
+    if scored:
+        C.log(f"select: resuming — {len(scored)} moment(s) already scored (checkpoint).")
+    made_call = False
     for bi, batch in enumerate(batches):
-        if bi:
-            time.sleep(BATCH_DELAY_SECONDS)   # respect 30 req/min free-tier limit
+        if all(m["id"] in seen for m in batch):
+            continue                          # batch already scored on a prior run
+        if made_call:
+            time.sleep(BATCH_DELAY_SECONDS)   # respect 30 req/min free-tier limit (between calls)
+        made_call = True
         C.log(f"select: scoring batch {bi + 1}/{len(batches)} ({len(batch)} moments).")
         for item in _score_batch(client, campaign, knowledge, batch, n):
             m = by_id.get(item.get("id"))
@@ -280,6 +291,7 @@ def _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap):
             seen.add(m["id"])
             scored.append({**m, "score": float(item.get("score", 0)),
                            "reason": str(item.get("reason", ""))[:200]})
+        C.save_json(C.SELECT_PARTIAL, {"scored": scored})   # checkpoint after each batch
 
     if not scored:
         C.warn("Groq scored no moments across all batches — falling back to heuristic.")
@@ -357,7 +369,7 @@ def run(state):
     moments = dedup(moments)                                            # drop already-posted
     C.log(f"moments: {raw_count} raw -> {len(moments)} after filler-kill + merge + dedup.")
     if not moments:
-        C.fail("no candidate moments left after filtering — nothing to select.")
+        raise C.NothingUsable("no candidate moments left after filtering — nothing to select.")
 
     campaign = (C.load_json(C.RULES_JSON) or {}).get("campaign", state.get("campaign") or "campaign")
 
@@ -369,16 +381,21 @@ def run(state):
         selected = _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap)
 
     if not selected:
-        C.fail("select found NO live moments (every candidate scored below "
-               f"{MIN_LIVE_SCORE} = dead buildup/hype/countdown). Refusing to ship a batch "
-               "of dead clips. Root cause is almost always that moments.json spikes were "
-               "built on the wrong audio track — recompute spike detection on the merged "
-               "audio (cheap; reuses the cached transcript, no whisper re-run).")
+        raise C.NothingUsable(
+            "select found NO live moments (every candidate scored below "
+            f"{MIN_LIVE_SCORE} = dead buildup/hype/countdown). Refusing to ship a batch "
+            "of dead clips. Root cause is almost always that moments.json spikes were "
+            "built on the wrong audio track — recompute spike detection on the merged "
+            "audio (cheap; reuses the cached transcript, no whisper re-run).")
 
     C.save_json(C.SELECTED_JSON, {"campaign": campaign, "selected": selected})
+    C.SELECT_PARTIAL.unlink(missing_ok=True)         # stage complete — drop the checkpoint
     C.mark_stage(state, "select", selected=len(selected))
     C.log(f"select done: {len(selected)} moment(s) chosen.")
 
 
 if __name__ == "__main__":
-    run(C.load_state())
+    try:
+        run(C.load_state())
+    except C.NothingUsable as e:
+        C.fail(str(e))            # standalone: still fail loud (only run.py --auto-advance moves on)

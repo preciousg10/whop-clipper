@@ -337,6 +337,69 @@ def _mask_banned_word(word, banned):
     return pre + core + post
 
 
+def _subtitle_word(word):
+    """flzsh / Gen Z karaoke styling for ONE spoken-word subtitle token — the LOWER band only,
+    NOT the top hook plate. All lowercase, apostrophes dropped so contractions read as one word
+    ('what's' -> 'whats', 'that's' -> 'thats'), and EVERY other punctuation/symbol stripped
+    ('Saki.' -> 'saki', 'difference?' -> 'difference'). Keeps letters + digits ('10v1' survives).
+    Returns '' for a punctuation-only token (the caller then skips it). Banned-word masking runs
+    AFTER this (in _group_lines) so the mask's '*' are never stripped away."""
+    t = (word or "").lower().replace("'", "").replace("’", "")   # join contractions
+    return re.sub(r"[^a-z0-9]+", "", t)                                # drop all other punctuation
+
+
+# --- profanity censor (karaoke lower band only, SEPARATE from campaign banned masking) ------
+# Campaign banned words (bet/gamble/…) are FULLY masked ("b**") by _mask_banned_word for rules
+# compliance. Profanity gets a LIGHTER, stylistic censor instead: keep consonants + first/last,
+# replace the VOWELS with '*' ("shit"->"sh*t", "fuck"->"f*ck", "ass"->"*ss", "fucking"->
+# "f*ck*ng"). Applied ONLY to karaoke words (not the hook plate, not the campaign gauntlet).
+_VOWELS = frozenset("aeiou")
+_PROFANITY_ROOTS = frozenset("""
+fuck shit bitch ass asshole damn hell dick cunt pussy bastard prick slut whore twat cum cock
+dickhead motherfucker bullshit douchebag wanker jackass dumbass piss crap bollocks
+nigger nigga faggot fag retard spic chink kike coon gook tranny dyke
+""".split())
+# Inflections we allow after a root (fucking, bitches, shitty→shit+t+y). Kept short + anchored
+# so it catches swears but NOT innocent words that merely start the same (assault, assess,
+# hello, cocktail — their remainder isn't an inflection, so they're left alone).
+_PROF_SUFFIX = frozenset(["s", "es", "ed", "ing", "ings", "er", "ers", "in", "y", "ies", "a"])
+
+
+def _is_profane(word):
+    """True if `word` (lowercase, letters only) is a swear/slur — exact, or a root plus a short
+    inflection (fucking, bitches, shitty via an optional doubled final consonant). Anchored so
+    'assault'/'assess'/'hello'/'cocktail' are NOT matched."""
+    for root in _PROFANITY_ROOTS:
+        if word == root:
+            return True
+        if not word.startswith(root):
+            continue
+        rest = word[len(root):]
+        if rest and root[-1] not in _VOWELS and rest[:1] == root[-1]:   # gemination: shit->shitt-
+            rest = rest[1:]
+        if rest == "" or rest in _PROF_SUFFIX:
+            return True
+    return False
+
+
+def _censor_profanity(word):
+    """Vowel-censor a profane word ('shit'->'sh*t'); return it unchanged if not profane."""
+    if not word or not _is_profane(word):
+        return word
+    return "".join("*" if ch in _VOWELS else ch for ch in word)
+
+
+def _fx_line_text(label, banned):
+    """A non-speech sound label styled for the karaoke: lowercase, wrapped in asterisks
+    ('Scream!' -> '*scream*', 'weird noises' -> '*weird noises*'). Spaces are kept (a two-word
+    label stays one unit); banned words in the label are still masked. '' if empty."""
+    inner = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", (label or "").lower())).strip()
+    if not inner:
+        return ""
+    inner = " ".join(_mask_banned_word(w, banned) for w in inner.split())
+    return f"*{inner}*"
+
+
 def map_words_to_output(words, start, segments):
     """Map SOURCE-absolute word timings onto the FINAL output (clip) timeline.
 
@@ -395,29 +458,56 @@ def map_words_to_output(words, start, segments):
     return events
 
 
-def _group_lines(events, banned, max_words=5, max_gap=0.6):
-    """Group per-word events into short on-screen LINES (karaoke lines). A new line starts
-    after `max_words`, after a pause > `max_gap`, or once a word ends a sentence (. ! ?).
-    Each word is Title-Cased and banned-word-masked here (before it can reach the burn)."""
-    from captions import titlecase
-    lines, cur = [], []
+def _group_lines(events, banned, max_words=3, pause_gap=0.35, censor_profanity=True):
+    """Group per-word events into karaoke LINES that follow the natural RHYTHM of speech.
 
-    def flush():
-        if cur:
-            lines.append(cur[:])
-            cur.clear()
+    A line breaks PRIMARILY on a PAUSE: whenever the silence between one word's end and the
+    next word's start exceeds `pause_gap` (default ~0.35s), the current line ends there — even
+    if it's only ONE word — so each spoken burst is its own line ("hello" [pause] "how are you"
+    -> two lines, not "hello how are you"). Sentence-ending punctuation (. ! ?) also breaks.
+    WITHIN a continuous run of speech (no big gaps) we still cap at `max_words` (~3) so a fast
+    unbroken sentence doesn't run long; a 4th word is pulled in only to avoid orphaning the next
+    word as a lone trailing line. Everything is ONE physical line (WrapStyle 2 in _ass_header).
 
+    The word gaps are read from the OUTPUT-timeline events (post reorder/dead-air-trim), so the
+    rhythm matches the FINAL edit, not the raw source. Each word gets the flzsh karaoke styling
+    (`_subtitle_word`: lowercase, no punctuation, contractions joined); a CAMPAIGN-banned word is
+    then FULLY masked ('b**'), else (when `censor_profanity`) a swear gets the LIGHT vowel-censor
+    ('sh*t'). Sentence breaks read the RAW word's trailing '.!?' BEFORE stripping. Lower band only
+    — the top hook plate keeps its own casing."""
+    styled = []
     for e in events:
         raw = (e["word"] or "").strip()
-        tok = titlecase(strip_to_ascii(_mask_banned_word(raw, banned)))
+        clean = _subtitle_word(strip_to_ascii(raw))
+        tok = _mask_banned_word(clean, banned)             # campaign rule: FULL mask if banned
+        if tok == clean and censor_profanity:              # not banned → light profanity censor
+            tok = _censor_profanity(clean)
         if not tok:
             continue
-        if cur and (len(cur) >= max_words or e["start"] - cur[-1]["end"] > max_gap):
-            flush()
-        cur.append({"tok": tok, "start": float(e["start"]), "end": float(e["end"])})
-        if re.search(r"[.!?]$", raw):
-            flush()
-    flush()
+        styled.append({"tok": tok, "start": float(e["start"]), "end": float(e["end"]),
+                       "eos": bool(re.search(r"[.!?]$", raw))})
+
+    def gap_after(i):                     # True if a pause (or the clip end) follows word i
+        return i + 1 >= len(styled) or styled[i + 1]["start"] - styled[i]["end"] > pause_gap
+
+    lines, cur = [], []
+    for i, w in enumerate(styled):
+        cur.append(w)
+        if w["eos"] or gap_after(i):                      # PRIMARY break: a pause / sentence end
+            lines.append(cur); cur = []
+            continue
+        if len(cur) >= max_words:
+            # No pause yet but the line is long — break at the word cap. Allow ONE extra word
+            # only if the next word is itself the last of this burst (a pause/sentence follows
+            # it), else it'd be stranded alone. Otherwise break now (keeps ~2-3 words).
+            if len(cur) == max_words and i + 1 < len(styled) and (styled[i + 1]["eos"] or gap_after(i + 1)):
+                continue
+            lines.append(cur); cur = []
+    if cur:
+        lines.append(cur)
+    for ln in lines:                      # drop the internal helper key before returning
+        for w in ln:
+            w.pop("eos", None)
     return lines
 
 
@@ -491,7 +581,7 @@ def _ass_header(cfg, top_y):
     return (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
-        "WrapStyle: 0\n"
+        "WrapStyle: 2\n"                     # no auto-wrap: karaoke lines stay ONE line
         "ScaledBorderAndShadow: yes\n"
         f"PlayResX: {W}\n"
         f"PlayResY: {H}\n\n"
@@ -506,13 +596,25 @@ def _ass_header(cfg, top_y):
     )
 
 
-def build_ass(events, cfg, banned, out_path, top_y):
+def build_ass(events, cfg, banned, out_path, top_y, fx_events=None):
     """Write a word-level karaoke ASS file for one clip and return its path, or None if
     there's nothing to burn. Emits one Dialogue per word: the full line is shown, and the
     active word is wrapped in an accent-colour + upscale override so it POPS, reverting as
     the next word speaks. `top_y` pins the line's top into the lower letterbox band (see
-    subtitle_top_y). Re-checks each finished line for banned words (fail-loud)."""
-    lines = _group_lines(events, banned)
+    subtitle_top_y). `fx_events` are non-speech sound labels ([{label,start,end}], already
+    output-timed) inserted as standalone '*scream*' lines in the word gaps. Re-checks each
+    finished line for banned words (fail-loud)."""
+    lines = _group_lines(events, banned,
+                         max_words=int(cfg.get("subtitle_max_words", 3)),
+                         pause_gap=float(cfg.get("subtitle_pause_gap", 0.35)),
+                         censor_profanity=bool(cfg.get("subtitle_censor_profanity", True)))
+    # Non-speech sound labels become standalone single-token lines, merged into the timeline.
+    for fx in (fx_events or []):
+        tok = _fx_line_text(fx.get("label", ""), banned)
+        if not tok:
+            continue
+        lines.append([{"tok": tok, "start": float(fx["start"]), "end": float(fx["end"])}])
+    lines.sort(key=lambda ln: ln[0]["start"])
     if not lines:
         return None
     from captions import banned_hit
@@ -1003,6 +1105,15 @@ def run(state):
             src_words = [w for w in words_by_source.get(c["source"], [])
                          if float(w["end"]) > start and float(w["start"]) < end]
             events = map_words_to_output(src_words, start, segments)
+            # Non-speech sound labels (captions stage, Groq-inferred) mapped through the SAME
+            # segments so a '*scream*' lands on the beat in the FINAL timeline, in a word gap.
+            fx_events = []
+            for fx in (c.get("sound_fx") or []):
+                mapped = map_words_to_output(
+                    [{"word": fx["label"], "start": float(fx["start"]), "end": float(fx["end"])}],
+                    start, segments)
+                fx_events += [{"label": e["word"], "start": e["start"], "end": e["end"]}
+                              for e in mapped]
             # Pin the karaoke line into the lower letterbox band BELOW the footage, using the
             # same blur_fill geometry compose renders (source aspect drives the band height).
             if c["source"] not in dim_cache:
@@ -1010,7 +1121,7 @@ def run(state):
             sw, sh = dim_cache[c["source"]]
             top_y = subtitle_top_y(cfg, sw, sh)
             ass_file = C.DRAFTS / f".sub_{rank:02d}.ass"
-            ass_path = build_ass(events, cfg, banned, ass_file, top_y)
+            ass_path = build_ass(events, cfg, banned, ass_file, top_y, fx_events)
         subtitled = ass_path is not None
 
         compose(src_path, start, end, segments, cold_open, cap_png, watermark, out_path,

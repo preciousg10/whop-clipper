@@ -284,6 +284,78 @@ def _nearby_transcript(tr_segs, start, end, pad_pre=10.0, pad_post=4.0, limit=40
     return " ".join(parts).strip()[:limit]
 
 
+# --- non-speech sound labels (karaoke *scream* / *laughing* fills) --------------
+# Whisper only transcribes SPEECH, so a scream / laugh / crash leaves a silent gap in the
+# word-level karaoke. We fill that gap with a SHORT accurate descriptor ("*scream*"), but
+# only for a genuine non-speech beat and only when Groq can tell what it is from context —
+# never a random guess. Detection here (captions stage, where Groq already runs); cut.py
+# maps the stored beats through the clip reorder and burns them (staying zero-Groq).
+SOUND_FX_WINDOW = 22.0        # seconds around the moment to scan for non-speech spikes
+SOUND_FX_MAX = 3              # cap labels per clip (keeps it sparse + few tokens)
+
+
+def _speech_covers(tr_segs, a, b, pad=0.4):
+    """True if any transcribed speech overlaps [a-pad, b+pad] — i.e. the spike is NOT a
+    non-speech beat (someone is talking there)."""
+    return any((s.get("text") or "").strip() and s.get("end", 0) >= a - pad and s.get("start", 0) <= b + pad
+               for s in tr_segs)
+
+
+def _nonspeech_beats(m, tr_segs, spikes):
+    """Loud audio_spike moments near this clip that carry NO speech — candidate non-speech
+    beats. Returns the strongest few, source-absolute, sorted by time."""
+    lo, hi = float(m["start"]) - SOUND_FX_WINDOW, float(m["end"]) + SOUND_FX_WINDOW
+    beats = []
+    for s in spikes:
+        peak = s.get("peak", s["start"])
+        if peak is None or not (lo <= float(peak) <= hi):
+            continue
+        if _speech_covers(tr_segs, float(s["start"]), float(s["end"])):
+            continue
+        beats.append(s)
+    beats.sort(key=lambda s: s.get("intensity", 0), reverse=True)
+    beats = beats[:SOUND_FX_MAX]
+    beats.sort(key=lambda s: float(s["start"]))
+    return beats
+
+
+def _label_sound_beats(client, context, beats):
+    """Ask Groq for a SHORT accurate descriptor per non-speech beat, or null when it can't
+    tell (no random guessing). Returns [{start,end,peak,label}] for the labeled ones only."""
+    if not client or not beats:
+        return []
+    payload = [{"i": i, "intensity": b.get("intensity")} for i, b in enumerate(beats)]
+    system = (
+        "You label NON-SPEECH audio moments for karaoke captions on a short clip. You're given "
+        "the surrounding transcript (what was said around the sound) and a list of loud moments "
+        "where NO words were spoken. For EACH moment, output a SHORT lowercase descriptor of the "
+        "sound (1-2 words, e.g. scream, screaming, laughing, gasp, cheering, crowd goes wild, "
+        "crash, groan, scared) — but ONLY if the surrounding context makes the sound reasonably "
+        "clear. If you CANNOT tell what the sound is, return null for that moment. NEVER guess "
+        "randomly — an accurate null beats a wrong label. Return ONLY a JSON array, one object "
+        'per moment: {"i": <index>, "label": <string or null>}. No prose.')
+    user = (f"Surrounding transcript: {context!r}\n"
+            f"Audience: {C.AUDIENCE_CONTEXT}\n"
+            f"Non-speech moments (index, loudness intensity): {json.dumps(payload)}")
+    raw = C.groq_chat(client, system, user, temperature=0.3, max_tokens=200)
+    m = re.search(r"\[.*\]", raw, re.S)
+    if not m:
+        return []
+    try:
+        arr = json.loads(m.group(0))
+    except Exception:
+        return []
+    by_i = {int(x["i"]): x.get("label") for x in arr if isinstance(x, dict) and "i" in x}
+    out = []
+    for i, b in enumerate(beats):
+        lbl = by_i.get(i)
+        if not lbl or not str(lbl).strip() or str(lbl).strip().lower() in ("null", "none", "unknown"):
+            continue
+        out.append({"start": float(b["start"]), "end": float(b["end"]),
+                    "peak": b.get("peak"), "label": str(lbl).strip()})
+    return out
+
+
 def _groq_candidates(client, campaign, moment, style_notes, event="", emoji_in_caption=True):
     event = (event or moment.get("text") or "").strip()
     emoji_rule = (
@@ -419,16 +491,34 @@ def run(state):
     # reaction and get a SPECIFIC caption instead of a generic template.
     moments_doc = C.load_json(C.MOMENTS_JSON) or {}
     tr_by_source = {s["source"]: s.get("transcript", []) for s in moments_doc.get("sources", [])}
+    # Non-speech audio spikes per source — candidates for karaoke *scream* / *laughing* fills.
+    spikes_by_source = {}
+    for mm in moments_doc.get("moments", []):
+        if mm.get("type") == "audio_spike":
+            spikes_by_source.setdefault(mm["source"], []).append(mm)
     client = C.groq_client()
     if client is None:
         C.warn("offline mode — generating captions from templates (no Groq).")
 
-    clips = []
+    # RESUME (Unit 2b): reload any clips already captioned (checkpointed after each one) so a
+    # prior DAILY-cap stop doesn't re-spend Groq on completed clips. We skip done moment ids,
+    # checkpoint after every clip, and let a GroqDailyCapError propagate to run.py, which stops
+    # resumably — the checkpoint below is already current when it fires.
+    partial = C.load_json(C.CAPTIONS_PARTIAL) or {}
+    clips = list(partial.get("clips", []))
+    done_ids = {c.get("moment_id") for c in clips}
+    total = len(selected["selected"])
+    if clips:
+        C.log(f"captions: resuming — {len(clips)}/{total} clip(s) already done (checkpoint).")
+    made_call = False
     for idx, m in enumerate(selected["selected"]):
+        if m["id"] in done_ids:
+            continue                                # already captioned on a prior run
         if client is not None:
-            if idx:
-                time.sleep(CAPTION_DELAY_SECONDS)   # respect free-tier rate limits
-            C.log(f"captions: clip {idx + 1}/{len(selected['selected'])} (moment {m['id']}).")
+            if made_call:
+                time.sleep(CAPTION_DELAY_SECONDS)   # respect free-tier rate limits (between calls)
+            C.log(f"captions: clip {idx + 1}/{total} (moment {m['id']}).")
+            made_call = True
         event = (m.get("text") or "").strip() or _nearby_transcript(
             tr_by_source.get(m["source"], []), float(m["start"]), float(m["end"]))
         cands = _offline_candidates(m) if client is None else _groq_candidates(
@@ -486,17 +576,30 @@ def run(state):
         # the campaign config turns them off.
         best = finalize_caption(ranked[0], emoji_in_caption)
         variant = finalize_caption(ranked[1], emoji_in_caption) if len(ranked) > 1 else None
+        # Non-speech sound labels for the karaoke (accurate, or nothing). Only fires when the
+        # clip actually has a loud non-speech beat, and only adds ONE extra Groq call then.
+        sound_fx = []
+        beats = _nonspeech_beats(m, tr_by_source.get(m["source"], []),
+                                 spikes_by_source.get(m["source"], []))
+        if beats and client is not None:
+            sound_fx = _label_sound_beats(client, event, beats)
+            if sound_fx:
+                C.log(f"captions: labeled {len(sound_fx)} non-speech beat(s) for {m['id']}: "
+                      f"{[fx['label'] for fx in sound_fx]}")
         clips.append({
             "moment_id": m["id"], "source": m["source"],
             "start": m["start"], "end": m["end"], "type": m["type"],
             "peak": m.get("peak"),                # cold-open anchor for the cut stage
             "score": m.get("score"), "reason": m.get("reason"),
             "candidates": cands, "killed": killed,
-            "caption": best, "variant": variant,
+            "caption": best, "variant": variant, "sound_fx": sound_fx,
             **platform_text(best, rules, banned),
         })
+        # Checkpoint after EVERY clip so a daily-cap stop (or crash) resumes here, not from #1.
+        C.save_json(C.CAPTIONS_PARTIAL, {"campaign": campaign, "clips": clips})
 
     C.save_json(C.CAPTIONS_JSON, {"campaign": campaign, "clips": clips})
+    C.CAPTIONS_PARTIAL.unlink(missing_ok=True)       # stage complete — drop the checkpoint
     C.mark_stage(state, "captions", clips=len(clips), killed=sum(len(c["killed"]) for c in clips))
     C.log(f"captions done: {len(clips)} clip(s); "
           f"{sum(len(c['killed']) for c in clips)} candidate(s) killed by rules.")

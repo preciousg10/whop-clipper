@@ -54,6 +54,11 @@ DEFAULT_CONFIG = {
     "subtitle_accent_color": "&H00FFFF&",  # active-word colour (ASS &HBBGGRR); yellow
     "subtitle_active_scale": 110,  # % upscale applied to the active word (the "pop")
     "subtitle_ass_fontsize": 54,   # subtitle font size at 1080x1920 output res
+    "subtitle_pause_gap": 0.1,    # sec of silence between words that starts a NEW karaoke line
+                                   # (breaks on the speaker's natural pauses, even mid-cap)
+    "subtitle_max_words": 3,       # cap within a continuous (pause-free) run of speech
+    "subtitle_censor_profanity": True,  # karaoke swears get a light vowel-censor ("sh*t");
+                                   # campaign banned words (bet/gamble) stay FULLY masked
     "subtitle_band_margin": 28,    # px below the footage rectangle to pin the karaoke line
                                    # (blur_fill) so it sits in the lower black band, off the video
     # Caption/subtitle readability (understated but always legible on any background). The dark
@@ -79,6 +84,64 @@ def require_intake():
         if not p.exists():
             C.fail(f"{p.name} missing — run Stage 0 first:\n"
                    "  python scripts/intake.py --brief <file> --links <file>")
+
+
+def _stop_daily_cap(stage):
+    """Groq DAILY cap hit mid-stage (Unit 2b). The stage has already checkpointed its finished
+    Groq work (select_partial / captions_partial), so we just report N-of-M and stop RESUMABLY —
+    a `python run.py --resume` after the quota resets continues from the checkpoint, re-spending
+    NO completed calls."""
+    if stage == "captions":
+        done = len((C.load_json(C.CAPTIONS_PARTIAL) or {}).get("clips", []))
+        total = len((C.load_json(C.SELECTED_JSON) or {}).get("selected", []))
+        C.stop_resumable(f"Groq daily cap hit during captions — {done} of {total} clip(s) done. "
+                         f"Re-run with --resume after the cap resets.")
+    elif stage == "select":
+        done = len((C.load_json(C.SELECT_PARTIAL) or {}).get("scored", []))
+        C.stop_resumable(f"Groq daily cap hit during select — {done} moment(s) scored so far. "
+                         f"Re-run with --resume after the cap resets (already-scored batches skip).")
+    C.stop_resumable(f"Groq daily cap hit during {stage}. Re-run with --resume after reset.")
+
+
+def cut_only(state):
+    """Run ONLY the cut stage on the already-selected/captioned clips — ZERO Groq calls,
+    no download/index/select/captions. For iterating on the render (e.g. the ASS karaoke)
+    without re-picking or burning the Groq daily cap.
+
+    cut consumes campaign/captions.json (the hook captions already generated for the picks in
+    selected.json). We touch ONLY the source files those clips reference — any other campaign's
+    footage sitting in campaign/footage/ is ignored (cut never scans the folder; that's index)."""
+    caps = C.load_json(C.CAPTIONS_JSON)
+    if not caps or not caps.get("clips"):
+        C.fail("--cut-only needs campaign/captions.json (the captions already generated for "
+               "the selected clips) but it's missing/empty. It's produced by the captions "
+               "stage; run the full pipeline once (or just the captions stage) first — "
+               "--cut-only never calls Groq itself.")
+    if not C.SELECTED_JSON.exists():
+        C.warn("campaign/selected.json not found — cutting from captions.json alone (the picks "
+               "it was built from are gone, but the captions carry everything cut needs).")
+
+    # Only these source files will be opened — list them and confirm they exist, so a mixed
+    # footage/ folder (multiple campaigns) can't pull in the wrong files.
+    sources = sorted({c["source"] for c in caps["clips"]})
+    C.log(f"cut-only: {len(caps['clips'])} clip(s) referencing {len(sources)} source file(s) "
+          f"(every other file in campaign/footage/ is ignored):")
+    missing = []
+    for s in sources:
+        p = C.ROOT / s
+        C.log(f"    {'[OK]     ' if p.exists() else '[MISSING]'} {s}")
+        if not p.exists():
+            missing.append(s)
+    if missing:
+        C.fail(f"--cut-only: {len(missing)} referenced source file(s) not found: {missing}. "
+               "Restore them (cut only touches the sources named in captions.json).")
+
+    # Always re-run cut (it may be marked done from a prior run); leave every other stage alone.
+    state.get("stages", {}).pop("cut", None)
+    C.save_state(state)
+    C.log("== stage: cut ONLY (download, index, select, captions all skipped — no Groq) ==")
+    cut_stage.run(state)
+    C.log("cut-only complete — drafts in drafts/ (best first), see drafts/manifest.json.")
 
 
 def stage_download(state):
@@ -132,37 +195,14 @@ def offer_cleanup(args):
         C.log("Raw footage deleted; transcripts + moments.json retained.")
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Clipper pipeline orchestrator.")
-    ap.add_argument("--resume", action="store_true", help="continue from last completed stage (default behavior)")
-    ap.add_argument("--force", action="store_true", help="re-run all stages from scratch")
-    ap.add_argument("--clips-per-batch", type=int)
-    ap.add_argument("--layout", choices=["blur_fill", "crop_fill"],
-                    help="vertical fill mode (default blur_fill: whole frame on a blurred bg)")
-    ap.add_argument("--clip-min", type=int, dest="clip_min")
-    ap.add_argument("--clip-max", type=int, dest="clip_max")
-    ap.add_argument("--watermark-file", help="watermark filename in assets/ (exact or substring)")
-    ap.add_argument("--cookies-from-browser", help="browser for cookies when re-fetching gated VODs")
-    ap.add_argument("--max-source-height", type=int, dest="max_source_height",
-                    help="cap for Drive transcoded preview streams in px (default 720)")
-    ap.add_argument("--original", action="store_true",
-                    help="force raw original Drive files instead of preview streams")
-    ap.add_argument("--cleanup", action="store_true", help="delete raw footage after a successful batch")
-    ap.add_argument("--no-cleanup", action="store_true", help="never prompt for footage cleanup")
-    args = ap.parse_args()
-
-    global _COOKIES, _ORIGINAL
-    _COOKIES = args.cookies_from_browser
-    _ORIGINAL = args.original
-
-    C.ensure_dirs()
-    require_intake()
-
+def _prepare_state(args):
+    """Load state, scope it to the campaign on disk (rules.json), merge config + CLI overrides,
+    and honor --force. Returns the ready-to-run state (config saved). Re-run each pass of the
+    auto-advance loop so a newly-picked campaign is activated correctly."""
     state = C.load_state()
-    # Defensive: if the campaign on disk (rules.json) differs from the state's active one,
-    # scope stages to it so we never skip stages left 'done' by a PRIOR campaign (that made
-    # run.py think everything was already built and mixed old drafts in). No-op in the
-    # normal flow where intake already switched.
+    # Defensive: if the campaign on disk (rules.json) differs from the state's active one, scope
+    # stages to it so we never skip stages a PRIOR campaign left 'done'. This is ALSO how an
+    # auto-advanced campaign gets its own fresh (empty) stage set.
     rules_campaign = (C.load_json(C.RULES_JSON) or {}).get("campaign")
     C.activate_campaign(state, rules_campaign)
     cfg = {**DEFAULT_CONFIG, **state.get("config", {})}
@@ -179,20 +219,126 @@ def main():
     if args.max_source_height:
         cfg["max_source_height"] = args.max_source_height
     state["config"] = cfg
-    C.save_state(state)
-
     if args.force:
         for name, _ in STAGES:
             state.get("stages", {}).pop(name, None)
-        C.save_state(state)
+    C.save_state(state)
+    return state
 
-    C.log(f"config: {cfg}")
+
+def _run_stages(state, args):
+    """Run the pipeline stages in order. A GroqDailyCapError stops resumably; a NothingUsable
+    propagates to the caller (which may auto-advance)."""
     for name, fn in STAGES:
         if C.stage_done(state, name) and not args.force:
             C.log(f"skip {name} (already done)")
             continue
         C.log(f"== stage: {name} ==")
-        fn(state)
+        try:
+            fn(state)
+        except C.GroqDailyCapError:
+            _stop_daily_cap(name)     # checkpoint already saved by the stage — resumable stop
+
+
+def _advance_to_next_campaign(excluded, n, args, reason):
+    """Re-pick the NEXT ranked clippable campaign (excluding the ones that produced nothing)
+    and run intake on it, so the auto-advance loop can run the pipeline for it. Reads the
+    current pick.json for scout locator + mode. Fails loud if there's no further campaign."""
+    import subprocess
+    scripts = os.path.dirname(os.path.abspath(__file__))
+    pick = C.load_json(C.ROOT / "campaign_inputs" / "pick.json") or {}
+    failed_id, failed_name = pick.get("scout_id"), pick.get("campaign")
+    if failed_id and failed_id not in excluded:
+        excluded.append(failed_id)
+    bar = "=" * 70
+    C.warn(bar)
+    C.warn(f"AUTO-ADVANCE #{n}/{args.auto_advance_max}: campaign {failed_name!r} produced "
+           f"nothing usable.")
+    C.warn(f"  reason: {reason}")
+    C.warn(f"  advancing to the next ranked clippable campaign (excluding {len(excluded)} failed).")
+    C.warn(bar)
+
+    pc = [sys.executable, os.path.join(scripts, "pickcampaign.py")]
+    if pick.get("scout_json"):
+        pc += ["--scout-json", pick["scout_json"]]
+    if pick.get("rank_mode") == "streamer_only":
+        pc.append("--streamer-only")
+    for eid in excluded:
+        if eid:
+            pc += ["--exclude-id", str(eid)]
+    if subprocess.run(pc).returncode != 0:
+        C.fail("auto-advance: pickcampaign found no further clippable campaign (all remaining "
+               "were skipped/excluded). Stopping.")
+    if subprocess.run([sys.executable, os.path.join(scripts, "intake.py"),
+                       "--from-pick"]).returncode != 0:
+        C.fail("auto-advance: intake failed for the next campaign. Stopping.")
+    newpick = C.load_json(C.ROOT / "campaign_inputs" / "pick.json") or {}
+    C.log(f"auto-advance: now on {newpick.get('campaign')!r} — running the pipeline for it.")
+    return excluded
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Clipper pipeline orchestrator.")
+    ap.add_argument("--resume", action="store_true", help="continue from last completed stage (default behavior)")
+    ap.add_argument("--force", action="store_true", help="re-run all stages from scratch")
+    ap.add_argument("--cut-only", action="store_true", dest="cut_only",
+                    help="run ONLY the cut stage on the existing selected/captioned clips "
+                         "(skips download, index, select, captions — ZERO Groq calls)")
+    ap.add_argument("--clips-per-batch", type=int)
+    ap.add_argument("--layout", choices=["blur_fill", "crop_fill"],
+                    help="vertical fill mode (default blur_fill: whole frame on a blurred bg)")
+    ap.add_argument("--clip-min", type=int, dest="clip_min")
+    ap.add_argument("--clip-max", type=int, dest="clip_max")
+    ap.add_argument("--watermark-file", help="watermark filename in assets/ (exact or substring)")
+    ap.add_argument("--cookies-from-browser", help="browser for cookies when re-fetching gated VODs")
+    ap.add_argument("--max-source-height", type=int, dest="max_source_height",
+                    help="cap for Drive transcoded preview streams in px (default 720)")
+    ap.add_argument("--original", action="store_true",
+                    help="force raw original Drive files instead of preview streams")
+    ap.add_argument("--cleanup", action="store_true", help="delete raw footage after a successful batch")
+    ap.add_argument("--no-cleanup", action="store_true", help="never prompt for footage cleanup")
+    ap.add_argument("--auto-advance", action="store_true", dest="auto_advance",
+                    help="if the picked campaign produces NOTHING usable (no footage / zero "
+                         "indexable sources / no live moments), advance to the NEXT ranked "
+                         "campaign (re-pick + intake + run). OFF by default — it downloads a "
+                         "second campaign, so it never happens unless you ask.")
+    ap.add_argument("--auto-advance-max", type=int, default=2, dest="auto_advance_max",
+                    help="max campaigns to auto-advance through before giving up (default 2).")
+    args = ap.parse_args()
+
+    global _COOKIES, _ORIGINAL
+    _COOKIES = args.cookies_from_browser
+    _ORIGINAL = args.original
+
+    C.ensure_dirs()
+
+    if args.cut_only:
+        require_intake()
+        state = _prepare_state(args)
+        C.log(f"config: {state['config']}")
+        cut_only(state)
+        return
+
+    # AUTO-ADVANCE loop (Unit 2c): normally runs exactly once. With --auto-advance, a campaign
+    # that produces NOTHING usable (NothingUsable) triggers a re-pick of the NEXT ranked
+    # campaign (excluding the failed one) + intake, then the pipeline runs again for it.
+    excluded, advances = [], 0
+    while True:
+        require_intake()                       # re-checked each pass (a new campaign after advance)
+        state = _prepare_state(args)
+        C.log(f"config: {state['config']}")
+        try:
+            _run_stages(state, args)
+        except C.NothingUsable as e:
+            if not args.auto_advance:
+                C.fail(str(e))                 # default: dead-end LOUD, exactly as before
+            if advances >= args.auto_advance_max:
+                C.fail(f"{e}\nauto-advance: reached the limit ({args.auto_advance_max}) — "
+                       f"stopping. Excluded so far: {excluded}.")
+            advances += 1
+            excluded = _advance_to_next_campaign(excluded, advances, args, str(e))
+            continue                           # re-run the pipeline for the newly-picked campaign
+        break
 
     C.log("pipeline complete — drafts in drafts/ (best first), see drafts/manifest.json.")
     offer_cleanup(args)

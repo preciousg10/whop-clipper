@@ -282,22 +282,44 @@ def run(state):
         C.fail("campaign/manifest.json missing — run intake.py first.")
     footage = discover_footage(manifest)
     if not footage:
-        C.fail("no footage to index — run intake.py first.")
+        raise C.NothingUsable("no footage to index for this campaign.")
 
     do_transcribe = not C.offline_mode()
     if not do_transcribe:
         C.warn("offline mode — skipping whisper transcription (audio spikes only).")
 
-    sources, all_moments, failures = [], [], []
+    # ROBUSTNESS (Unit 2a): one bad file must not fail the whole stage. We SKIP a footage file
+    # that can't be indexed — no audio stream, or corrupt/unreadable (transcript + audio spikes
+    # both come from audio, so a video-only / broken file has nothing to index) — and keep going.
+    # The stage COMPLETES as long as at least ONE file indexed; it hard-fails only if ZERO did.
+    sources, all_moments, skipped = [], [], []
     for entry in footage:
         src_path = C.ROOT / entry["path"]
         base = os.path.basename(entry["path"])
         size_gb = (src_path.stat().st_size / 1e9) if src_path.exists() else 0.0
+
+        if not src_path.exists():
+            C.warn(f"  SKIP {base}: file missing on disk — not indexable.")
+            skipped.append((base, "missing on disk"))
+            continue
+        # Cheap probe FIRST: no readable audio stream = no-audio or corrupt -> skip cleanly.
+        try:
+            n_audio = C.audio_stream_count(src_path)
+        except SystemExit:
+            n_audio = None                 # ffprobe unavailable -> unknown; let index_source try
+        if n_audio == 0:
+            C.warn(f"  SKIP {base}: no readable audio stream (no-audio or corrupt) — "
+                   f"nothing to transcribe or detect. Skipping, continuing with the rest.")
+            skipped.append((base, "no audio / unreadable"))
+            continue
+
         try:
             duration = entry.get("duration_sec") or C.ffprobe_duration(src_path)
             dur_txt = f"{duration / 60:.1f} min"
         except SystemExit:
-            duration, dur_txt = None, "duration UNREADABLE"
+            C.warn(f"  SKIP {base}: duration unreadable (corrupt) — skipping.")
+            skipped.append((base, "duration unreadable"))
+            continue
         C.log(f"indexing {base}  ({size_gb:.2f} GB, {dur_txt}) …")
         try:
             src = index_source(entry, state, do_transcribe)
@@ -305,15 +327,14 @@ def run(state):
             all_moments.extend(src["moments"])
             C.log(f"  OK {base}: {len(src['moments'])} moment(s), "
                   f"{len(src['transcript'])} transcript segment(s).")
-        except SystemExit as e:            # C.fail() inside a source: record, keep going
-            msg = f"fail() -> {e.code}"
-            C.warn(f"  FAILED {base}: {msg}")
-            failures.append((base, msg))
+        except SystemExit as e:            # C.fail() inside a source: skip it, keep going
+            C.warn(f"  SKIP {base}: indexing error ({e.code}) — skipping this file.")
+            skipped.append((base, f"index error {e.code}"))
         except Exception as e:
             import traceback
-            C.warn(f"  FAILED {base}: {e.__class__.__name__}: {e}")
+            C.warn(f"  SKIP {base}: {e.__class__.__name__}: {e} — skipping this file.")
             traceback.print_exc()
-            failures.append((base, f"{e.__class__.__name__}: {e}"))
+            skipped.append((base, f"{e.__class__.__name__}: {e}"))
 
     # assign global ids, newest-intensity first is handled later by select
     for i, m in enumerate(all_moments):
@@ -321,15 +342,23 @@ def run(state):
 
     C.save_json(C.MOMENTS_JSON, {"created_at": C.now_iso(),
                                  "sources": sources, "moments": all_moments})
-    if failures:
-        # Loud, explicit, and NOT marked done — so resume retries the failed source(s)
-        # (already-checkpointed chunks are reused, so retries are cheap).
-        detail = "; ".join(f"{n} ({e})" for n, e in failures)
-        C.fail(f"index failed for {len(failures)} source(s): {detail}. "
-               f"{len(sources)} source(s) indexed OK and checkpointed — rerun to retry.")
-    C.mark_stage(state, "index", moments=len(all_moments), sources=len(sources))
+    if not sources:
+        # ZERO usable sources — nothing to clip. NothingUsable so the orchestrator can
+        # auto-advance to the next campaign (or dead-end loud without --auto-advance).
+        detail = "; ".join(f"{n} ({e})" for n, e in skipped) or "no footage files"
+        raise C.NothingUsable(f"index produced ZERO usable sources — every footage file was "
+                              f"skipped (no audio / corrupt / error): {detail}.")
+    C.mark_stage(state, "index", moments=len(all_moments), sources=len(sources),
+                 skipped=len(skipped))
+    if skipped:
+        detail = ", ".join(f"{n} ({e})" for n, e in skipped)
+        C.warn(f"index completed with {len(skipped)} file(s) SKIPPED as not indexable "
+               f"(indexed {len(sources)} OK): {detail}")
     C.log(f"index done: {len(all_moments)} moments across {len(sources)} source(s).")
 
 
 if __name__ == "__main__":
-    run(C.load_state())
+    try:
+        run(C.load_state())
+    except C.NothingUsable as e:
+        C.fail(str(e))            # standalone: still fail loud (only run.py --auto-advance moves on)

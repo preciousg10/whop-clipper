@@ -43,6 +43,10 @@ MOMENTS_JSON = CAMPAIGN / "moments.json"
 SELECTED_JSON = CAMPAIGN / "selected.json"
 CAPTIONS_JSON = CAMPAIGN / "captions.json"
 DRAFTS_MANIFEST = DRAFTS / "manifest.json"
+# Per-item Groq checkpoints (Unit 2b): select/captions write finished work here so a DAILY
+# Groq-cap stop can --resume without redoing completed API calls. Deleted on stage completion.
+SELECT_PARTIAL = CAMPAIGN / "select_partial.json"
+CAPTIONS_PARTIAL = CAMPAIGN / "captions_partial.json"
 
 # Default to the 70B model: the 8B ('llama-3.1-8b-instant') scored moments randomly
 # (100 to a garbage clip in one run, 0 to everything the next), which wrecked both
@@ -78,6 +82,34 @@ def fail(msg, code=1):
     """Print a clear error and stop. Never return."""
     print(f"\n✗ FAIL: {msg}\n", file=sys.stderr, flush=True)
     sys.exit(code)
+
+
+# Distinct exit code for a resumable STOP (Groq daily cap) so an orchestrator can tell it apart
+# from a hard failure (code 1) — the run isn't broken, it's paused until the quota resets.
+RESUMABLE_STOP_CODE = 7
+
+
+def stop_resumable(msg, code=RESUMABLE_STOP_CODE):
+    """A clean, RESUMABLE stop (not a crash): print a clear ⏸ notice and exit with a distinct
+    code. Used when the Groq DAILY cap is hit mid-stage — progress is checkpointed, and a
+    `--resume` after the cap resets continues exactly where it stopped."""
+    print(f"\n⏸ STOPPED (resumable): {msg}\n", file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+class GroqDailyCapError(Exception):
+    """Groq DAILY token/request cap (TPD/RPD) — distinct from a short per-minute limit. Raised
+    by groq_chat so the caller can checkpoint finished work and stop_resumable() rather than
+    spin retries into a quota that won't reset until tomorrow."""
+    def __init__(self, msg, retry_after=None):
+        super().__init__(msg)
+        self.retry_after = retry_after
+
+
+class NothingUsable(Exception):
+    """A stage found NOTHING clippable for the picked campaign — no footage, zero indexable
+    sources, or no live moments. Raised (instead of fail()) so the orchestrator can either
+    dead-end loud (default) or, with --auto-advance, move on to the next ranked campaign."""
 
 
 def offline_mode():
@@ -268,10 +300,43 @@ def groq_client():
     return Groq(api_key=key)
 
 
+# A required wait longer than this is a DAILY cap, not a per-minute one (per-minute waits are
+# seconds; daily waits are minutes/hours). Retrying into a daily cap only hangs the run.
+_MAX_MINUTE_WAIT_S = 90.0
+
+
+def _parse_wait_seconds(msg):
+    """Seconds from a Groq 'try again in 5m30s' / '8.5s' / '2h34m' hint, or None."""
+    m = re.search(r"try again in ([0-9hms.\s]+)", msg, re.I)
+    if not m:
+        return None
+    total, found = 0.0, False
+    for val, unit in re.findall(r"([\d.]+)\s*(h|m|s)", m.group(1), re.I):
+        found = True
+        total += float(val) * {"h": 3600, "m": 60, "s": 1}[unit.lower()]
+    return total if found else None
+
+
+def classify_rate_limit(msg):
+    """('daily' | 'minute' | 'error', wait_seconds_or_None). Mirrors scout's classifier: 'daily'
+    = TPD/RPD/'per day' or a wait longer than a per-minute window (retrying can't help today);
+    'minute' = a short recoverable per-minute (TPM/RPM) limit; 'error' = a non-rate failure."""
+    low = msg.lower()
+    is_rate = ("429" in msg or "rate limit" in low or "rate_limit" in low
+               or "tpm" in low or "tpd" in low or "rpm" in low or "rpd" in low)
+    if not is_rate:
+        return "error", None
+    wait = _parse_wait_seconds(msg)
+    is_daily = ("per day" in low or "tpd" in low or "rpd" in low or "daily" in low
+                or (wait is not None and wait > _MAX_MINUTE_WAIT_S))
+    return ("daily" if is_daily else "minute"), wait
+
+
 def groq_chat(client, system, user, temperature=0.8, max_tokens=1024, retries=6):
-    """One chat completion. Transient rate-limit (429 TPM/RPM on the free tier) is NOT
-    fatal: back off and retry, honoring Groq's 'try again in Xs' hint. Any other API
-    error, or exhausting retries, fails loud. Returns the message string."""
+    """One chat completion. A short PER-MINUTE rate limit (429 TPM/RPM) is transient: back off
+    and retry, honoring Groq's 'try again in Xs' hint. A DAILY cap (TPD/RPD, or a wait longer
+    than a per-minute window) raises GroqDailyCapError immediately — retrying a dead daily quota
+    only hangs the run; the caller checkpoints + stops resumably. Any other error fails loud."""
     for attempt in range(retries + 1):
         try:
             resp = client.chat.completions.create(
@@ -282,14 +347,17 @@ def groq_chat(client, system, user, temperature=0.8, max_tokens=1024, retries=6)
                 max_tokens=max_tokens,
             )
             return resp.choices[0].message.content or ""
+        except GroqDailyCapError:
+            raise
         except Exception as e:
             msg = str(e)
-            is_rate = "429" in msg or "rate_limit" in msg.lower() or "rate limit" in msg.lower()
-            if is_rate and attempt < retries:
-                m = re.search(r"try again in ([\d.]+)\s*s", msg)
-                wait = (float(m.group(1)) + 0.5) if m else min(2.0 * (attempt + 1), 20.0)
-                warn(f"Groq rate limit — waiting {wait:.1f}s then retrying "
+            kind, wait = classify_rate_limit(msg)
+            if kind == "daily":
+                raise GroqDailyCapError(msg, retry_after=wait)
+            if kind == "minute" and attempt < retries:
+                w = (wait + 0.5) if wait else min(2.0 * (attempt + 1), 20.0)
+                warn(f"Groq rate limit — waiting {w:.1f}s then retrying "
                      f"(attempt {attempt + 1}/{retries})…")
-                time.sleep(wait)
+                time.sleep(w)
                 continue
             fail(f"Groq API call failed ({GROQ_MODEL}): {e}")

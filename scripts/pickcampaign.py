@@ -328,6 +328,159 @@ def clippable(c, done_ids):
     return True, None
 
 
+# --- pre-edited footage filter (Unit 1) ----------------------------------------
+# Some campaigns' "footage" is a Drive folder of already-edited short vertical clips
+# (15-45s each), not raw VODs — you can't clip moments out of an edited clip. We SKIP a
+# campaign whose footage is ENTIRELY such shorts. Measurement is cheap + download-free:
+# gdown lists the Drive folder (skip_download) and yt-dlp reads each file's duration from
+# metadata (extract_info download=False). YouTube channels/playlists are raw VOD sources
+# and PASS without probing. FAIL OPEN on anything we can't measure — better to let a
+# campaign through than wrongly exclude it (--rank can always force one anyway).
+DEFAULT_PREEDITED_MIN_SECONDS = 120      # a footage file >= this is a "real VOD" (config)
+DEFAULT_PREEDITED_MAX_PROBE = 40         # cap files probed per Drive folder (perf bound)
+
+_VIDEO_EXT_RE = re.compile(r"\.(mp4|mov|mkv|webm|m4v|avi|ts|flv|m2ts)$", re.I)
+_NONVIDEO_EXT_RE = re.compile(
+    r"\.(png|jpe?g|webp|gif|pdf|docx?|txt|md|markdown|csv|tsv|xlsx?|json|rtf|"
+    r"gdoc|gsheet|gslides)$", re.I)
+
+
+def _footage_kind(url):
+    """Coarse type of a footage link for the pre-edited check."""
+    low = (url or "").lower()
+    if "youtube.com" in low or "youtu.be" in low:
+        # A channel or playlist resolves to full VODs (raw source) — never pre-edited.
+        if any(t in low for t in ("/@", "/channel/", "/c/", "/user/", "playlist", "list=")):
+            return "raw_channel"
+        return "vod"                                  # a single YouTube video
+    if "drive.google.com" in low and ("/folders/" in low or "folderview" in low):
+        return "drive_folder"
+    if "drive.google.com" in low:
+        return "drive_file"
+    return "vod"                                      # kick / twitch / vimeo / direct
+
+
+def _looks_video(name):
+    """A Drive folder entry likely to be a video: a video extension, OR no clearly
+    non-video extension (Drive frequently lists files without an extension)."""
+    n = name or ""
+    if _VIDEO_EXT_RE.search(n):
+        return True
+    if _NONVIDEO_EXT_RE.search(n):
+        return False
+    return True
+
+
+class _QuietLogger:
+    """Swallow yt-dlp's per-file error/warning chatter (a transient 503 on one probe is not
+    worth printing — it's retried, and the aggregate decision reports what it saw)."""
+    def debug(self, m): pass
+    def info(self, m): pass
+    def warning(self, m): pass
+    def error(self, m): pass
+
+
+def _probe_duration(url, timeout=20, attempts=3):
+    """Duration in seconds from yt-dlp metadata (NO download). Retries on TRANSIENT errors
+    (Drive 503s / timeouts) so a flaky request doesn't read as 'unknowable'. Returns None
+    only when the metadata genuinely carries no duration, or every attempt failed."""
+    try:
+        from yt_dlp import YoutubeDL
+    except ImportError:
+        return None
+    import time as _t
+    for a in range(attempts):
+        try:
+            with YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True,
+                            "socket_timeout": timeout, "noplaylist": True,
+                            "logger": _QuietLogger()}) as ydl:
+                info = ydl.extract_info(url, download=False)
+            d = info.get("duration")
+            return float(d) if d is not None else None   # success (duration may be absent)
+        except Exception:
+            if a < attempts - 1:
+                _t.sleep(1.0 * (a + 1))                   # brief backoff, then retry
+    return None
+
+
+def _list_drive_folder(url):
+    """[(id, name), ...] for a Drive folder WITHOUT downloading (gdown skip_download), or
+    None if it can't be listed (then the caller fails open)."""
+    try:
+        import gdown
+    except ImportError:
+        return None
+    try:
+        files = gdown.download_folder(url=url, skip_download=True, quiet=True, use_cookies=False)
+    except Exception:
+        return None
+    out = [(getattr(f, "id", None), getattr(f, "path", None) or "") for f in (files or [])]
+    out = [(fid, name) for fid, name in out if fid]
+    return out or None
+
+
+def _short_name(s, n=34):
+    s = str(s or "").strip()
+    return (s[:n - 1] + "…") if len(s) > n else s
+
+
+def preedited_footage_skip(c, min_seconds=DEFAULT_PREEDITED_MIN_SECONDS,
+                           max_probe=DEFAULT_PREEDITED_MAX_PROBE):
+    """(skip, reason) — True only when the campaign's footage is ENTIRELY pre-edited short
+    clips: it has resolvable footage AND every file we could measure is < `min_seconds`,
+    with nothing left unmeasurable. Any raw channel/playlist, any file >= threshold, or any
+    unmeasurable source makes us FAIL OPEN (skip=False). Metadata only — never downloads."""
+    links = footage_links(c)
+    if not links:
+        return False, None                            # 'no footage' is clippable()'s job
+    to_probe, source_unknown, sampled_note = [], False, ""
+    for url in links:
+        kind = _footage_kind(url)
+        if kind == "raw_channel":
+            return False, None                        # raw VOD source -> clippable
+        if kind == "drive_folder":
+            entries = _list_drive_folder(url)
+            if entries is None:
+                source_unknown = True                 # can't even list it -> could be a VOD
+                continue
+            vids = [(f"https://drive.google.com/file/d/{fid}/view", name)
+                    for fid, name in entries if _looks_video(name)]
+            if not vids:
+                source_unknown = True
+                continue
+            if len(vids) > max_probe:
+                sampled_note = f" (sampled {max_probe} of {len(vids)})"
+                vids = vids[:max_probe]
+            to_probe.extend(vids)
+        else:                                         # single vod / drive file
+            to_probe.append((url, url))
+    if source_unknown or not to_probe:
+        return False, None                            # a whole source is unknowable -> fail open
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        results = list(ex.map(lambda t: (t[1], _probe_duration(t[0])), to_probe))
+
+    measured, unreadable = [], 0
+    for name, d in results:
+        if d is None:
+            unreadable += 1                           # a single file we couldn't read
+        elif d >= min_seconds:
+            return False, None                        # a real VOD present -> clippable
+        else:
+            measured.append((name, d))
+    # Skip only when a clear MAJORITY of files measured AND every one is short. A minority of
+    # transient/unreadable probes is tolerated (retries already ran); if most files are
+    # unreadable we treat the length as genuinely unknowable and fail open.
+    if measured and len(measured) >= max(1, unreadable):
+        lens = ", ".join(f"{_short_name(n)}={d:.0f}s" for n, d in measured[:6])
+        more = f", +{len(measured) - 6} more" if len(measured) > 6 else ""
+        extra = f", {unreadable} unreadable" if unreadable else ""
+        return True, (f"pre-edited footage — {len(measured)} measured file(s) < "
+                      f"{min_seconds}s{sampled_note}{extra} [{lens}{more}]")
+    return False, None                                # too little measured -> fail open
+
+
 # --- main ----------------------------------------------------------------------
 def load_scout_campaigns(scout_json):
     if not os.path.exists(scout_json):
@@ -341,6 +494,44 @@ def load_scout_campaigns(scout_json):
     if not campaigns:
         C.fail(f"scout campaigns file has no campaigns: {scout_json}")
     return campaigns
+
+
+def board_age_hours(scout_json):
+    """Hours since scout GENERATED this board (top-level `generated_at`), or None if unknown.
+    Lets the clipper detect a STALE board even though scout's once-daily 20h guard skips
+    SILENTLY (exit 0): if scout didn't scrape today, generated_at is yesterday's."""
+    try:
+        data = json.loads(open(scout_json, encoding="utf-8").read())
+    except Exception:
+        return None
+    ts = data.get("generated_at") if isinstance(data, dict) else None
+    if not ts:
+        return None
+    try:
+        import datetime
+        gen = datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return (datetime.datetime.now(datetime.timezone.utc) - gen).total_seconds() / 3600.0
+    except Exception:
+        return None
+
+
+def warn_if_stale_board(scout_json, max_hours):
+    """Loudly flag a stale scout board (Unit 2d) so the chained `whop.bat` run can NEVER pick
+    from an old board without the user seeing it. Warns; does not stop (the pick may still be
+    fine on a day-old board) — but it is unmistakable."""
+    age = board_age_hours(scout_json)
+    if age is None:
+        C.warn("scout board age UNKNOWN (no generated_at timestamp) — can't confirm it's fresh.")
+        return
+    if age >= max_hours:
+        bar = "!" * 70
+        C.warn(bar)
+        C.warn(f"STALE SCOUT BOARD — campaigns.json was generated {age:.1f}h ago (>= {max_hours}h).")
+        C.warn("Scout most likely SKIPPED its once-daily scrape (20h guard) and you are picking")
+        C.warn("from an OLD board. For fresh data run scout with --force, then re-run the pick.")
+        C.warn(bar)
+    else:
+        C.log(f"scout board age: {age:.1f}h (fresh, < {max_hours}h).")
 
 
 def _commit_pick(pick, rank, scout_json, streamer_only=False):
@@ -419,18 +610,37 @@ def main():
                          f"rather than descend the whole list.")
     ap.add_argument("--rank", type=int, default=None,
                     help="manual override: force this exact 1-based rank (must pass the "
-                         "clippability preconditions, else fail loud). Default: walk from #1.")
+                         "clippability preconditions, else fail loud). BYPASSES the pre-edited "
+                         "footage filter, so you can force a campaign the walk would skip. "
+                         "Default: walk from #1.")
     ap.add_argument("--streamer-only", action="store_true",
                     help="STREAMER/IRL-only handoff: rank + pick only streamer_irl campaigns "
                          "(plus sports campaigns that carry a streamer/IRL keyword signal, at "
                          "x0.6 lower priority). Reads scout's existing category tags — no "
                          "re-categorization. The full board in campaigns.json is untouched; "
                          "only what's ranked + handed to the clipper changes.")
+    ap.add_argument("--preedited-min-seconds", type=int, default=DEFAULT_PREEDITED_MIN_SECONDS,
+                    help=f"pre-edited filter: a footage file this long or longer counts as a "
+                         f"real VOD (default {DEFAULT_PREEDITED_MIN_SECONDS}s). A campaign whose "
+                         f"footage is ENTIRELY shorter clips is skipped during the walk.")
+    ap.add_argument("--preedited-max-probe", type=int, default=DEFAULT_PREEDITED_MAX_PROBE,
+                    help=f"pre-edited filter: max files probed per Drive folder (default "
+                         f"{DEFAULT_PREEDITED_MAX_PROBE}).")
+    ap.add_argument("--no-preedited-filter", action="store_true",
+                    help="disable the pre-edited-footage skip (walk exactly as before).")
+    ap.add_argument("--exclude-id", action="append", default=[], metavar="SCOUT_ID",
+                    help="scout campaign id to SKIP during the walk (repeatable). Used by "
+                         "run.py --auto-advance to move past a campaign that produced nothing.")
+    ap.add_argument("--stale-board-hours", type=float, default=20.0,
+                    help="warn LOUDLY if scout's campaigns.json is at least this many hours old "
+                         "(default 20, matching scout's once-daily guard) — so a silently-skipped "
+                         "scout scrape never picks from a stale board unnoticed.")
     args = ap.parse_args()
 
     scout_json = args.scout_json or os.path.join(args.scout_dir, "campaigns.json")
     scout_dir = os.path.dirname(scout_json) or "."
     campaigns = load_scout_campaigns(scout_json)
+    warn_if_stale_board(scout_json, args.stale_board_hours)   # Unit 2d: never silent on a stale board
     ranked = rank_campaigns(campaigns, streamer_only=args.streamer_only)
     if not ranked:
         if args.streamer_only:
@@ -469,8 +679,20 @@ def main():
     cap = max(1, args.max_walk)
     walked = ranked[:cap]
     skips = []
+    exclude = set(args.exclude_id or [])
     for i, c in enumerate(walked, 1):
+        if c.get("id") in exclude:
+            skips.append((i, c, "excluded (--exclude-id; auto-advance skip)"))
+            continue
         ok, why = clippable(c, done_ids)
+        # Pre-edited footage filter (Unit 1): only AFTER the cheap checks pass (it probes the
+        # network for durations, so we never run it on a campaign that already failed).
+        if ok and not args.no_preedited_filter:
+            C.log(f"    #{i} {c.get('name')!r}: checking footage length (no download)…")
+            skip_pe, why_pe = preedited_footage_skip(
+                c, min_seconds=args.preedited_min_seconds, max_probe=args.preedited_max_probe)
+            if skip_pe:
+                ok, why = False, why_pe
         if ok:
             for sr, sc, sw in skips:
                 C.log(f"  skip #{sr}  {sc.get('name')!r} — {sw}")

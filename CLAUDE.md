@@ -25,6 +25,9 @@ python scripts/run.py                                # download → index → se
 python scripts/intake.py --brief <file> --links <file> --campaign "<name>"   # Stage 0
 python scripts/run.py --resume   # continue after a crash (per-stage + per-chunk checkpoints)
 python scripts/run.py --force    # re-run all stages
+python scripts/run.py --cut-only # re-render ONLY the cut stage from the existing captions.json
+                                 # (skips download/index/select/captions — ZERO Groq calls; for
+                                 # iterating on the render without burning the Groq daily cap)
 python scripts/selftest.py       # offline self-test (no ffmpeg → ffmpeg stages SKIP, rest run)
 ```
 **Full chain the user runs:** `python scout.py` (in ../scout, ranks campaigns) →
@@ -46,9 +49,25 @@ pick.json}` from the campaign's scraped `rules_text` + `source_links`. **Fail-lo
 if the top pick has no footage links (nothing to clip) it STOPS and reports — it does NOT skip
 to #2, and it does NOT scrape Whop (scout owns the browser). Live "search Whop by name" is
 deferred: it prints the Whop search URL for the user to open instead of running unverified
-automation. `--rank N` is a manual override. `intake.py --from-pick` (`apply_pick`) then reads
-`pick.json` and runs Stage 0 on it — the wiring that lets intake take the scout pick instead of
-hand-placed files (fail-loud if the pick or its files are missing).
+automation. `--rank N` is a manual override (and BYPASSES the pre-edited filter below).
+`intake.py --from-pick` (`apply_pick`) then reads `pick.json` and runs Stage 0 on it — the
+wiring that lets intake take the scout pick instead of hand-placed files (fail-loud if the
+pick or its files are missing).
+**Pre-edited footage filter** (`preedited_footage_skip`): during the walk, a campaign is
+skipped if its footage is ENTIRELY pre-edited short clips — resolvable footage where EVERY
+measured file is under `--preedited-min-seconds` (default 120s). Measurement is download-free:
+gdown lists a Drive folder (`skip_download=True`), yt-dlp reads each file's `duration` from
+metadata (`extract_info download=False`), probed concurrently with retries. YouTube
+channels/playlists are raw VOD sources and PASS without probing; any file ≥ threshold PASSES.
+FAILS OPEN on anything unmeasurable (unlistable folder, majority-unreadable) — never wrongly
+excludes; `--rank` forces a skipped one anyway. pickcampaign has NO state.json config — these
+are CLI args, so no state key to add.
+**Stale-board warning** (`warn_if_stale_board`, Unit 2d): scout's once-daily 20h guard skips
+its scrape SILENTLY (exit 0), so the chained `whop.bat` run could pick from a day-old board
+unnoticed. pickcampaign reads the top-level `generated_at` from `campaigns.json` and, if the
+board is ≥ `--stale-board-hours` (default 20) old, prints a LOUD banner (scout likely skipped;
+run scout `--force` for fresh data). Self-contained in the clipper — catches staleness from any
+cause, not just the guard.
 
 `intake.py` (brief+links) → `campaign/{brief.md, rules.json, knowledge.md, manifest.json}`
 + `footage/ assets/ docs/ other/`
@@ -75,6 +94,19 @@ into `memory/longterm.md`.**
 ## Conventions that matter
 - **Fail loud, never guess.** Missing tool / ambiguous rule / no footage → `C.fail(...)`
   and stop. Intake flags ambiguities for the user rather than inventing rules.
+- **Survive one bad input; only die when EVERYTHING is unusable (Unit 2).** `index.py` probes
+  each footage file for a readable audio stream FIRST and SKIPS a no-audio/corrupt file (warn,
+  continue) — the stage completes as long as ≥1 file indexed, hard-failing (`C.NothingUsable`)
+  only at ZERO usable sources. Groq stages tell a DAILY cap (TPD/RPD, or a wait > 90s) apart
+  from a short per-minute limit (`common.classify_rate_limit`): a per-minute limit still backs
+  off + retries; a DAILY cap raises `C.GroqDailyCapError`. select/captions checkpoint each
+  finished batch/clip to `select_partial.json` / `captions_partial.json`, so run.py catches the
+  daily cap, reports "N of M done", and `stop_resumable`s (exit 7) — `--resume` continues
+  without re-spending Groq (partials deleted on stage completion). A campaign that yields
+  NOTHING usable raises `C.NothingUsable`; run.py dead-ends loud by default, or with
+  `--auto-advance` re-picks the NEXT ranked campaign (`pickcampaign --exclude-id` the failed
+  one) + intake and runs again (opt-in — it downloads a second campaign; bounded by
+  `--auto-advance-max`, default 2).
 - **Everything is resumable.** New work must checkpoint to `state.json` (and to disk)
   before the next step. `index.py` checkpoints per 5-min VOD chunk — preserve that. It
   REUSES the on-disk transcript/rms/words partials ONLY when `chunks_done > 0` (a genuine
@@ -106,12 +138,26 @@ into `memory/longterm.md`.**
   the Groq free tier overnight (each selected clip = one downstream caption Groq call). We take
   every moment that clears the bar up to the ceiling and **stop — never pad to a number**; if
   nothing clears it we ship the best available, capped conservatively.
-- **Caption + subtitle case is Title Case (Like This), per user preference** —
-  `captions.titlecase` is the single choke point, applied in `finalize_caption` (hook caption)
-  AND `cut._group_lines` (per subtitle word, before it reaches the ASS). It capitalizes each
-  word's first letter and leaves the rest untouched, so contractions survive ("don't"→"Don't",
-  masked "b**"→"B**"). This OVERRODE the old lowercase default. `emoji_in_caption` (config,
-  default true) keeps emoji IN THE HOOK caption; cut renders them with a color-emoji font and
+- **Hook caption case is Title Case (Like This), per user preference** — `captions.titlecase`
+  is applied in `finalize_caption` (hook caption). It capitalizes each word's first letter and
+  leaves the rest untouched, so contractions survive ("don't"→"Don't", masked "b**"→"B**").
+  **The karaoke SUBTITLES are styled DIFFERENTLY** (flzsh / Gen Z look, `cut._subtitle_word`):
+  all lowercase, apostrophes dropped so contractions read as one word ("what's"→"whats"), and
+  ALL other punctuation stripped ("Saki."→"saki", "difference?"→"difference"); digits survive.
+  This runs BEFORE masking in `_group_lines`, and sentence-boundary line breaks read the RAW
+  word's trailing ".!?" before it's stripped. Only the lower karaoke band is restyled — the hook
+  plate keeps Title Case + punctuation.
+- **Two DIFFERENT censors on karaoke words** (`_group_lines`, lower band only — never the hook):
+  a CAMPAIGN-banned word (bet/gamble, rules compliance) is FULLY masked by `_mask_banned_word`
+  ("b**"); anything else that is PROFANITY gets a LIGHTER stylistic vowel-censor by
+  `_censor_profanity` — keep consonants + shape, replace vowels with "*" ("shit"→"sh*t",
+  "fuck"→"f*ck", "ass"→"*ss", "fucking"→"f*ck*ng"). Banned takes precedence (full mask wins).
+  The profanity set (`_PROFANITY_ROOTS`, swears + slurs) is matched case-insensitively with
+  inflections (fucking/bitches/shitty via an anchored root + optional doubled consonant + short
+  suffix) so it catches suffixed forms WITHOUT false-positiving innocent look-alikes (assault,
+  assess, hello, cocktail stay untouched). Toggle: `subtitle_censor_profanity` (default true).
+  `emoji_in_caption` (config, default true) keeps emoji IN THE HOOK caption; cut renders them
+  with a color-emoji font and
   DROPS any glyph the font can't draw so a tofu box never ships. Tofu-detection uses fontTools'
   live cmap if installed, else a curated allowlist (`cut._ALLOWED_EMOJI_CP`) — because Segoe UI
   Emoji draws unknown code points as a visible box that a pixel probe can't distinguish from a
@@ -143,7 +189,23 @@ into `memory/longterm.md`.**
   and drops `subtitle_band_margin` px below it — so a 2nd line grows DOWN into the band, never up
   onto the footage. `SUBTITLE_BOX_W`=640 → MarginL/R (safe box); `SUBTITLE_CENTER_Y`=1440 is only
   the fallback (crop_fill / full-height source with no band). Clear of the top hook plate, the
-  bottom-right watermark, and the bottom UI / right action-rail notch.
+  bottom-right watermark, and the bottom UI / right action-rail notch. **Line grouping follows
+  speech RHYTHM** (`_group_lines`): the PRIMARY break is a PAUSE — when the silence between two
+  words exceeds `subtitle_pause_gap` (default 0.35s) the line ends there, even at 1 word, so each
+  spoken burst is its own line ("hello" [pause] "how are you" → two lines). Gaps are read from
+  the OUTPUT-timeline events so the rhythm matches the FINAL edit (post reorder/dead-air trim).
+  Within a continuous pause-free run it still caps at `subtitle_max_words` (~3, +1 to avoid an
+  orphan); always ONE physical line (ASS `WrapStyle: 2` forbids auto-wrap).
+- **Non-speech sound labels** (karaoke `*scream*` / `*laughing*` fills). Whisper only
+  transcribes SPEECH, so a scream/laugh/crash is a silent GAP in the word karaoke. The captions
+  stage (`captions._nonspeech_beats` + `_label_sound_beats`) finds loud `audio_spike` moments
+  with NO overlapping transcript and asks Groq for a SHORT accurate descriptor — returning null
+  (no label) when it can't tell, so it NEVER guesses randomly — storing `sound_fx`:
+  `[{start,end,peak,label}]` (source-absolute) per clip in captions.json. Only fires when a clip
+  has a real non-speech beat (≤3 per clip), so it adds Groq calls sparingly and NONE for
+  all-speech clips. cut.py stays ZERO-Groq: it maps `sound_fx` through the same `segments` and
+  burns each as a standalone `*label*` line (`cut._fx_line_text`, lowercase + asterisks, banned
+  words still masked) dropped into the word gap.
 - **Merge discipline (select):** `merge_gap_seconds` (7) + `merge_max_span_seconds` (60)
   keep a merged moment one real beat; over-length moments are NOT clamped from the start —
   `cut.clip_bounds` centers the clip window on the moment's peak. Every speech moment now
