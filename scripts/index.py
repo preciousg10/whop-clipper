@@ -13,6 +13,7 @@ Offline/degraded mode (CLIPPER_OFFLINE=1) skips whisper (spikes only) so the pip
 is testable without downloading a model.
 """
 import os
+import re
 import sys
 import wave
 
@@ -130,13 +131,16 @@ def _transcribe_audio(audio, offset):
     array in [-1, 1], so we normalize the int16-scaled samples here (we already hold the
     samples — no need to re-open a file).
 
-    Returns (segments, words): segment-level text (as before) AND per-word timings
-    {word,start,end}. Word timings power the karaoke-style burned subtitles in cut.py,
-    which maps them through the cold-open reorder onto the FINAL clip timeline — so we
-    persist them at INDEX time (one whisper pass) instead of re-transcribing every clip.
-    Both are offset to ABSOLUTE source seconds (chunk offset + segment/word time)."""
+    Returns (segments, words, lang, lang_prob): segment-level text (as before), per-word
+    timings {word,start,end}, and faster-whisper's DETECTED LANGUAGE for this chunk (code +
+    probability, free — whisper already runs it). Word timings power the karaoke-style burned
+    subtitles in cut.py, which maps them through the cold-open reorder onto the FINAL clip
+    timeline — so we persist them at INDEX time (one whisper pass) instead of re-transcribing
+    every clip. Both are offset to ABSOLUTE source seconds (chunk offset + segment/word time)."""
     model = _get_model()
-    segments, _info = model.transcribe(audio / 32768.0, word_timestamps=True)
+    segments, info = model.transcribe(audio / 32768.0, word_timestamps=True)
+    lang = getattr(info, "language", None)
+    lang_prob = getattr(info, "language_probability", None)
     segs, words = [], []
     for seg in segments:
         text = (seg.text or "").strip()
@@ -151,7 +155,78 @@ def _transcribe_audio(audio, offset):
             words.append({"word": wt,
                           "start": round(offset + float(w.start), 3),
                           "end": round(offset + float(w.end), 3)})
-    return segs, words
+    return segs, words, lang, lang_prob
+
+
+# --- footage-language detection (feeds the language gate in run()) -------------
+# faster-whisper returns a language CODE per transcription; these map the common ones to a
+# display name for the gate message + per-source logs. Unknown codes fall back to the code.
+_LANG_NAMES = {
+    "en": "English", "de": "German", "es": "Spanish", "fr": "French", "pt": "Portuguese",
+    "it": "Italian", "nl": "Dutch", "ru": "Russian", "pl": "Polish", "tr": "Turkish",
+    "sv": "Swedish", "no": "Norwegian", "da": "Danish", "fi": "Finnish", "cs": "Czech",
+    "ja": "Japanese", "ko": "Korean", "zh": "Chinese", "ar": "Arabic", "hi": "Hindi",
+    "id": "Indonesian", "uk": "Ukrainian", "ro": "Romanian", "el": "Greek", "vi": "Vietnamese",
+}
+
+
+def _language_name(code):
+    return _LANG_NAMES.get((code or "").lower(), (code or "unknown"))
+
+
+# Lightweight OFFLINE fallback: only used when whisper somehow returned no language code
+# (e.g. an old pre-feature transcript resumed from disk). Stopword-ratio vote over the text.
+_STOPWORDS = {
+    "en": {"the", "and", "you", "that", "this", "have", "with", "for", "not", "are", "was",
+           "but", "what", "your", "just", "like", "they", "from", "know", "all", "get", "out",
+           "one", "about", "can", "when", "there", "yeah", "gonna", "really"},
+    "de": {"und", "der", "die", "das", "ich", "nicht", "ist", "du", "wir", "ihr", "sie", "ein",
+           "eine", "mit", "auf", "für", "aber", "was", "wie", "auch", "dann", "noch", "hier",
+           "habe", "haben", "wird", "sich", "dass", "ja", "so", "mal"},
+    "es": {"el", "la", "los", "las", "que", "de", "en", "un", "una", "por", "con", "para",
+           "como", "pero", "esto", "esta", "muy", "cuando", "porque", "también", "hay", "este",
+           "sí", "está", "pues"},
+    "fr": {"le", "la", "les", "des", "une", "que", "de", "et", "est", "pas", "pour", "avec",
+           "dans", "sur", "mais", "comme", "vous", "nous", "ils", "cette", "tout", "aussi",
+           "oui", "voilà", "ça"},
+    "pt": {"o", "a", "os", "as", "que", "de", "em", "um", "uma", "por", "com", "para", "como",
+           "mas", "isso", "esta", "muito", "quando", "porque", "também", "não", "você", "sim",
+           "está", "então"},
+    "it": {"il", "la", "le", "che", "di", "un", "una", "per", "con", "come", "ma", "questo",
+           "molto", "quando", "perché", "anche", "non", "sono", "sei", "sì", "cosa", "adesso"},
+}
+
+
+def _detect_language_text(text):
+    """(lang_code, confidence) from a stopword-ratio vote, or (None, None) when there's too
+    little text to tell. A pure-offline fallback — whisper's own detection is preferred."""
+    toks = re.findall(r"[a-zà-ÿ']+", (text or "").lower())
+    if len(toks) < 8:
+        return None, None
+    scores = {lang: sum(1 for t in toks if t in sw) / len(toks)
+              for lang, sw in _STOPWORDS.items()}
+    best = max(scores, key=scores.get)
+    if scores[best] <= 0:
+        return None, None
+    return best, round(scores[best], 3)
+
+
+def _resolve_language(lang_chars, lang_probw, transcript, do_transcribe):
+    """Pick a source's dominant language. Primary: char-weighted vote over whisper's per-chunk
+    codes (lang_chars) with a char-weighted avg probability. Fallback: offline text heuristic
+    (only when whisper gave nothing — e.g. a resumed pre-feature transcript). Returns
+    (code_or_None, prob_or_None, lang_chars_for_aggregation)."""
+    if lang_chars:
+        dom = max(lang_chars, key=lang_chars.get)
+        prob = (lang_probw.get(dom, 0.0) / lang_chars[dom]) if lang_chars[dom] else None
+        return dom, (round(prob, 3) if prob is not None else None), \
+            {k: round(v, 1) for k, v in lang_chars.items()}
+    if do_transcribe:
+        text = " ".join(s.get("text", "") for s in transcript)
+        lang, conf = _detect_language_text(text)
+        if lang:
+            return lang, conf, {lang: float(len(text))}
+    return None, None, {}
 
 
 # --- moment construction -------------------------------------------------------
@@ -236,6 +311,11 @@ def index_source(entry, state, do_transcribe):
     transcript = (C.load_json(tr_path, default=[]) or []) if resuming else []
     rms_vals = (C.load_json(rms_path, default=[]) or []) if resuming else []
     words = (C.load_json(words_path, default=[]) or []) if resuming else []
+    # Per-source language votes, char-weighted (see _resolve_language). Persisted in ss so a
+    # RESUME that skips the transcription loop still has them — the transcript partial on disk
+    # carries no language code, so they can't be recomputed from it.
+    lang_chars = dict(ss.get("lang_chars", {})) if resuming else {}
+    lang_probw = dict(ss.get("lang_probw", {})) if resuming else {}
 
     # Extract the whole audio track ONCE to a small wav (resumes reuse it — it's only
     # deleted after every chunk is done), then walk it in CHUNK_SEC slices. The multi-GB
@@ -251,14 +331,20 @@ def index_source(entry, state, do_transcribe):
         audio = _read_wav_slice(audio_wav, start, dur)
         rms_vals.extend([round(float(v), 2) for v in _rms_per_second(audio)])
         if do_transcribe:
-            segs, chunk_words = _transcribe_audio(audio, start)
+            segs, chunk_words, lang, lprob = _transcribe_audio(audio, start)
             transcript.extend(segs)
             words.extend(chunk_words)
+            nchars = sum(len(s["text"]) for s in segs)
+            if lang and nchars:
+                lang_chars[lang] = lang_chars.get(lang, 0.0) + nchars
+                lang_probw[lang] = lang_probw.get(lang, 0.0) + nchars * float(lprob or 0.0)
         # checkpoint after each chunk
         C.save_json(tr_path, transcript)
         C.save_json(rms_path, rms_vals)
         C.save_json(words_path, words)
         ss["chunks_done"] = ci + 1
+        ss["lang_chars"] = lang_chars
+        ss["lang_probw"] = lang_probw
         C.save_state(state)
         done_min = int((ci + 1) * CHUNK_SEC / 60)
         total_min = int(np.ceil(duration / 60))
@@ -267,12 +353,71 @@ def index_source(entry, state, do_transcribe):
     if CLEANUP_TMP and audio_wav.exists():
         audio_wav.unlink()
 
+    # Resolve this source's dominant language (feeds the campaign-wide gate in run()).
+    language, language_prob, lang_chars_final = _resolve_language(
+        lang_chars, lang_probw, transcript, do_transcribe)
+    ss["language"] = language
+    C.save_state(state)
+    if do_transcribe:
+        if language:
+            C.log(f"  {name}: language {_language_name(language)} ({language})"
+                  + (f", p={language_prob:.2f}" if language_prob is not None else ""))
+        else:
+            C.log(f"  {name}: language undetermined (little/no speech).")
+
     rms = np.array(rms_vals, dtype=np.float32)
     moments = (_spike_moments(entry["path"], rms)
                + _speech_moments(entry["path"], transcript, rms))
     return {"source": entry["path"], "duration_sec": round(duration, 2),
             "safe_margin": entry.get("safe_margin", False),
+            "language": language, "language_prob": language_prob,
+            "lang_chars": lang_chars_final,
             "transcript": transcript, "words": words, "moments": moments}
+
+
+def _language_gate(sources, state):
+    """Footage-language gate. Runs AFTER transcription (local + free) but BEFORE select/captions
+    (the LLM token-spending stages) — that ordering is the whole point. Aggregates each source's
+    whisper-detected language (char-weighted) across the campaign; if the DOMINANT language isn't
+    `gate_language` (default 'en') with enough confidence, STOP the run so a German/other-language
+    campaign that slipped scout's English name/description derank never burns LLM tokens producing
+    garbage captions. Raises NothingUsable (run.py fails loud by default, or --auto-advance
+    re-picks the next campaign). FAILS OPEN on ambiguity / no speech / offline — never wrongly
+    excludes. Bypass with --allow-any-language (config allow_any_language)."""
+    cfg = state.get("config", {})
+    if cfg.get("allow_any_language"):
+        C.log("language gate: bypassed (--allow-any-language).")
+        return
+    gate_lang = str(cfg.get("gate_language", "en")).lower()
+    min_conf = float(cfg.get("gate_language_min_prob", 0.6))
+
+    totals = {}
+    for s in sources:
+        for lang, ch in (s.get("lang_chars") or {}).items():
+            totals[lang] = totals.get(lang, 0.0) + float(ch)
+    total = sum(totals.values())
+    if total <= 0:
+        C.warn("language gate: no transcript language detected (no speech / offline) — "
+               "gate skipped (fail open).")
+        return
+
+    dominant = max(totals, key=totals.get)
+    share = totals[dominant] / total
+    mix = ", ".join(f"{_language_name(l)} ({l}) {c / total:.0%}"
+                    for l, c in sorted(totals.items(), key=lambda kv: -kv[1]))
+    C.log(f"language gate: dominant footage language {_language_name(dominant)} ({dominant}) "
+          f"at {share:.0%} confidence [{gate_lang} required] — mix: {mix}")
+
+    if dominant == gate_lang:
+        return
+    if share < min_conf:
+        C.warn(f"language gate: dominant language is {_language_name(dominant)} ({dominant}) but "
+               f"confidence {share:.0%} < {min_conf:.0%} threshold — passing (ambiguous, fail open).")
+        return
+    raise C.NothingUsable(
+        f"Footage language detected: {_language_name(dominant)} ({dominant}) — not "
+        f"{_language_name(gate_lang)} ({gate_lang}). Skipping campaign to avoid wasting LLM "
+        f"tokens. Override with --allow-any-language.")
 
 
 def run(state):
@@ -348,6 +493,9 @@ def run(state):
         detail = "; ".join(f"{n} ({e})" for n, e in skipped) or "no footage files"
         raise C.NothingUsable(f"index produced ZERO usable sources — every footage file was "
                               f"skipped (no audio / corrupt / error): {detail}.")
+    # Language gate: bail BEFORE select/captions (token spend) if the footage isn't English.
+    # moments.json is already saved above, so the stop is inspectable + resumable/re-pickable.
+    _language_gate(sources, state)
     C.mark_stage(state, "index", moments=len(all_moments), sources=len(sources),
                  skipped=len(skipped))
     if skipped:
@@ -358,7 +506,15 @@ def run(state):
 
 
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="Index stage — build the moment index of the source.")
+    ap.add_argument("--allow-any-language", action="store_true", dest="allow_any_language",
+                    help="bypass the footage-language gate (index non-English footage anyway)")
+    args = ap.parse_args()
+    state = C.load_state()
+    state.setdefault("config", {})["allow_any_language"] = bool(args.allow_any_language)
+    C.save_state(state)
     try:
-        run(C.load_state())
+        run(state)
     except C.NothingUsable as e:
         C.fail(str(e))            # standalone: still fail loud (only run.py --auto-advance moves on)

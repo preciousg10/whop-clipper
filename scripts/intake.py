@@ -18,6 +18,7 @@ Instead of just filing downloads and keyword-scanning the brief, intake now:
 import argparse
 import os
 import re
+import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -64,6 +65,56 @@ def apply_pick(args):
     C.log(f"intake from scout pick: campaign={args.campaign!r} "
           f"(rank {meta.get('rank')}, composite {meta.get('composite_score')}); "
           f"brief={args.brief}, links={args.links}")
+
+
+# --- clean slate on a NEW campaign ---------------------------------------------
+def _wipe_dir_contents(d):
+    """Delete every file/subdir INSIDE d (keep d itself — OneDrive can lock the dir).
+    Returns the count removed. Only ever called on the clipper's own campaign working dirs."""
+    if not d.exists():
+        return 0
+    removed = 0
+    for p in sorted(d.iterdir()):
+        try:
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+            removed += 1
+        except Exception as e:
+            C.warn(f"could not remove {p}: {e}")
+    return removed
+
+
+def clear_prior_campaign(new_campaign, prior_manifest):
+    """When intake starts a DIFFERENT campaign than the one currently on disk, clear the prior
+    campaign's footage + transcripts + stale derived artifacts (moments/selected/captions) so
+    the new campaign starts clean — otherwise old junk (e.g. LETSGO's NBA/Pokemon footage) piles
+    up in campaign/footage/ and gets re-indexed, wasting time and polluting results.
+
+    SAME campaign (resume / re-run) → NO-OP: clearing would force a needless re-download and
+    defeat the unchanged-file reuse. SAFETY: only ever touches C.FOOTAGE / C.TRANSCRIPTS and the
+    named artifact files — all fixed paths under campaign/, never anything outside them."""
+    prior_campaign = (prior_manifest or {}).get("campaign")
+    if not prior_campaign or prior_campaign == new_campaign:
+        return  # fresh (nothing recorded) or same campaign → keep everything for reuse/resume
+    C.warn(f"campaign changed ({prior_campaign!r} → {new_campaign!r}) — clearing the prior "
+           f"campaign's footage/transcripts/derived files so the new one starts clean "
+           f"(stale footage would otherwise be re-indexed and pollute results).")
+    cleared = []
+    for d in (C.FOOTAGE, C.TRANSCRIPTS):
+        n = _wipe_dir_contents(d)
+        if n:
+            cleared.append(f"{d.relative_to(C.ROOT).as_posix()}/ ({n} item(s))")
+    for f in (C.MOMENTS_JSON, C.SELECTED_JSON, C.CAPTIONS_JSON,
+              C.SELECT_PARTIAL, C.CAPTIONS_PARTIAL):
+        if f.exists():
+            try:
+                f.unlink()
+                cleared.append(f.relative_to(C.ROOT).as_posix())
+            except Exception as e:
+                C.warn(f"could not remove {f}: {e}")
+    C.log("cleared: " + (", ".join(cleared) if cleared else "(nothing to clear)"))
 
 
 # --- inputs --------------------------------------------------------------------
@@ -440,6 +491,9 @@ def main():
 
     # Prior manifest lets us skip re-downloading sources whose files are unchanged.
     prior = C.load_json(C.CAMPAIGN_MANIFEST) or {}
+    # If this is a DIFFERENT campaign than what's on disk, wipe the prior footage/transcripts/
+    # derived files first so old campaign junk isn't re-indexed (no-op on a same-campaign re-run).
+    clear_prior_campaign(args.campaign, prior)
     prior_by_source = {}
     for d in prior.get("downloads", []):
         prior_by_source.setdefault(d.get("source"), []).append(d)

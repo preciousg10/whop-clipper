@@ -57,6 +57,11 @@ def _redirect_common_paths(base):
     C.MOMENTS_JSON = C.CAMPAIGN / "moments.json"
     C.SELECTED_JSON = C.CAMPAIGN / "selected.json"
     C.CAPTIONS_JSON = C.CAMPAIGN / "captions.json"
+    # Per-item Groq checkpoints — MUST be redirected too, else the self-test reads (and, on
+    # stage completion, DELETES) the user's real campaign/{select,captions}_partial.json. That
+    # leak wiped a real partial and made cut render the real campaign's footage in the sandbox.
+    C.SELECT_PARTIAL = C.CAMPAIGN / "select_partial.json"
+    C.CAPTIONS_PARTIAL = C.CAMPAIGN / "captions_partial.json"
     C.DRAFTS_MANIFEST = C.DRAFTS / "manifest.json"
 
 
@@ -125,7 +130,8 @@ def _assert_sandboxed():
     the run loudly instead of wiping the user's real campaign/ again."""
     sb = str(_SANDBOX.resolve())
     for p in (C.CAMPAIGN, C.FOOTAGE, C.ASSETS, C.DOCS, C.OTHER, C.TRANSCRIPTS,
-              C.DRAFTS, C.DRAFTS_ARCHIVE, C.MEMORY, C.STATE_PATH, C.RULES_JSON):
+              C.DRAFTS, C.DRAFTS_ARCHIVE, C.MEMORY, C.STATE_PATH, C.RULES_JSON,
+              C.SELECT_PARTIAL, C.CAPTIONS_PARTIAL):
         if not str(Path(p).resolve()).startswith(sb):
             C.fail(f"SAFETY ABORT: self-test path {p} is outside the sandbox {sb}. "
                    "Refusing to touch real data.")
@@ -134,7 +140,8 @@ def _assert_sandboxed():
 def reset_campaign():
     _assert_sandboxed()
     for p in (C.RULES_JSON, C.CAMPAIGN_MANIFEST, C.BRIEF_MD, C.KNOWLEDGE_MD, C.MOMENTS_JSON,
-              C.SELECTED_JSON, C.CAPTIONS_JSON, C.STATE_PATH):
+              C.SELECTED_JSON, C.CAPTIONS_JSON, C.SELECT_PARTIAL, C.CAPTIONS_PARTIAL,
+              C.STATE_PATH):
         try:
             p.unlink(missing_ok=True)
         except Exception:

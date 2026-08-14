@@ -37,6 +37,14 @@ DEFAULT_CONFIG = {
     # keys come ONLY from env (GROQ_API_KEY / GEMINI_API_KEY / CEREBRAS_API_KEY). Drop a name to
     # disable it, or reorder. A provider with a missing key/library is skipped automatically.
     "llm_providers": ["groq", "gemini", "cerebras"],
+    # Footage-language gate (index stage). AFTER transcription (local + free) but BEFORE
+    # select/captions (LLM token spend), bail if the dominant FOOTAGE language isn't
+    # gate_language — catches campaigns whose brief/name is English but whose footage is not
+    # (slipped scout's derank), before a single token is spent. Fails OPEN below the confidence
+    # share; bypass a run with --allow-any-language.
+    "gate_language": "en",
+    "gate_language_min_prob": 0.6,  # min dominant-language char-share to trust the gate
+    "allow_any_language": False,    # set per-run by --allow-any-language (never sticky)
     "layout": "blur_fill",         # vertical fill: "blur_fill" (whole frame, blurred bg)
                                    # or "crop_fill" (COVER + center-crop, crops edges)
     "blur_fg_zoom": 1.2,           # blur_fill foreground zoom: 1.0 = pure no-crop
@@ -222,6 +230,9 @@ def _prepare_state(args):
         cfg["watermark_file"] = args.watermark_file
     if args.max_source_height:
         cfg["max_source_height"] = args.max_source_height
+    # Set from the flag EVERY run so it's a per-run override, never sticky in state.json (a
+    # once-passed --allow-any-language must not silently disable the gate on later runs).
+    cfg["allow_any_language"] = bool(args.allow_any_language)
     state["config"] = cfg
     if args.force:
         for name, _ in STAGES:
@@ -299,6 +310,9 @@ def main():
                     help="cap for Drive transcoded preview streams in px (default 720)")
     ap.add_argument("--original", action="store_true",
                     help="force raw original Drive files instead of preview streams")
+    ap.add_argument("--allow-any-language", action="store_true", dest="allow_any_language",
+                    help="bypass the footage-language gate — process non-English footage anyway "
+                         "(default: STOP before select/captions if footage isn't English).")
     ap.add_argument("--cleanup", action="store_true", help="delete raw footage after a successful batch")
     ap.add_argument("--no-cleanup", action="store_true", help="never prompt for footage cleanup")
     ap.add_argument("--auto-advance", action="store_true", dest="auto_advance",
