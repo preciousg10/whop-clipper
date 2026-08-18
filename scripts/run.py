@@ -58,6 +58,14 @@ DEFAULT_CONFIG = {
     "merge_max_span_seconds": 60,  # hard cap on a merged moment's span (stop merging past)
     "story_pre_seconds": 4,        # start AT the action — minimal setup lead-in (max)
     "story_post_seconds": 4,       # end near the payoff — minimal resolution tail (max)
+    # COLD-OPEN (conditional): only tease a clip whose audio window has ONE genuine sharp peak.
+    "coldopen_peak_range_min": 3.0,  # min "triangle range" (σ of window peak above its median,
+                                   # in the source's own RMS std units) to treat a peak as sharp;
+                                   # below this the clip is flat-high and plays straight
+    "coldopen_min_separation": 5.0,  # min OUTPUT seconds between the teaser and the payoff's
+                                   # natural arrival in the body — else it reads as an instant repeat
+    "output_fps": 30,              # cut renders at this constant frame rate (CFR) — fixes the
+                                   # VFR concat-seam stutter on cold-open→setup transitions
     "emoji_in_caption": True,      # flzsh DNA: keep emoji as caption punctuation
     "subtitles_enabled": True,     # burn word-level karaoke spoken-word subtitles (ASS/libass)
     # Karaoke subtitle look (lower-center, ASS/libass). The active (currently-spoken) word

@@ -133,8 +133,12 @@ def _ungrounded_terms(caption, tvocab):
 GROUNDED_FALLBACKS = [
     "wait for the end 👀",
     "you have to see this 😳",
-    "watch this till the end 👀",
     "nah this is actually crazy 😭",
+    "why did this even happen 😭",
+    "the way this ends is diabolical 💀",
+    "tell me why this happened 😭",
+    "no shot this just happened 😳",
+    "how is this even real 😭",
 ]
 
 OFFLINE_TEMPLATES = [
@@ -201,6 +205,13 @@ def quality_kill(cap):
     if GIVEAWAY_RE.search(cap) and not HOOK_PATTERNS["question"].search(cap):
         return "past-tense summary gives the payoff away"
     return None
+
+
+def _hook_prefix(cap, n=2):
+    """The first `n` alphabetic words of a hook — its structural signature ('how did', 'no way',
+    'wait for', 'this should'). FIX 6 rotates on this so one phrasing (e.g. 'how did this even
+    happen', which dominated ~half a batch) can't repeat across many clips."""
+    return " ".join(re.findall(r"[a-z']+", (cap or "").lower())[:n])
 
 
 def score_caption(text):
@@ -510,6 +521,13 @@ def run(state):
     clips = list(partial.get("clips", []))
     done_ids = {c.get("moment_id") for c in clips}
     total = len(selected["selected"])
+    # FIX 6 — batch-wide hook-structure ledger (seeded from any resumed clips so diversity
+    # survives a --resume) + a per-structure CAP. A specific hook keeps its structure until that
+    # structure hits the cap; after that the clip takes a structurally-DIFFERENT neutral grounded
+    # hook, so no single phrasing (e.g. 'how did') can dominate the batch.
+    from collections import Counter
+    hook_prefix_use = Counter(_hook_prefix(c.get("caption", "")) for c in clips)
+    hook_prefix_cap = max(3, (total + 4) // 5)   # ceil(total/5): ~20% ceiling per structure
     if clips:
         C.log(f"captions: resuming — {len(clips)}/{total} clip(s) already done (checkpoint).")
     made_call = False
@@ -574,10 +592,23 @@ def run(state):
             C.warn(f"moment {m['id']}: no usable Groq caption — generic curiosity fallback.")
             pool = GROUNDED_FALLBACKS
         ranked = sorted(pool, key=score_caption, reverse=True)
+        # FIX 6 — HOOK VARIETY. Prefer the best SPECIFIC (grounded) hook whose structure is still
+        # under the batch cap; keep specificity while a structure has room. Once every available
+        # specific structure is capped (the pools here are mostly 'how did'/'no way'), fall to the
+        # least-used NEUTRAL grounded hook — still accurate, but a different structure — so the
+        # batch spreads instead of repeating one phrasing a dozen times.
+        best_raw = next((cap for cap in ranked
+                         if hook_prefix_use[_hook_prefix(cap)] < hook_prefix_cap), None)
+        if best_raw is None:
+            best_raw = min(GROUNDED_FALLBACKS,
+                           key=lambda cap: (hook_prefix_use[_hook_prefix(cap)], -score_caption(cap)))
+        hook_prefix_use[_hook_prefix(best_raw)] += 1
+        alt = ([cap for cap in ranked if _hook_prefix(cap) != _hook_prefix(best_raw)]
+               or [cap for cap in GROUNDED_FALLBACKS if _hook_prefix(cap) != _hook_prefix(best_raw)])
         # ALL captions on ALL clips: lowercase energy; emoji kept as punctuation unless
         # the campaign config turns them off.
-        best = finalize_caption(ranked[0], emoji_in_caption)
-        variant = finalize_caption(ranked[1], emoji_in_caption) if len(ranked) > 1 else None
+        best = finalize_caption(best_raw, emoji_in_caption)
+        variant = finalize_caption(alt[0], emoji_in_caption) if alt else None
         # Non-speech sound labels for the karaoke (accurate, or nothing). Only fires when the
         # clip actually has a loud non-speech beat, and only adds ONE extra Groq call then.
         sound_fx = []

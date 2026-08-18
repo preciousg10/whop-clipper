@@ -15,6 +15,7 @@ missing.
 """
 import os
 import re
+import statistics
 import subprocess
 import sys
 
@@ -50,7 +51,104 @@ COLD_OPEN_MIN_PAYOFF = 2.0    # and leave >= this much clip after it, else play 
 MOTION_RADIUS = 1.0           # scan ±1s around the peak for the highest-motion frame
 FADE_FRAMES = 2               # 2-frame fade on the cold-open->setup cut (reads intentional)
 ASSUMED_FPS = 30.0            # fade duration basis when the true fps is unknown
+OUTPUT_FPS = 30               # cut output is normalized to this CFR (FIX 3: kills VFR seam stutter)
+# Cold-open is CONDITIONAL (FIX 1): only tease a moment that has ONE genuine sharp peak. We
+# measure the clip window's audio SHAPE from index.py's per-second RMS — the "triangle range"
+# = (window peak − window baseline/median) expressed in the source's own std units (so it's
+# comparable across quiet vs loud VODs). A large range = a standout spike worth teasing; a small
+# range = flat-high sustained energy, which we play straight. Tunable via config.
+COLDOPEN_PEAK_RANGE_MIN = 3.0   # min z-range (σ above baseline) to treat a peak as "sharp"
+COLDOPEN_MIN_SEPARATION = 5.0   # min OUTPUT seconds between the teaser and the payoff's natural
+                                # arrival in the body (FIX 2) — else it reads as an instant repeat
 LOUDNORM = "loudnorm=I=-14:TP=-1.5:LRA=11"   # per-clip audio normalization (social target)
+
+# Per-second RMS arrays (index.py's <name>.rms.json partials) + their global std, cached per
+# source. This is the audio-energy signal the cold-open shape decision reads.
+_RMS_CACHE = {}
+_RMS_STD_CACHE = {}
+
+
+def _rms_stats(source):
+    """(per-second RMS list, global population std) for a source, or (None, None) if the
+    .rms.json partial isn't present (offline index / pre-feature moments.json)."""
+    if source not in _RMS_CACHE:
+        base = os.path.splitext(os.path.basename(source))[0]
+        vals = C.load_json(C.TRANSCRIPTS / f"{base}.rms.json", default=None)
+        arr = [float(v) for v in vals] if vals else None
+        _RMS_CACHE[source] = arr
+        _RMS_STD_CACHE[source] = (statistics.pstdev(arr) if arr and len(arr) > 1 else 0.0)
+    return _RMS_CACHE[source], _RMS_STD_CACHE[source]
+
+
+def coldopen_shape(rms, gstd, start, end):
+    """Analyze the clip window [start,end] against the source RMS. Returns
+    (true_peak_sec, z_range) or None when there's no usable RMS:
+      - true_peak_sec: ABSOLUTE second of the loudest RMS in the window — the clip's REAL
+        energy peak (FIX 4), used to anchor the teaser instead of an arbitrary/early frame.
+      - z_range: (window_peak − window_median) / global_std — the triangle-vs-flat SHAPE
+        metric (FIX 1). High = one sharp standout spike; low = flat-high sustained energy."""
+    if not rms or gstd <= 0:
+        return None
+    lo = max(0, int(start))
+    hi = min(len(rms), int(round(end)))
+    if hi - lo < 3:
+        return None
+    win = rms[lo:hi]
+    peak_val = max(win)
+    true_peak = lo + win.index(peak_val)
+    baseline = statistics.median(win)
+    z_range = (peak_val - baseline) / gstd
+    return float(true_peak), round(z_range, 2)
+
+
+def coldopen_body_gap(true_peak, start, segments):
+    """OUTPUT-timeline seconds between the END of the cold-open teaser (segments[0]) and the
+    moment the teased peak arrives NATURALLY in the body (segments[1:]). Returns None if the
+    peak was trimmed out of the body. Rejects cold-opens whose payoff replays too soon (FIX 2)
+    — the separation is measured on the FINAL edit (post dead-air trim + cap), not source time,
+    so trimmed-away setup can't collapse the gap unnoticed."""
+    if len(segments) < 2:
+        return None
+    teaser_dur = segments[0][1] - segments[0][0]
+    rel = true_peak - start
+    out = teaser_dur
+    for (a, b) in segments[1:]:
+        if a <= rel < b:
+            return (out + (rel - a)) - teaser_dur
+        out += (b - a)
+    return None
+
+
+def plan_cold_open(src_path, source, start, end, keeps, cmax, cfg):
+    """Decide whether THIS clip gets a cold-open, and where the teaser is (FIX 1/2/4).
+    Returns (cold_rel | None, reason_string). cold_rel is the clip-relative (a,b) teaser span.
+
+    The gate, in order: (1) needs a genuine SINGLE SHARP peak — window z-range >= threshold,
+    else it's flat-high and plays straight; (2) the true peak must sit inside the clip, not at an
+    edge; (3) a clean >=1.5s teaser window must carve out; (4) on the FINAL edit the payoff must
+    arrive with real separation after the teaser, else it reads as an instant repeat."""
+    range_min = float(cfg.get("coldopen_peak_range_min", COLDOPEN_PEAK_RANGE_MIN))
+    cold_min_sep = float(cfg.get("coldopen_min_separation", COLDOPEN_MIN_SEPARATION))
+    rms, gstd = _rms_stats(source)
+    shape = coldopen_shape(rms, gstd, start, end)
+    if shape is None:
+        return None, "no RMS energy data → straight cut"
+    true_peak, z_range = shape
+    if z_range < range_min:
+        return None, f"flat-high (range {z_range:.1f}σ < {range_min:g}σ) → straight cut"
+    if (true_peak - start) < COLD_OPEN_MIN_SETUP or (end - true_peak) < COLD_OPEN_MIN_PAYOFF:
+        return None, f"sharp peak (range {z_range:.1f}σ) but sits at the clip edge → straight cut"
+    cand = cold_open_window(src_path, true_peak, start, end)
+    if cand is None:
+        return None, f"sharp peak (range {z_range:.1f}σ) but no clean teaser window → straight cut"
+    trial = cap_segments([cand] + keeps, cmax)          # measure separation on the FINAL edit
+    gap = coldopen_body_gap(true_peak, start, trial)
+    if gap is None:
+        return None, f"sharp peak (range {z_range:.1f}σ) but peak trimmed from body → straight cut"
+    if gap < cold_min_sep:
+        return None, (f"sharp peak (range {z_range:.1f}σ) but payoff replays too soon "
+                      f"(+{gap:.1f}s < {cold_min_sep:g}s) → straight cut")
+    return cand, f"sharp peak (range {z_range:.1f}σ) → teasing (payoff +{gap:.1f}s later)"
 
 
 # --- fonts / caption rendering -------------------------------------------------
@@ -860,7 +958,13 @@ def build_compose_cmd(source, start, end, segments, cold_open, caption_png, wate
     wm_margin = cfg.get("watermark_margin", 40)
     wm_w = int(W * wm_scale)
     trimming = cold_open or len(segments) > 1
-    fd = FADE_FRAMES / ASSUMED_FPS
+    # FIX 3 — force CONSTANT frame rate. YouTube livestream VODs are often variable-frame-rate;
+    # trimming VFR pieces and concatenating them lands frames on mismatched time grids, which the
+    # concat filter renders as a visible stutter/lag spike right at the cold-open→setup seam. We
+    # resample EACH segment to CFR (fps filter) BEFORE concat so every frame is on one uniform
+    # grid, and stamp the encoder with -r too. This also makes the 2-frame fade exact.
+    fps = int(cfg.get("output_fps", OUTPUT_FPS) or OUTPUT_FPS)
+    fd = FADE_FRAMES / fps
 
     fc = []
     audio_label = None                        # filter label OR raw stream feeding loudnorm
@@ -880,7 +984,8 @@ def build_compose_cmd(source, start, end, segments, cold_open, caption_png, wate
 
     if trimming:                              # cold-open and/or dead-air via trim+concat
         for i, (a, b) in enumerate(segments):
-            vf = f"[0:v]trim={a}:{b},setpts=PTS-STARTPTS"
+            # fps BEFORE setpts+concat = every segment on one CFR grid → seamless join (FIX 3).
+            vf = f"[0:v]trim={a}:{b},fps={fps},setpts=PTS-STARTPTS"
             if cold_open and i == 0:          # fade OUT the end of the teaser
                 vf += f",fade=t=out:st={max(0.0, (b - a) - fd):.3f}:d={fd:.3f}"
             elif cold_open and i == 1:        # fade IN the start of the setup
@@ -911,7 +1016,9 @@ def build_compose_cmd(source, start, end, segments, cold_open, caption_png, wate
     # a 720 source loses nothing visible. Quoted min() protects the inner comma; -2 keeps the
     # width even for yuv420p; a source already <= max_h is left unchanged.
     max_src_h = int(cfg.get("max_source_height", 720) or 720)
-    fc.append(f"{vsrc}scale=-2:'min(ih,{max_src_h})'[dsrc];")
+    # ,fps here normalizes the SINGLE-segment (no-trim) path to CFR too; the trim path already
+    # resampled each piece before concat above (a second pass here is a harmless no-op).
+    fc.append(f"{vsrc}scale=-2:'min(ih,{max_src_h})',fps={fps}[dsrc];")
     vsrc = "[dsrc]"
 
     # Vertical fill. Default BLUR-FILL keeps the ENTIRE source frame visible (no
@@ -974,7 +1081,8 @@ def build_compose_cmd(source, start, end, segments, cold_open, caption_png, wate
     if has_audio:
         cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "160k"]
     cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out_path)]
+            "-pix_fmt", "yuv420p", "-r", str(fps),   # stamp CFR at the encoder (FIX 3)
+            "-movflags", "+faststart", str(out_path)]
     return cmd
 
 
@@ -1050,11 +1158,32 @@ def run(state):
         C.log(f"watermark: {watermark.name}")
 
     C.DRAFTS.mkdir(parents=True, exist_ok=True)
-    clips = sorted(caps["clips"], key=lambda c: (c.get("score") or 0), reverse=True)
+    ranked_clips = sorted(caps["clips"], key=lambda c: (c.get("score") or 0), reverse=True)
     audio_cache = {}
     dim_cache = {}
+
+    # FIX 5 — DUPLICATE GUARD: no two OUTPUT clips may cover overlapping SOURCE time. Clips are
+    # best-first, so keep the higher-scored clip and DROP any later one whose (final) window
+    # overlaps it. This is the last-line guarantee (belt-and-suspenders over select's spread
+    # check) that a near-duplicate never reaches drafts/. Windows are computed once here.
+    clips, kept_windows = [], []
+    for c in ranked_clips:
+        duration = durations.get(c["source"]) or C.ffprobe_duration(C.ROOT / c["source"])
+        s, e = clip_bounds(c, duration, cmin, cmax, pre, post)
+        dup = next((w for w in kept_windows
+                    if w[0] == c["source"] and not (e <= w[1] or s >= w[2])), None)
+        if dup:
+            C.log(f"dedup: dropping {c['moment_id']} (window {s:.0f}-{e:.0f}s) — overlaps a "
+                  f"higher-scored clip's window {dup[1]:.0f}-{dup[2]:.0f}s.")
+            continue
+        kept_windows.append((c["source"], s, e))
+        clips.append((c, s, e))
+    if len(clips) < len(ranked_clips):
+        C.log(f"dedup: dropped {len(ranked_clips) - len(clips)} overlapping clip(s); "
+              f"{len(clips)} unique clip(s) to render.")
+
     manifest = []
-    for rank, c in enumerate(clips, 1):
+    for rank, (c, start, end) in enumerate(clips, 1):
         # final rules gate (defensive — the gauntlet already filtered)
         for field in ("caption", "tiktok_caption", "shorts_title"):
             from captions import banned_hit
@@ -1062,29 +1191,18 @@ def run(state):
                 C.fail(f"banned word slipped into {field} for clip {c['moment_id']} — aborting.")
 
         src_path = C.ROOT / c["source"]
-        duration = durations.get(c["source"]) or C.ffprobe_duration(src_path)
         if c["source"] not in audio_cache:
             audio_cache[c["source"]] = C.audio_stream_count(src_path)
         n_audio = audio_cache[c["source"]]
         has_audio = n_audio > 0
 
-        start, end = clip_bounds(c, duration, cmin, cmax, pre, post)
         keeps = dead_air_keeps(src_path, start, end, n_audio)
 
-        # COLD-OPEN: if the payoff peak is separable from the setup (sits well past the
-        # start and leaves real clip after it), open on the peak, then cut back to the
-        # setup. Otherwise the clip plays chronologically.
-        cold_rel = None
-        peak = c.get("peak")
-        if peak is not None:
-            try:
-                peakf = float(peak)
-            except (TypeError, ValueError):
-                peakf = None
-            if (peakf is not None and (peakf - start) >= COLD_OPEN_MIN_SETUP
-                    and (end - peakf) >= COLD_OPEN_MIN_PAYOFF):
-                cold_rel = cold_open_window(src_path, peakf, start, end)
+        # COLD-OPEN (FIX 1/2/4) — CONDITIONAL on a genuine single sharp peak with real payoff
+        # separation; see plan_cold_open. Flat-high clips and edge/too-soon peaks play straight.
+        cold_rel, reason = plan_cold_open(src_path, c["source"], start, end, keeps, cmax, cfg)
         cold_open = cold_rel is not None
+        C.log(f"cold-open [{c['moment_id']}]: {reason}")
         segments = ([cold_rel] if cold_open else []) + keeps
         segments = cap_segments(segments, cmax)      # total playtime <= clip_max_seconds
 

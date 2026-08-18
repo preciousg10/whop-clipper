@@ -390,17 +390,24 @@ def _probe_duration(url, timeout=20, attempts=3):
     except ImportError:
         return None
     import time as _t
+    base = {"quiet": True, "no_warnings": True, "skip_download": True,
+            "socket_timeout": timeout, "noplaylist": True, "logger": _QuietLogger()}
+    cf = C.cookies_file()          # auth cookies help genuinely-gated metadata reads (Kick 403)
+    # Try WITH cookies first, then WITHOUT: for some YouTube URLs the logged-in response is
+    # storyboard-only (no duration/format), where the unauthenticated read succeeds — so cookies
+    # must never REGRESS a probe that would otherwise work.
+    variants = [dict(base, cookiefile=cf), dict(base)] if cf else [dict(base)]
     for a in range(attempts):
-        try:
-            with YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True,
-                            "socket_timeout": timeout, "noplaylist": True,
-                            "logger": _QuietLogger()}) as ydl:
-                info = ydl.extract_info(url, download=False)
-            d = info.get("duration")
-            return float(d) if d is not None else None   # success (duration may be absent)
-        except Exception:
-            if a < attempts - 1:
-                _t.sleep(1.0 * (a + 1))                   # brief backoff, then retry
+        for opts in variants:
+            try:
+                with YoutubeDL(dict(opts)) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                d = info.get("duration")
+                return float(d) if d is not None else None   # success (duration may be absent)
+            except Exception:
+                continue                                     # try the next variant / attempt
+        if a < attempts - 1:
+            _t.sleep(1.0 * (a + 1))                           # brief backoff, then retry
     return None
 
 

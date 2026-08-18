@@ -155,6 +155,37 @@ class _CollectingLogger:
         return "\n".join(f"  {ln}" for ln in lines if ln.strip())
 
 
+_COOKIES_LOGGED = False
+
+
+def _apply_cookies(opts):
+    """Attach the auth cookies file (COOKIES_FILE / ROOT/cookies.txt) to a yt-dlp opts dict so
+    gated Kick/YouTube VODs stop 403-ing. Returns True if a cookies file was applied. No-op
+    (and one-time warning via C.cookies_file) when the file is absent — the download is still
+    attempted. Never logs the file's contents."""
+    global _COOKIES_LOGGED
+    cf = C.cookies_file()
+    if not cf:
+        return False
+    opts["cookiefile"] = cf
+    if not _COOKIES_LOGGED:
+        C.log(f"yt-dlp using cookies file: {cf}")
+        _COOKIES_LOGGED = True
+    return True
+
+
+def _cookies_degraded_response(msg):
+    """True when a WITH-cookies yt-dlp failure looks like a login-gated/degraded response rather
+    than a real network error — YouTube serves logged-in requests a player path that (without a
+    JS-challenge solver) collapses to storyboard-only, so the requested video format 'isn't
+    available'. In that case retrying WITHOUT cookies restores the public formats. Guarded so it
+    only ever triggers when cookies were actually applied."""
+    low = msg.lower()
+    return ("requested format is not available" in low
+            or "only images are available" in low
+            or "no video formats" in low)
+
+
 def _ytdlp_workdir():
     """yt-dlp temp + cache dir INSIDE the project, so the mux step doesn't land on a
     full system-temp volume and its scratch/cache stays local and inspectable."""
@@ -204,16 +235,37 @@ def _fetch_ytdlp(url, staging, cookies_from_browser=None, format_id=None,
     if cookies_from_browser:
         opts["cookiesfrombrowser"] = (cookies_from_browser,)
         C.log(f"yt-dlp using cookies from browser: {cookies_from_browser}")
+    cookies_applied = _apply_cookies(opts)   # cookies.txt file (Kick/YouTube auth) on EVERY fetch
     C.log(f"yt-dlp: {url}")
+
+    def _download(o, log):
+        try:
+            with YoutubeDL(o) as ydl:
+                ydl.download([url])
+        except Exception as e:
+            detail = log.detail()
+            msg = f"yt-dlp failed: {e}"
+            if detail:
+                msg += f"\nyt-dlp/ffmpeg output:\n{detail}"
+            raise DownloadError(msg)
+
     try:
-        with YoutubeDL(opts) as ydl:
-            ydl.download([url])
-    except Exception as e:
-        detail = logger.detail()
-        msg = f"yt-dlp failed: {e}"
-        if detail:
-            msg += f"\nyt-dlp/ffmpeg output:\n{detail}"
-        raise DownloadError(msg)
+        _download(opts, logger)
+    except DownloadError as e:
+        # No-regression fallback: if the WITH-cookies attempt got a login-gated/storyboard-only
+        # response ('requested format is not available'), retry WITHOUT cookies — the public
+        # (unauthenticated) formats usually come back. Cookies still help genuinely gated
+        # sources (Kick); they just must never BREAK a source that works without them.
+        if cookies_applied and _cookies_degraded_response(str(e)):
+            C.warn("yt-dlp with cookies returned no usable video formats (login-gated / "
+                   "storyboard-only response) — retrying WITHOUT cookies.")
+            retry_opts = dict(opts)
+            retry_opts.pop("cookiefile", None)
+            retry_logger = _CollectingLogger()
+            retry_opts["logger"] = retry_logger
+            _download(retry_opts, retry_logger)
+        else:
+            raise
     files = [p for p in staging.rglob("*") if p.is_file()]
     if not files:
         raise DownloadError("yt-dlp produced no files")
@@ -229,6 +281,7 @@ def _drive_file_info(url, cookies_from_browser=None):
     opts = {"quiet": True, "no_warnings": True}
     if cookies_from_browser:
         opts["cookiesfrombrowser"] = (cookies_from_browser,)
+    _apply_cookies(opts)     # cookies.txt file (auth) for the Drive/VOD metadata probe too
     try:
         with YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)

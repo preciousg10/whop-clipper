@@ -186,6 +186,96 @@ def extract_required_elements(text, asset_names):
     return req
 
 
+# --- automatic watermark decision (no human prompt) ----------------------------
+# The watermark policy is decided from the campaign rules/brief/knowledge, NOT by stopping to
+# ask a human. Required -> burn it (use a provided image if named); no requirement -> skip;
+# genuinely ambiguous (contradictory or an unclear bare mention) -> flag for review but STILL
+# proceed with watermark OFF (a missing watermark is fixable in review; a wrongly-added overlay
+# is worse). cut.py keys off rules.json['watermark_required'] (True/False), which we always set.
+WATERMARK_REQUIRED_RE = re.compile(
+    # "watermark ... required/mandatory/on every clip" (the requirement follows the noun)
+    r"\b(watermark|logo|branding|brand overlay)s?\b[^.\n]{0,40}?\b(?<!not )(?<!not  )"
+    r"(required|mandatory|must|always|needed|on (all|every|each)|in all (videos|clips|posts))"
+    # "must/always/need to ... use/include/add ... watermark" (the requirement precedes it)
+    r"|\b(must|always|required to|need to|have to|has to)\b[^.\n]{0,40}?\b(use|include|add|apply|have)\b"
+    r"[^.\n]{0,20}?\b(watermark|logo|branding)"
+    # "use/add watermark on every clip / in all videos"
+    r"|\b(use|include|add|apply)\b[^.\n]{0,20}?\b(watermark|logo)\b[^.\n]{0,30}?"
+    r"\b(on (all|every|each)|in all|every (clip|video|post))",
+    re.I)
+WATERMARK_NONE_RE = re.compile(
+    r"\bno watermark\b|\bwithout (a |the )?watermark\b"
+    r"|\bwatermark\b[^.\n]{0,20}?\b(not (required|needed|necessary|mandatory)|optional)"
+    r"|\b(don'?t|do not|no need to) (use|need|add|include|apply) (a |the )?(watermark|logo)"
+    r"|\bno logo\b|\blogo\b[^.\n]{0,15}?not (required|needed)",
+    re.I)
+WATERMARK_MENTION_RE = re.compile(r"\bwatermark\b|\blogo overlay\b", re.I)
+
+
+def _wm_phrase(m):
+    return re.sub(r"\s+", " ", m.group(0)).strip()[:60]
+
+
+def decide_watermark(rules, corpus, asset_names):
+    """Automatically decide the watermark policy from the campaign text + provided assets.
+
+    Returns (required: bool, reason: str, ambiguity: str|None, asset_hint: str|None):
+      - required  -> the value written to rules.json['watermark_required'] (cut.py obeys it).
+      - reason    -> a one-line WHY for the log.
+      - ambiguity -> a review flag ONLY when contradictory/unclear (still proceeds OFF), else None.
+      - asset_hint-> a watermark image name found in this campaign's assets, when required.
+    """
+    text = corpus or ""
+    req = WATERMARK_REQUIRED_RE.search(text)
+    neg = WATERMARK_NONE_RE.search(text)
+    mention = WATERMARK_MENTION_RE.search(text)
+    wm_asset = next((a for a in asset_names
+                     if "watermark" in a.lower() or "logo" in a.lower()), None)
+
+    if req and neg:
+        # A required-looking match may just be the negation phrase self-matching ("watermark not
+        # required" contains both 'watermark' and 'required'). Re-test with negations removed: if a
+        # requirement still stands, it's a GENUINE contradiction; otherwise it's simply not required.
+        if WATERMARK_REQUIRED_RE.search(WATERMARK_NONE_RE.sub(" ", text)):
+            return (False,
+                    f"CONTRADICTORY rules — required ('{_wm_phrase(req)}') AND not-required "
+                    f"('{_wm_phrase(neg)}') both found; defaulting OFF (safe).",
+                    "Watermark rules contradict each other (both 'required' and 'not required' "
+                    "found) — defaulted to OFF; confirm the correct policy.",
+                    None)
+        return (False, f"not required per rule '{_wm_phrase(neg)}' — skipping.", None, None)
+    if req:
+        hint = (f" → using assets/{wm_asset}" if wm_asset else
+                " (no watermark image in assets/ yet — add one or CUT will fail loud)")
+        return (True, f"required per rule '{_wm_phrase(req)}'{hint}.", None, wm_asset)
+    if neg:
+        return (False, f"not required per rule '{_wm_phrase(neg)}' — skipping.", None, None)
+    if wm_asset:
+        return (True, f"no explicit rule, but a watermark image was provided "
+                      f"(assets/{wm_asset}) → treating as required and using it.", None, wm_asset)
+    if mention:
+        return (False,
+                f"'watermark' mentioned ('{_wm_phrase(mention)}') but no clear required/"
+                f"not-required rule — defaulting OFF (safe).",
+                "Watermark is mentioned but the requirement is unclear — defaulted to OFF; "
+                "confirm whether one is mandatory.",
+                None)
+    return (False, "no watermark requirement found in rules/brief/knowledge — skipping.",
+            None, None)
+
+
+def _sync_watermark_element(rules, required):
+    """Keep required_elements coherent with the decision: a watermark entry present iff required.
+    (The word-presence heuristic in extract_required_elements can list one even for a negation.)"""
+    els = list(rules.get("required_elements", []))
+    has = any(e.get("type") == "watermark" for e in els)
+    if required and not has:
+        els.append({"type": "watermark", "detail": "Campaign watermark PNG on EVERY clip."})
+    elif not required and has:
+        els = [e for e in els if e.get("type") != "watermark"]
+    rules["required_elements"] = els
+
+
 def build_floor(text, asset_names):
     return {
         "banned_words": extract_banned_words(text),
@@ -415,11 +505,8 @@ def build_ambiguities(rules, resources, llm_used):
     amb = []
     if not rules.get("payout_terms"):
         amb.append("No payout terms found — confirm rate/budget before producing.")
-    has_watermark = any(r.get("type") == "watermark" for r in rules.get("required_elements", []))
-    # watermark_required=False is an explicit human confirmation that NONE is needed — don't
-    # re-prompt once it's been settled (preserved across re-intake of the same campaign).
-    if not has_watermark and rules.get("watermark_required") is not False:
-        amb.append("No watermark requirement detected — confirm whether one is mandatory.")
+    # Watermark is decided AUTOMATICALLY (decide_watermark) — no unconditional prompt here. Only a
+    # genuinely ambiguous decision adds a flag, and main() inserts that separately.
     if not rules.get("submission_process"):
         amb.append("No submission process / deadline found — confirm how to submit.")
     for r in resources:
@@ -562,12 +649,24 @@ def main():
     rules = AN.merge_rules(floor, llm)
     rules["campaign"] = args.campaign
 
-    # Preserve a human-confirmed watermark decision across re-intake of the SAME campaign, so a
-    # "watermark not required" confirmation isn't lost (and re-prompted) on every re-run. Guarded
-    # by a campaign-name match so a leftover flag from a different campaign never carries over.
+    # WATERMARK: decide automatically (never stop to ask). A prior EXPLICIT bool for the SAME
+    # campaign is kept (respects a manual correction and avoids flip-flopping on re-intake);
+    # otherwise decide_watermark reads the rules/brief/knowledge and sets True/False. Ambiguous
+    # cases still proceed OFF but add a review flag.
     prior_rules = C.load_json(C.RULES_JSON) or {}
-    if prior_rules.get("campaign") == args.campaign and "watermark_required" in prior_rules:
-        rules["watermark_required"] = prior_rules["watermark_required"]
+    prior_wm = (prior_rules.get("watermark_required")
+                if prior_rules.get("campaign") == args.campaign else None)
+    wm_ambiguity = None
+    if isinstance(prior_wm, bool):
+        rules["watermark_required"] = prior_wm
+        _sync_watermark_element(rules, prior_wm)
+        C.log(f"watermark: keeping prior decision for this campaign (watermark_required={prior_wm}).")
+    else:
+        wm_required, wm_reason, wm_ambiguity, _wm_asset = decide_watermark(
+            rules, corpus, asset_names)
+        rules["watermark_required"] = wm_required
+        _sync_watermark_element(rules, wm_required)
+        C.log(f"watermark: {wm_reason}")
 
     # Spatial constraints from reference images (flagged — never auto-guess margins).
     rules["spatial_constraints"] = [{
@@ -577,6 +676,8 @@ def main():
     } for r in resources if r.get("purpose")]
 
     rules["ambiguities"] = build_ambiguities(rules, resources, llm_used)
+    if wm_ambiguity:                       # only when the auto-decision was genuinely unclear
+        rules["ambiguities"].insert(0, wm_ambiguity)
 
     C.save_json(C.RULES_JSON, rules)
     write_brief_md(args.campaign, rules, brief)

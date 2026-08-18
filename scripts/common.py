@@ -48,11 +48,13 @@ DRAFTS_MANIFEST = DRAFTS / "manifest.json"
 SELECT_PARTIAL = CAMPAIGN / "select_partial.json"
 CAPTIONS_PARTIAL = CAMPAIGN / "captions_partial.json"
 
-# Default to the 70B model: the 8B ('llama-3.1-8b-instant') scored moments randomly
-# (100 to a garbage clip in one run, 0 to everything the next), which wrecked both
-# selection and caption quality. 70B scores consistently with sensible reasons.
-# Override with GROQ_MODEL=llama-3.1-8b-instant if you hit free-tier daily token limits.
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Default to gpt-oss-120b: llama-3.3-70b-versatile was DEPRECATED/retired by Groq mid-2026,
+# and the 8B ('llama-3.1-8b-instant') scored moments randomly (100 to garbage one run, 0 the
+# next), wrecking selection + caption quality. gpt-oss-120b scores consistently with sensible
+# reasons. NOTE it is a REASONING model: hidden reasoning tokens count against max_tokens, so
+# _GroqProvider forces reasoning_effort=low + a token reserve (see _is_reasoning_model) — without
+# that a large prompt burns the whole budget on reasoning and returns EMPTY content.
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 # LLM FAILOVER CHAIN models (all free-tier). Order + enable via config `llm_providers`.
 # NOTE: gemini-2.0-flash was retired by Google (404) mid-2026 — default is now the current
 # free-tier gemini-2.5-flash. Groq/Cerebras 70B defaults are still live. Override any via env.
@@ -116,6 +118,29 @@ class NothingUsable(Exception):
     """A stage found NOTHING clippable for the picked campaign — no footage, zero indexable
     sources, or no live moments. Raised (instead of fail()) so the orchestrator can either
     dead-end loud (default) or, with --auto-advance, move on to the next ranked campaign."""
+
+
+# --- yt-dlp auth cookies (gated YouTube/Kick VODs 403 without a logged-in session) ------
+_COOKIES_WARNED = False
+
+
+def cookies_file():
+    """Absolute path to the Netscape cookies.txt yt-dlp should use for gated VODs
+    (YouTube/Kick 403 without a logged-in session), or None if it isn't present.
+
+    Path comes from the COOKIES_FILE env var, else the default ROOT/cookies.txt. When the
+    file is MISSING we warn ONCE (some sources still work unauthenticated) and return None —
+    callers still attempt the download. The file's CONTENTS are never logged (it holds a live
+    session); only its path is printed."""
+    global _COOKIES_WARNED
+    p = os.environ.get("COOKIES_FILE") or str(ROOT / "cookies.txt")
+    if os.path.exists(p):
+        return p
+    if not _COOKIES_WARNED:
+        warn(f"no cookies file at {p} — YouTube/Kick may 403 (set COOKIES_FILE or place "
+             f"cookies.txt there). Attempting anyway; some sources work without.")
+        _COOKIES_WARNED = True
+    return None
 
 
 def offline_mode():
@@ -363,6 +388,58 @@ def classify_rate_limit(msg):
 
 
 # --- per-provider adapters (each returns a PLAIN STRING; keys read from env only) ----------
+# Opt-in raw-response logging: CLIPPER_DEBUG_LLM=1 dumps the FULL provider response object
+# (model_dump) for the first call of each provider, so a shape change (e.g. a new reasoning
+# model returning empty content) is diagnosable against reality instead of guessed at.
+_LLM_DEBUG = os.environ.get("CLIPPER_DEBUG_LLM") == "1"
+_LLM_DEBUG_DUMPED = set()
+
+# gpt-oss and other reasoning models emit HIDDEN reasoning tokens that count against
+# max_tokens BEFORE any answer content. With the default ('medium'/'high') effort a large
+# prompt burns the entire budget on reasoning and returns finish_reason='length' with EMPTY
+# content — the exact select/caption failure after switching to openai/gpt-oss-120b. We force
+# 'low' effort AND add a reasoning reserve to max_tokens so answer content is never starved.
+_REASONING_MODEL_HINTS = ("gpt-oss", "o1", "o3", "o4", "deepseek-r1", "qwq", "reasoning")
+_REASONING_TOKEN_RESERVE = 700
+
+
+def _is_reasoning_model(model):
+    m = (model or "").lower()
+    return any(h in m for h in _REASONING_MODEL_HINTS)
+
+
+def _openai_content(resp, provider_name):
+    """Normalize an OpenAI-shaped chat response (Groq/Cerebras) to a PLAIN answer string.
+
+    Reasoning models split output: the chain-of-thought lands in message.reasoning and the
+    real answer in message.content. We return content; if it's empty (e.g. truncated by a
+    length finish) we log a LOUD diagnostic (finish_reason + reasoning-token count + a
+    reasoning preview) instead of silently handing '' to the parser. CLIPPER_DEBUG_LLM=1
+    additionally dumps the whole response object once per provider."""
+    if _LLM_DEBUG and provider_name not in _LLM_DEBUG_DUMPED:
+        _LLM_DEBUG_DUMPED.add(provider_name)
+        try:
+            log(f"[LLM RAW {provider_name}] {json.dumps(resp.model_dump(), default=str)[:4000]}")
+        except Exception as e:
+            log(f"[LLM RAW {provider_name}] <could not dump: {e}>")
+    choice = resp.choices[0]
+    content = (getattr(choice.message, "content", None) or "").strip()
+    if content:
+        return content
+    # Empty content — diagnose loudly (this is what silently produced flat scores/templates).
+    finish = getattr(choice, "finish_reason", "?")
+    reasoning = (getattr(choice.message, "reasoning", None) or "")
+    rtoks = None
+    try:
+        rtoks = resp.usage.completion_tokens_details.reasoning_tokens
+    except Exception:
+        pass
+    warn(f"{provider_name} returned EMPTY content (finish_reason={finish}, "
+         f"reasoning_tokens={rtoks}). Likely reasoning ate the token budget — raising "
+         f"max_tokens / lowering reasoning_effort. reasoning preview: {reasoning[:160]!r}")
+    return ""
+
+
 class _GroqProvider:
     name = "GROQ"
 
@@ -370,14 +447,22 @@ class _GroqProvider:
         from groq import Groq
         self.model = GROQ_MODEL
         self._client = Groq(api_key=os.environ["GROQ_API_KEY"])
+        self._reasoning = _is_reasoning_model(self.model)
+        if self._reasoning:
+            log(f"GROQ: '{self.model}' is a reasoning model — using reasoning_effort=low "
+                f"+ token reserve so answer content isn't starved by reasoning tokens.")
 
     def complete(self, system, user, temperature, max_tokens):
-        resp = self._client.chat.completions.create(
+        kwargs = dict(
             model=self.model,
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user}],
             temperature=temperature, max_tokens=max_tokens)
-        return resp.choices[0].message.content or ""
+        if self._reasoning:
+            kwargs["reasoning_effort"] = "low"                  # minimize hidden reasoning tokens
+            kwargs["max_tokens"] = max_tokens + _REASONING_TOKEN_RESERVE   # headroom for the answer
+        resp = self._client.chat.completions.create(**kwargs)
+        return _openai_content(resp, self.name)
 
 
 class _GeminiProvider:
@@ -418,14 +503,19 @@ class _CerebrasProvider:
         self.model = CEREBRAS_MODEL
         self._client = OpenAI(api_key=os.environ["CEREBRAS_API_KEY"],
                               base_url="https://api.cerebras.ai/v1")
+        self._reasoning = _is_reasoning_model(self.model)
 
     def complete(self, system, user, temperature, max_tokens):
-        resp = self._client.chat.completions.create(
+        kwargs = dict(
             model=self.model,
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user}],
             temperature=temperature, max_tokens=max_tokens)
-        return resp.choices[0].message.content or ""
+        if self._reasoning:
+            kwargs["reasoning_effort"] = "low"
+            kwargs["max_tokens"] = max_tokens + _REASONING_TOKEN_RESERVE
+        resp = self._client.chat.completions.create(**kwargs)
+        return _openai_content(resp, self.name)
 
 
 _PROVIDER_SPECS = {
