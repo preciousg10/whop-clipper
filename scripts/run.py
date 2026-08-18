@@ -45,11 +45,21 @@ DEFAULT_CONFIG = {
     "gate_language": "en",
     "gate_language_min_prob": 0.6,  # min dominant-language char-share to trust the gate
     "allow_any_language": False,    # set per-run by --allow-any-language (never sticky)
-    "layout": "blur_fill",         # vertical fill: "blur_fill" (whole frame, blurred bg)
-                                   # or "crop_fill" (COVER + center-crop, crops edges)
+    "layout": "auto",              # vertical fill: "auto" (TRACK a single subject, else blur_fill),
+                                   # "track" (force face/person-tracked 9:16 crop), "blur_fill"
+                                   # (whole frame on a blurred bg), or "crop_fill" (COVER+center-crop)
     "blur_fg_zoom": 1.2,           # blur_fill foreground zoom: 1.0 = pure no-crop
                                    # letterbox; >1 trims only far L/R edges to fill more
                                    # vertical space (never crops top/bottom or subjects)
+    # TRACK mode (OpenShorts-style face/person reframe; needs mediapipe+ultralytics+opencv).
+    "track_safe_zone": 0.35,       # center dead-zone as a fraction of the crop width — the crop
+                                   # HOLDS while the subject stays inside it (no jitter)
+    "track_smooth": 0.12,          # pan easing when the subject leaves the safe zone (0-1; lower=slower)
+    "track_max_pan": 12.0,         # max crop pan speed in source px/frame (caps fast whip-pans)
+    "track_detect_every": 3,       # run detection every Nth frame (reuse between) — ~10fps at 30fps
+    "track_min_single_frac": 0.5,  # auto: min share of sampled frames with exactly ONE subject → TRACK
+    "track_max_multi_frac": 0.3,   # auto: above this share of multi-subject frames → GENERAL (group)
+    "track_max_none_frac": 0.5,    # auto: above this share of subject-less frames → GENERAL (landscape)
     "clip_min_seconds": 15,        # allow tight action clips (don't over-pad)
     "clip_max_seconds": 30,        # hard cap — a tight 20-25s clip beats a padded 45s one
     "min_separation_seconds": 60,  # min gap between two selected moments (same source)
@@ -308,8 +318,9 @@ def main():
                     help="run ONLY the cut stage on the existing selected/captioned clips "
                          "(skips download, index, select, captions — ZERO Groq calls)")
     ap.add_argument("--clips-per-batch", type=int)
-    ap.add_argument("--layout", choices=["blur_fill", "crop_fill"],
-                    help="vertical fill mode (default blur_fill: whole frame on a blurred bg)")
+    ap.add_argument("--layout", choices=["auto", "track", "blur_fill", "crop_fill"],
+                    help="vertical layout (default auto: face/person-tracked crop for a single "
+                         "subject, else blur_fill). 'track' forces the crop; 'blur_fill' the bg.")
     ap.add_argument("--clip-min", type=int, dest="clip_min")
     ap.add_argument("--clip-max", type=int, dest="clip_max")
     ap.add_argument("--watermark-file", help="watermark filename in assets/ (exact or substring)")

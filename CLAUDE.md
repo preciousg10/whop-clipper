@@ -155,6 +155,22 @@ into `memory/longterm.md`.**
   the Groq free tier overnight (each selected clip = one downstream caption Groq call). We take
   every moment that clears the bar up to the ceiling and **stop — never pad to a number**; if
   nothing clears it we ship the best available, capped conservatively.
+- **Two vertical layouts (`config layout`, default `auto`).** GENERAL = the original single-pass
+  `blur_fill` (whole 16:9 frame on a blurred bg). TRACK (`scripts/reframe.py`, OpenShorts-style)
+  crops 16:9→9:16 following the subject so the streamer FILLS the frame. `auto` picks per clip:
+  a single clear subject → TRACK, a group shot / subject-less landscape / already-vertical →
+  GENERAL (`reframe.decide_track`). Detection = **MediaPipe BlazeFace (Tasks API) → YOLOv8n
+  person** fallback; models auto-download once into `models/` (gitignored). Stabilizer
+  (`SmoothedCameraman`, "heavy tripod"): HOLDS the crop while the subject stays in a center safe
+  zone, pans only when they leave it, eased + speed-capped (`track_max_pan`) so it never jitters.
+  TRACK renders in **3 passes** — `build_content_cmd` (trim/cold-open/CFR 16:9 + audio) →
+  `reframe.track_reframe` (OpenCV per-frame crop, detection every `track_detect_every` frames) →
+  `build_overlay_cmd` (hook + karaoke + watermark burned on top) — so EVERY other feature is
+  identical; only the pixels underneath change. `_content_fc` is the shared trim/CFR/audio core
+  both blur_fill and the content pass use (keep it single-source so FIX 3's CFR can't drift).
+  Heavy deps (mediapipe/ultralytics/opencv/torch) are **optional**: `reframe.deps_available()`
+  warns loudly with the pip line and falls back to blur_fill — never a silent break. In TRACK the
+  footage fills the frame (no letterbox band), so `subtitle_top_y` uses the full-height fallback.
 - **Hook caption case is Title Case (Like This), per user preference** — `captions.titlecase`
   is applied in `finalize_caption` (hook caption). It capitalizes each word's first letter and
   leaves the rest untouched, so contractions survive ("don't"→"Don't", masked "b**"→"B**").

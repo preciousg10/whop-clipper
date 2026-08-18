@@ -645,18 +645,18 @@ def blur_fill_footage_bottom(src_w, src_h, zoom):
     return (H + vis_h) / 2.0
 
 
-def subtitle_top_y(cfg, src_w=None, src_h=None):
+def subtitle_top_y(cfg, src_w=None, src_h=None, layout=None):
     """Y (from the top of the 1920 canvas) at which the karaoke line's TOP should sit, so it
     lands in the lower letterbox band BELOW the footage and never overlaps it. In blur_fill we
-    pin it `subtitle_band_margin` px under the computed footage bottom; without a band (crop_fill
-    or a full-height source) we fall back to `subtitle_center_y`. Config `subtitle_top_y` forces
-    an explicit value."""
+    pin it `subtitle_band_margin` px under the computed footage bottom; without a band (crop_fill,
+    TRACK, or a full-height source) we fall back to `subtitle_center_y`. `layout` overrides the
+    config layout (the cut stage resolves it PER CLIP). Config `subtitle_top_y` forces a value."""
     forced = cfg.get("subtitle_top_y")
     if forced is not None:
         return int(forced)
     margin = int(cfg.get("subtitle_band_margin", 28))
-    layout = str(cfg.get("layout", "blur_fill")).lower()
-    if layout != "crop_fill":
+    layout = str(layout or cfg.get("layout", "blur_fill")).lower()
+    if layout not in ("crop_fill", "track"):
         fb = blur_fill_footage_bottom(src_w, src_h, cfg.get("blur_fg_zoom", 1.2))
         if fb is not None:
             # keep it inside the band (leave room below for a 2nd line before the very bottom)
@@ -942,35 +942,25 @@ def probe_dimensions(path):
         return None, None
 
 
-def build_compose_cmd(source, start, end, segments, cold_open, caption_png, watermark_png,
-                      out_path, cfg, has_audio, n_audio=1, ass_path=None):
-    """`segments` are clip-relative (a, b) spans played in order. When cold_open is set,
-    segment 0 is the peak teaser (opened on the payoff) and segment 1 is the setup —
-    a 2-frame fade straddles that cut so it reads as intentional. Remaining segments are
-    the dead-air-trimmed body.
+def _content_fc(segments, cold_open, has_audio, n_audio, cfg):
+    """Shared filtergraph CORE used by BOTH the blur_fill single-pass compose and the TRACK
+    content pass: trim → CFR (fps) → cold-open fades → concat → loudnorm, then downscale the
+    video to ≤ max_source_height (still source 16:9 aspect). Returns
+    (fc_list, video_label='[dsrc]', audio_label='[aout]'|None, fps).
 
-    Audio: ALL source tracks are merged (amix) so no audio is ever lost — this VOD keeps
-    the commentary/action on a 2nd track, and first-track-only left clips silent.
-
-    `ass_path` (optional): a word-level karaoke ASS file whose timings were mapped through
-    THESE same `segments` — burned last via libass, at 1080x1920 output resolution."""
-    wm_scale = cfg.get("watermark_scale", 0.18)
-    wm_margin = cfg.get("watermark_margin", 40)
-    wm_w = int(W * wm_scale)
+    Keeping this in one place means CFR/fade/audio correctness (incl. FIX 3's seam fix) can't
+    drift between the two render paths."""
     trimming = cold_open or len(segments) > 1
     # FIX 3 — force CONSTANT frame rate. YouTube livestream VODs are often variable-frame-rate;
     # trimming VFR pieces and concatenating them lands frames on mismatched time grids, which the
-    # concat filter renders as a visible stutter/lag spike right at the cold-open→setup seam. We
-    # resample EACH segment to CFR (fps filter) BEFORE concat so every frame is on one uniform
-    # grid, and stamp the encoder with -r too. This also makes the 2-frame fade exact.
+    # concat filter renders as a visible stutter/lag spike at the cold-open→setup seam. We resample
+    # EACH segment to CFR (fps filter) BEFORE concat so every frame is on one uniform grid.
     fps = int(cfg.get("output_fps", OUTPUT_FPS) or OUTPUT_FPS)
     fd = FADE_FRAMES / fps
-
     fc = []
-    audio_label = None                        # filter label OR raw stream feeding loudnorm
-    # Build a reusable audio source. A filter OUTPUT label is single-use, so when we
-    # merge tracks we asplit the mix into one copy per consumer (segment). With a single
-    # track we just reuse the [0:a] input pad (which IS multi-use) as before.
+    audio_label = None
+    # A filter OUTPUT label is single-use, so when we merge tracks we asplit the mix into one copy
+    # per consumer (segment). A single track reuses the [0:a] input pad (which IS multi-use).
     n_consumers = len(segments) if trimming else 1
     if has_audio and n_audio >= 2:
         mix = "".join(f"[0:a:{k}]" for k in range(n_audio))
@@ -1006,20 +996,91 @@ def build_compose_cmd(source, start, end, segments, cold_open, caption_png, wate
         if has_audio:
             audio_label = _apad(0)
 
-    # Per-clip audio peak/loudness normalization to a consistent social target.
+    aout = None
     if has_audio:
-        fc.append(f"{audio_label}{LOUDNORM}[aout];")
-
-    # Downscale the source to max_source_height BEFORE any blur-fill/scale/overlay work, so the
-    # WHOLE filtergraph runs on <=720p frames. 4K (3840x2160) through split+scale+overlay
-    # exhausts RAM ("Cannot allocate memory -12"); the final output is 1080x1920 regardless, so
-    # a 720 source loses nothing visible. Quoted min() protects the inner comma; -2 keeps the
-    # width even for yuv420p; a source already <= max_h is left unchanged.
+        fc.append(f"{audio_label}{LOUDNORM}[aout];")   # loudness normalize to a social target
+        aout = "[aout]"
+    # Downscale to max_source_height first so the WHOLE graph runs on ≤720p frames (4K through
+    # split+scale+overlay OOMs). ,fps also normalizes the single-segment path to CFR.
     max_src_h = int(cfg.get("max_source_height", 720) or 720)
-    # ,fps here normalizes the SINGLE-segment (no-trim) path to CFR too; the trim path already
-    # resampled each piece before concat above (a second pass here is a harmless no-op).
     fc.append(f"{vsrc}scale=-2:'min(ih,{max_src_h})',fps={fps}[dsrc];")
-    vsrc = "[dsrc]"
+    return fc, "[dsrc]", aout, fps
+
+
+def build_content_cmd(source, start, end, segments, cold_open, out_path, cfg, has_audio, n_audio=1):
+    """TRACK pass 1: render the trimmed / cold-open-reordered clip as a plain ≤max_h 16:9 CFR
+    video + loudnormed audio — the 'content' on the FINAL output timeline. reframe.py crops it to
+    9:16 next; build_overlay_cmd burns the hook/subtitles/watermark afterwards. No vertical fill
+    or overlays here, so the reframe operates on clean footage."""
+    fc, vsrc, aout, fps = _content_fc(segments, cold_open, has_audio, n_audio, cfg)
+    fc.append(f"{vsrc}copy[vout]")                      # [dsrc] → [vout] (already ≤max_h 16:9 CFR)
+    threads = str(max(1, int(cfg.get("ffmpeg_threads", 2) or 2)))
+    dur = round(end - start, 3)
+    cmd = ["ffmpeg", "-y", "-v", "error",
+           "-filter_complex_threads", threads, "-threads", threads,
+           "-ss", f"{start}", "-t", f"{dur}", "-i", str(source),
+           "-filter_complex", "".join(fc), "-map", "[vout]"]
+    if has_audio and aout:
+        cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "160k"]
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-pix_fmt", "yuv420p", "-r", str(fps), str(out_path)]
+    return cmd
+
+
+def build_overlay_cmd(video_1080, audio_src, caption_png, watermark_png, ass_path, out_path,
+                      cfg, has_audio):
+    """TRACK pass 3: composite the hook caption PNG + watermark + karaoke ASS onto the already
+    reframed 1080x1920 video, carrying the loudnormed audio from the content pass. This mirrors
+    the overlay TAIL of build_compose_cmd so hooks/subtitles/watermark render IDENTICALLY on a
+    TRACK clip — the reframe only changed the pixels underneath."""
+    wm_scale = cfg.get("watermark_scale", 0.18)
+    wm_margin = cfg.get("watermark_margin", 40)
+    wm_w = int(W * wm_scale)
+    fps = int(cfg.get("output_fps", OUTPUT_FPS) or OUTPUT_FPS)
+    vlast = "[vpre]" if ass_path else "[vout]"
+    fc = []
+    if watermark_png:                                  # inputs: 0=video 1=caption 2=wm 3=audio
+        audio_in = 3
+        fc.append(f"[0:v][1:v]overlay=(W-w)/2:{CAPTION_TOP_Y}:eof_action=repeat[cap];")
+        fc.append(f"[2:v]scale={wm_w}:-2[wm];")
+        fc.append(f"[cap][wm]overlay=W-w-{wm_margin}:H-h-{wm_margin + 20}:eof_action=repeat{vlast}")
+    else:                                              # inputs: 0=video 1=caption 2=audio
+        audio_in = 2
+        fc.append(f"[0:v][1:v]overlay=(W-w)/2:{CAPTION_TOP_Y}:eof_action=repeat{vlast}")
+    if ass_path:
+        fc.append(f";[vpre]{_ass_filter_arg(ass_path)}[vout]")
+    threads = str(max(1, int(cfg.get("ffmpeg_threads", 2) or 2)))
+    cmd = ["ffmpeg", "-y", "-v", "error", "-filter_complex_threads", threads, "-threads", threads,
+           "-i", str(video_1080), "-i", str(caption_png)]
+    if watermark_png:
+        cmd += ["-i", str(watermark_png)]
+    cmd += ["-i", str(audio_src), "-filter_complex", "".join(fc), "-map", "[vout]"]
+    if has_audio:
+        cmd += ["-map", f"{audio_in}:a", "-c:a", "copy"]
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-r", str(fps), "-movflags", "+faststart", str(out_path)]
+    return cmd
+
+
+def build_compose_cmd(source, start, end, segments, cold_open, caption_png, watermark_png,
+                      out_path, cfg, has_audio, n_audio=1, ass_path=None):
+    """`segments` are clip-relative (a, b) spans played in order. When cold_open is set,
+    segment 0 is the peak teaser (opened on the payoff) and segment 1 is the setup —
+    a 2-frame fade straddles that cut so it reads as intentional. Remaining segments are
+    the dead-air-trimmed body.
+
+    Audio: ALL source tracks are merged (amix) so no audio is ever lost — this VOD keeps
+    the commentary/action on a 2nd track, and first-track-only left clips silent.
+
+    `ass_path` (optional): a word-level karaoke ASS file whose timings were mapped through
+    THESE same `segments` — burned last via libass, at 1080x1920 output resolution."""
+    wm_scale = cfg.get("watermark_scale", 0.18)
+    wm_margin = cfg.get("watermark_margin", 40)
+    wm_w = int(W * wm_scale)
+    # Shared trim→CFR→(cold-open fades)→concat→loudnorm→downscale core (also used by the TRACK
+    # content pass) so CFR/fade/audio behavior lives in ONE place. `vsrc` = the ≤max_h 16:9 video
+    # label ([dsrc]); audio, when present, is already loudnormed to [aout].
+    fc, vsrc, _aout, fps = _content_fc(segments, cold_open, has_audio, n_audio, cfg)
 
     # Vertical fill. Default BLUR-FILL keeps the ENTIRE source frame visible (no
     # cropping): a COVER-scaled + heavily-blurred copy fills the 1080x1920 canvas as
@@ -1093,6 +1154,30 @@ def compose(source, start, end, segments, cold_open, caption_png, watermark_png,
     C.run_cmd(cmd, desc=f"cutting {out_path.name}")
 
 
+def compose_track(source, start, end, segments, cold_open, caption_png, watermark_png, out_path,
+                  cfg, has_audio, n_audio, ass_path, detectors, rank):
+    """3-pass TRACK render: (1) build the trimmed 16:9 content clip on the output timeline,
+    (2) reframe.py crops it 9:16 following the subject, (3) burn hook/subtitles/watermark on top.
+    Returns True on success, or False to signal the caller to fall back to blur_fill (a reframe
+    failure — deps/detector/geometry). Intermediates live under drafts/ and are always cleaned."""
+    import reframe
+    content = C.DRAFTS / f".content_{rank:02d}.mp4"
+    tracked = C.DRAFTS / f".tracked_{rank:02d}.mp4"
+    fps = int(cfg.get("output_fps", OUTPUT_FPS) or OUTPUT_FPS)
+    try:
+        C.run_cmd(build_content_cmd(source, start, end, segments, cold_open, content, cfg,
+                                    has_audio, n_audio), desc=f"track p1/3 (content) {out_path.name}")
+        if not reframe.track_reframe(content, tracked, cfg, detectors, fps=fps):
+            return False
+        C.run_cmd(build_overlay_cmd(tracked, content, caption_png, watermark_png, ass_path,
+                                    out_path, cfg, has_audio),
+                  desc=f"track p3/3 (overlay) {out_path.name}")
+        return True
+    finally:
+        content.unlink(missing_ok=True)
+        tracked.unlink(missing_ok=True)
+
+
 # --- misc ----------------------------------------------------------------------
 def slugify(text, n=40):
     s = re.sub(r"[^a-z0-9]+", "-", (text or "clip").lower()).strip("-")
@@ -1127,7 +1212,20 @@ def run(state):
     cmax = float(cfg.get("clip_max_seconds", 45))
     pre = float(cfg.get("story_pre_seconds", 20))
     post = float(cfg.get("story_post_seconds", 15))
-    layout = str(cfg.get("layout", "blur_fill")).lower()
+    layout = str(cfg.get("layout", "auto")).lower()   # auto | track | blur_fill | crop_fill
+    # TRACK-mode face/person reframe (OpenShorts-style). Only load the heavy detectors when the
+    # layout can actually use them (auto/track) AND the deps import; otherwise every clip uses
+    # blur_fill exactly as before. Detectors load ONCE and are reused across all clips.
+    detectors = None
+    if layout in ("auto", "track"):
+        import reframe
+        if reframe.deps_available():
+            detectors = reframe.Detectors(cfg)
+            if not detectors.usable:
+                detectors = None
+        if detectors is None:
+            C.warn(f"TRACK: layout='{layout}' requested but reframe is unavailable — "
+                   "falling back to blur_fill for all clips.")
     emoji_in_caption = bool(cfg.get("emoji_in_caption", True))
     # Hook vs subtitle are visually DISTINCT layers. The HOOK is the plated scroll-stopper
     # at the top (Pillow PNG, larger text, denser plate — hook_font_scale / hook_plate_opacity).
@@ -1214,6 +1312,23 @@ def run(state):
                            stroke=caption_outline, plate_opacity=hook_plate_opacity,
                            font_scale=hook_font_scale)
 
+        # --- LAYOUT: resolve TRACK vs GENERAL (blur_fill) for THIS clip ---
+        # blur_fill/crop_fill are forced GENERAL; track forces TRACK; auto samples the clip and
+        # picks TRACK only for a single clear subject (else blur_fill). eff_layout also drives
+        # the karaoke placement (TRACK fills the frame → no lower letterbox band).
+        eff_layout = layout if layout in ("blur_fill", "crop_fill") else "blur_fill"
+        use_track, track_reason = False, ""
+        if detectors is not None:
+            if layout == "track":
+                use_track, track_reason = True, "forced (layout=track)"
+            else:
+                use_track, track_reason = reframe.decide_track(
+                    src_path, cfg, detectors, window=(start, end))
+            eff_layout = "track" if use_track else "blur_fill"
+        C.log(f"  layout [{c['moment_id']}]: "
+              + (f"TRACK — {track_reason}" if use_track
+                 else "GENERAL blur_fill" + (f" — {track_reason}" if track_reason else "")))
+
         # KARAOKE SUBTITLES: take the clip's source words, map them through the SAME
         # `segments` compose plays (cold-open reorder + dead-air trims), and write an ASS
         # file whose per-word events land on the final output timeline. build_compose_cmd
@@ -1237,21 +1352,34 @@ def run(state):
             if c["source"] not in dim_cache:
                 dim_cache[c["source"]] = probe_dimensions(src_path)
             sw, sh = dim_cache[c["source"]]
-            top_y = subtitle_top_y(cfg, sw, sh)
+            top_y = subtitle_top_y(cfg, sw, sh, layout=eff_layout)
             ass_file = C.DRAFTS / f".sub_{rank:02d}.ass"
             ass_path = build_ass(events, cfg, banned, ass_file, top_y, fx_events)
         subtitled = ass_path is not None
 
-        compose(src_path, start, end, segments, cold_open, cap_png, watermark, out_path,
-                cfg, has_audio, n_audio, ass_path=ass_path)
+        # RENDER: TRACK uses the 3-pass reframe (content → crop → overlay); on any reframe
+        # failure it falls back to the normal blur_fill single pass. Everything else (hook,
+        # karaoke, watermark, cold-open, CFR) is identical across both.
+        if use_track:
+            if not compose_track(src_path, start, end, segments, cold_open, cap_png, watermark,
+                                 out_path, cfg, has_audio, n_audio, ass_path, detectors, rank):
+                eff_layout = "blur_fill"
+                C.warn(f"  {c['moment_id']}: TRACK reframe failed → blur_fill fallback.")
+                compose(src_path, start, end, segments, cold_open, cap_png, watermark, out_path,
+                        cfg, has_audio, n_audio, ass_path=ass_path)
+        else:
+            compose(src_path, start, end, segments, cold_open, cap_png, watermark, out_path,
+                    cfg, has_audio, n_audio, ass_path=ass_path)
         cap_png.unlink(missing_ok=True)
         if ass_path:
             ass_path.unlink(missing_ok=True)
-        C.log(f"  {'cold-open ' if cold_open else ''}{'subtitled ' if subtitled else ''}cut {name}")
+        C.log(f"  {'cold-open ' if cold_open else ''}{'subtitled ' if subtitled else ''}"
+              f"[{eff_layout.upper()}] cut {name}")
 
         manifest.append({
             "filename": name, "caption": c["caption"], "variant": c.get("variant"),
             "source": c["source"], "source_start": start, "source_end": end,
+            "layout": eff_layout,
             "cold_open": cold_open, "dead_air_trimmed": len(keeps) > 1,
             "subtitles": subtitled, "score": c.get("score"),
             "tiktok_caption": c["tiktok_caption"], "shorts_title": c["shorts_title"],
