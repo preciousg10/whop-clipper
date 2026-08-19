@@ -43,6 +43,76 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 SUBTITLE_BOX_W = 640
 SUBTITLE_CENTER_Y = 1440      # ~75% down: in the lower black band, off the video frame
 
+# --- per-clip STYLE-SET (caption + hook variety) --------------------------------
+# The pipeline is AUDIO-ONLY and cannot see frames, so style variety is ROTATION-based and
+# DETERMINISTIC — seeded by the clip id so it's stable on re-cut (not random each render).
+# This is a NAMED style-set block so LATER each account/category can ship its own; for now
+# there is one curated default. Override wholesale via config `style_set` (a dict merged over
+# this). Everything here is chosen to stay high-contrast, readable, and meme-fluent — variety
+# within good bounds, not chaos.
+DEFAULT_STYLE_SET = {
+    "name": "flzsh_default",
+    # Curated accent palette (RGB hex; converted to ASS &HBBGGRR at use). Punchy, high-contrast,
+    # video-readable against the black outline/plate — no low-contrast or muddy colors.
+    "accent_palette": ["FFFF00", "00E5FF", "39FF14", "FF2D95", "FF8C00"],
+    #                   yellow    cyan      lime      hot-pink  orange
+    # Active-word emphasis: "color" = accent FILL (current look); "box" = accent HIGHLIGHT behind
+    # the word (thick accent border reads as a colored box/sticker around it).
+    "emphasis_modes": ["color", "box"],
+    "box_border": 12,             # accent border thickness (px @ output res) for "box" mode
+    # Hook vertical positions (top-y on the 1920 canvas): top → upper. All sit in the upper third,
+    # well clear of the karaoke safe-zone (~1300+), so the hook never overlaps the subtitles.
+    "hook_positions": [175, 250, 330],
+    "hook_accent_match": True,    # tint the hook text in the clip's accent so the two layers complement
+}
+
+
+def _style_hash(seed):
+    """A STABLE (process-independent) integer hash of a clip id — Python's hash() is salted per
+    run, so we use md5 to keep the per-clip style identical on every re-cut."""
+    import hashlib
+    return int(hashlib.md5(str(seed).encode("utf-8")).hexdigest()[:8], 16)
+
+
+def _rgb_to_ass(rgb):
+    """'FFFF00' (RRGGBB) -> ASS '&H00FFFF&' (&HBBGGRR, reversed byte order)."""
+    s = str(rgb).lstrip("#")
+    if len(s) != 6:
+        return "&H00FFFF&"
+    r, g, b = s[0:2], s[2:4], s[4:6]
+    return f"&H{b}{g}{r}&".upper().replace("&HX", "&H")
+
+
+def _rgb_to_pil(rgb):
+    """'FFFF00' -> (255,255,0) for Pillow text fill."""
+    s = str(rgb).lstrip("#")
+    try:
+        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+    except (ValueError, IndexError):
+        return (255, 255, 255)
+
+
+def resolve_clip_style(cfg, clip_id):
+    """Pick THIS clip's caption/hook style deterministically from the (config-mergeable) style-set,
+    seeded by the clip id — accent color, active-word emphasis mode, and hook position. Different
+    salts per attribute so a clip's color, emphasis, and position rotate independently (a batch
+    spreads across the palette / modes / positions instead of moving in lockstep)."""
+    ss = {**DEFAULT_STYLE_SET, **(cfg.get("style_set") or {})}
+    palette = list(ss.get("accent_palette") or ["FFFF00"])
+    modes = list(ss.get("emphasis_modes") or ["color"])
+    positions = list(ss.get("hook_positions") or [CAPTION_TOP_Y])
+    h = _style_hash(clip_id)
+    accent_rgb = palette[h % len(palette)]
+    return {
+        "accent_rgb": accent_rgb,
+        "accent_ass": _rgb_to_ass(accent_rgb),
+        "emphasis": modes[(h // 7) % len(modes)],
+        "box_border": int(ss.get("box_border", 12)),
+        "hook_y": int(positions[(h // 13) % len(positions)]),
+        "hook_accent_match": bool(ss.get("hook_accent_match", True)),
+    }
+
+
 # --- cold-open restructure (the biggest hook lever) ----------------------------
 COLD_OPEN_DUR = 2.0           # target length of the peak teaser (spec: 1.5–2.5s)
 COLD_OPEN_MIN = 1.5           # never shorter than this or it reads as a glitch
@@ -325,7 +395,7 @@ CAPTION_PLATE_RADIUS = 18
 
 
 def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=2,
-                       emoji=True, plate_opacity=105, font_scale=1.0):
+                       emoji=True, plate_opacity=105, font_scale=1.0, text_color="white"):
     """The HOOK caption — the scroll-stopper, so it is the PROMINENT of the two text layers
     (larger/bolder than the burned subtitles). Clean, understated (Title Case, emoji as
     punctuation): white text on a SEMI-TRANSPARENT DARK PLATE so it stays legible on ANY
@@ -395,10 +465,10 @@ def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=
                 except Exception:
                     pass
             elif stroke > 0:
-                d.text((x, y), c["s"], font=c["font"], fill="white",
+                d.text((x, y), c["s"], font=c["font"], fill=text_color,
                        stroke_width=stroke, stroke_fill="black")
             else:
-                d.text((x, y), c["s"], font=c["font"], fill="white")
+                d.text((x, y), c["s"], font=c["font"], fill=text_color)
             x += c["w"]
         y += line_h
     img.save(out_path)
@@ -441,9 +511,22 @@ def _subtitle_word(word):
     ('what's' -> 'whats', 'that's' -> 'thats'), and EVERY other punctuation/symbol stripped
     ('Saki.' -> 'saki', 'difference?' -> 'difference'). Keeps letters + digits ('10v1' survives).
     Returns '' for a punctuation-only token (the caller then skips it). Banned-word masking runs
-    AFTER this (in _group_lines) so the mask's '*' are never stripped away."""
-    t = (word or "").lower().replace("'", "").replace("’", "")   # join contractions
-    return re.sub(r"[^a-z0-9]+", "", t)                                # drop all other punctuation
+    AFTER this (in _group_lines) so the mask's '*' are never stripped away.
+
+    FIX 1: the English standalone pronoun 'I' must stay CAPITAL even in the lowercase style —
+    'i' -> 'I', and the I-contractions I'm/I'll/I've/I'd (joined to im/ill/ive/id) -> Im/Ill/Ive/Id.
+    Only the standalone pronoun: the contraction forms are gated on the raw word actually having
+    an apostrophe, so a plain word like 'ill' (sick) or 'id' is NOT wrongly capitalized, and 'i'
+    inside another word is untouched (we only rewrite the whole-token cases)."""
+    raw = word or ""
+    t = raw.lower().replace("'", "").replace("’", "")             # join contractions
+    t = re.sub(r"[^a-z0-9]+", "", t)                              # drop all other punctuation
+    if not t:
+        return ""
+    had_apostrophe = "'" in raw or "’" in raw
+    if t == "i" or (had_apostrophe and t in ("im", "ill", "ive", "id")):
+        t = "I" + t[1:]                                          # capital I only for the pronoun
+    return t
 
 
 # --- profanity censor (karaoke lower band only, SEPARATE from campaign banned masking) ------
@@ -694,14 +777,17 @@ def _ass_header(cfg, top_y):
     )
 
 
-def build_ass(events, cfg, banned, out_path, top_y, fx_events=None):
+def build_ass(events, cfg, banned, out_path, top_y, fx_events=None, style=None):
     """Write a word-level karaoke ASS file for one clip and return its path, or None if
     there's nothing to burn. Emits one Dialogue per word: the full line is shown, and the
-    active word is wrapped in an accent-colour + upscale override so it POPS, reverting as
-    the next word speaks. `top_y` pins the line's top into the lower letterbox band (see
-    subtitle_top_y). `fx_events` are non-speech sound labels ([{label,start,end}], already
-    output-timed) inserted as standalone '*scream*' lines in the word gaps. Re-checks each
-    finished line for banned words (fail-loud)."""
+    active word is emphasised so it POPS, reverting as the next word speaks. `top_y` pins the
+    line's top into the lower letterbox band (see subtitle_top_y). `fx_events` are non-speech
+    sound labels ([{label,start,end}], already output-timed) inserted as standalone '*scream*'
+    lines in the word gaps. Re-checks each finished line for banned words (fail-loud).
+
+    `style` (per-clip, from resolve_clip_style) sets the accent COLOUR and the emphasis MODE:
+    'color' tints the active word (accent FILL); 'box' puts an accent HIGHLIGHT (thick accent
+    border) behind it. None → fall back to the config default accent, color mode."""
     lines = _group_lines(events, banned,
                          max_words=int(cfg.get("subtitle_max_words", 3)),
                          pause_gap=float(cfg.get("subtitle_pause_gap", 0.35)),
@@ -716,9 +802,18 @@ def build_ass(events, cfg, banned, out_path, top_y, fx_events=None):
     if not lines:
         return None
     from captions import banned_hit
-    accent = str(cfg.get("subtitle_accent_color", "&H00FFFF&"))   # ASS &HBBGGRR (default yellow)
+    style = style or {}
+    accent = str(style.get("accent_ass") or cfg.get("subtitle_accent_color", "&H00FFFF&"))
+    emphasis = str(style.get("emphasis", "color"))               # "color" (fill) | "box" (highlight)
+    box_border = int(style.get("box_border", 12))
     scale = int(cfg.get("subtitle_active_scale", 110))            # % upscale of the active word
     hold = float(cfg.get("subtitle_hold", 0.25))                  # linger after the last word
+    # The active-word override: color mode tints the FILL; box mode keeps the white fill but gives
+    # the word a thick accent BORDER so it reads as a highlighted/boxed word. Both upscale it.
+    if emphasis == "box":
+        active_open = f"{{\\3c{accent}\\bord{box_border}\\fscx{scale}\\fscy{scale}}}"
+    else:
+        active_open = f"{{\\c{accent}\\fscx{scale}\\fscy{scale}}}"
     dialogues = []
     for li, line in enumerate(lines):
         toks = [w["tok"] for w in line]
@@ -738,7 +833,7 @@ def build_ass(events, cfg, banned, out_path, top_y, fx_events=None):
             for j, tok in enumerate(toks):
                 safe = _ass_escape(tok)
                 if j == k:
-                    parts.append(f"{{\\c{accent}\\fscx{scale}\\fscy{scale}}}{safe}{{\\r}}")
+                    parts.append(f"{active_open}{safe}{{\\r}}")
                 else:
                     parts.append(safe)
             text = " ".join(parts)
@@ -1028,11 +1123,12 @@ def build_content_cmd(source, start, end, segments, cold_open, out_path, cfg, ha
 
 
 def build_overlay_cmd(video_1080, audio_src, caption_png, watermark_png, ass_path, out_path,
-                      cfg, has_audio):
+                      cfg, has_audio, caption_y=CAPTION_TOP_Y):
     """TRACK pass 3: composite the hook caption PNG + watermark + karaoke ASS onto the already
     reframed 1080x1920 video, carrying the loudnormed audio from the content pass. This mirrors
     the overlay TAIL of build_compose_cmd so hooks/subtitles/watermark render IDENTICALLY on a
-    TRACK clip — the reframe only changed the pixels underneath."""
+    TRACK clip — the reframe only changed the pixels underneath. `caption_y` = the hook's top Y
+    (varies per clip; see resolve_clip_style)."""
     wm_scale = cfg.get("watermark_scale", 0.18)
     wm_margin = cfg.get("watermark_margin", 40)
     wm_w = int(W * wm_scale)
@@ -1041,12 +1137,12 @@ def build_overlay_cmd(video_1080, audio_src, caption_png, watermark_png, ass_pat
     fc = []
     if watermark_png:                                  # inputs: 0=video 1=caption 2=wm 3=audio
         audio_in = 3
-        fc.append(f"[0:v][1:v]overlay=(W-w)/2:{CAPTION_TOP_Y}:eof_action=repeat[cap];")
+        fc.append(f"[0:v][1:v]overlay=(W-w)/2:{caption_y}:eof_action=repeat[cap];")
         fc.append(f"[2:v]scale={wm_w}:-2[wm];")
         fc.append(f"[cap][wm]overlay=W-w-{wm_margin}:H-h-{wm_margin + 20}:eof_action=repeat{vlast}")
     else:                                              # inputs: 0=video 1=caption 2=audio
         audio_in = 2
-        fc.append(f"[0:v][1:v]overlay=(W-w)/2:{CAPTION_TOP_Y}:eof_action=repeat{vlast}")
+        fc.append(f"[0:v][1:v]overlay=(W-w)/2:{caption_y}:eof_action=repeat{vlast}")
     if ass_path:
         fc.append(f";[vpre]{_ass_filter_arg(ass_path)}[vout]")
     threads = str(max(1, int(cfg.get("ffmpeg_threads", 2) or 2)))
@@ -1063,7 +1159,7 @@ def build_overlay_cmd(video_1080, audio_src, caption_png, watermark_png, ass_pat
 
 
 def build_compose_cmd(source, start, end, segments, cold_open, caption_png, watermark_png,
-                      out_path, cfg, has_audio, n_audio=1, ass_path=None):
+                      out_path, cfg, has_audio, n_audio=1, ass_path=None, caption_y=CAPTION_TOP_Y):
     """`segments` are clip-relative (a, b) spans played in order. When cold_open is set,
     segment 0 is the peak teaser (opened on the payoff) and segment 1 is the setup —
     a 2-frame fade straddles that cut so it reads as intentional. Remaining segments are
@@ -1120,11 +1216,11 @@ def build_compose_cmd(source, start, end, segments, cold_open, caption_png, wate
     # res) by chaining the `ass` filter onto this label → [vout].
     vlast = "[vpre]" if ass_path else "[vout]"
     if watermark_png:
-        fc.append(f"[base][1:v]overlay=(W-w)/2:{CAPTION_TOP_Y}:eof_action=repeat[cap];")
+        fc.append(f"[base][1:v]overlay=(W-w)/2:{caption_y}:eof_action=repeat[cap];")
         fc.append(f"[2:v]scale={wm_w}:-2[wm];")
         fc.append(f"[cap][wm]overlay=W-w-{wm_margin}:H-h-{wm_margin + 20}:eof_action=repeat{vlast}")
     else:
-        fc.append(f"[base][1:v]overlay=(W-w)/2:{CAPTION_TOP_Y}:eof_action=repeat{vlast}")
+        fc.append(f"[base][1:v]overlay=(W-w)/2:{caption_y}:eof_action=repeat{vlast}")
     if ass_path:
         fc.append(f";[vpre]{_ass_filter_arg(ass_path)}[vout]")
 
@@ -1148,14 +1244,14 @@ def build_compose_cmd(source, start, end, segments, cold_open, caption_png, wate
 
 
 def compose(source, start, end, segments, cold_open, caption_png, watermark_png, out_path,
-            cfg, has_audio, n_audio=1, ass_path=None):
+            cfg, has_audio, n_audio=1, ass_path=None, caption_y=CAPTION_TOP_Y):
     cmd = build_compose_cmd(source, start, end, segments, cold_open, caption_png,
-                            watermark_png, out_path, cfg, has_audio, n_audio, ass_path)
+                            watermark_png, out_path, cfg, has_audio, n_audio, ass_path, caption_y)
     C.run_cmd(cmd, desc=f"cutting {out_path.name}")
 
 
 def compose_track(source, start, end, segments, cold_open, caption_png, watermark_png, out_path,
-                  cfg, has_audio, n_audio, ass_path, detectors, rank):
+                  cfg, has_audio, n_audio, ass_path, detectors, rank, caption_y=CAPTION_TOP_Y):
     """3-pass TRACK render: (1) build the trimmed 16:9 content clip on the output timeline,
     (2) reframe.py crops it 9:16 following the subject, (3) burn hook/subtitles/watermark on top.
     Returns True on success, or False to signal the caller to fall back to blur_fill (a reframe
@@ -1170,7 +1266,7 @@ def compose_track(source, start, end, segments, cold_open, caption_png, watermar
         if not reframe.track_reframe(content, tracked, cfg, detectors, fps=fps):
             return False
         C.run_cmd(build_overlay_cmd(tracked, content, caption_png, watermark_png, ass_path,
-                                    out_path, cfg, has_audio),
+                                    out_path, cfg, has_audio, caption_y=caption_y),
                   desc=f"track p3/3 (overlay) {out_path.name}")
         return True
     finally:
@@ -1308,9 +1404,14 @@ def run(state):
         name = f"{rank:02d}_{score_i:03d}_{slugify(c['caption'])}.mp4"
         out_path = C.DRAFTS / name
         cap_png = C.DRAFTS / f".cap_{rank:02d}.png"
+        # PER-CLIP STYLE (deterministic, seeded by the moment id → stable on re-cut): the karaoke
+        # accent colour + emphasis mode, the hook's vertical position, and whether the hook text is
+        # tinted to match the accent. All non-visual (rotation), so it varies tastefully per clip.
+        style = resolve_clip_style(cfg, c["moment_id"])
+        hook_color = _rgb_to_pil(style["accent_rgb"]) if style["hook_accent_match"] else "white"
         render_caption_png(c["caption"], cap_png, emoji=emoji_in_caption,
                            stroke=caption_outline, plate_opacity=hook_plate_opacity,
-                           font_scale=hook_font_scale)
+                           font_scale=hook_font_scale, text_color=hook_color)
 
         # --- LAYOUT: resolve TRACK vs GENERAL (blur_fill) for THIS clip ---
         # blur_fill/crop_fill are forced GENERAL; track forces TRACK; auto samples the clip and
@@ -1354,7 +1455,7 @@ def run(state):
             sw, sh = dim_cache[c["source"]]
             top_y = subtitle_top_y(cfg, sw, sh, layout=eff_layout)
             ass_file = C.DRAFTS / f".sub_{rank:02d}.ass"
-            ass_path = build_ass(events, cfg, banned, ass_file, top_y, fx_events)
+            ass_path = build_ass(events, cfg, banned, ass_file, top_y, fx_events, style=style)
         subtitled = ass_path is not None
 
         # RENDER: TRACK uses the 3-pass reframe (content → crop → overlay); on any reframe
@@ -1362,14 +1463,15 @@ def run(state):
         # karaoke, watermark, cold-open, CFR) is identical across both.
         if use_track:
             if not compose_track(src_path, start, end, segments, cold_open, cap_png, watermark,
-                                 out_path, cfg, has_audio, n_audio, ass_path, detectors, rank):
+                                 out_path, cfg, has_audio, n_audio, ass_path, detectors, rank,
+                                 caption_y=style["hook_y"]):
                 eff_layout = "blur_fill"
                 C.warn(f"  {c['moment_id']}: TRACK reframe failed → blur_fill fallback.")
                 compose(src_path, start, end, segments, cold_open, cap_png, watermark, out_path,
-                        cfg, has_audio, n_audio, ass_path=ass_path)
+                        cfg, has_audio, n_audio, ass_path=ass_path, caption_y=style["hook_y"])
         else:
             compose(src_path, start, end, segments, cold_open, cap_png, watermark, out_path,
-                    cfg, has_audio, n_audio, ass_path=ass_path)
+                    cfg, has_audio, n_audio, ass_path=ass_path, caption_y=style["hook_y"])
         cap_png.unlink(missing_ok=True)
         if ass_path:
             ass_path.unlink(missing_ok=True)
@@ -1380,6 +1482,8 @@ def run(state):
             "filename": name, "caption": c["caption"], "variant": c.get("variant"),
             "source": c["source"], "source_start": start, "source_end": end,
             "layout": eff_layout,
+            "accent": "#" + style["accent_rgb"], "emphasis": style["emphasis"],
+            "hook_y": style["hook_y"], "hook_accent_match": style["hook_accent_match"],
             "cold_open": cold_open, "dead_air_trimmed": len(keeps) > 1,
             "subtitles": subtitled, "score": c.get("score"),
             "tiktok_caption": c["tiktok_caption"], "shorts_title": c["shorts_title"],

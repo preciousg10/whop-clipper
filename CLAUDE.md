@@ -203,10 +203,17 @@ into `memory/longterm.md`.**
 - **Word-level karaoke subtitles** (`subtitles_enabled`, config default true; auto-off in
   offline mode and when moments.json predates the feature — both lack word timings).
   Rendered via **ASS/libass** (`cut.build_ass`), NOT Pillow/drawtext: one ASS Dialogue per
-  word shows the FULL line with only the currently-spoken word wrapped in an accent colour +
-  upscale override (`{\c<accent>\fscxNNN\fscyNNN}word{\r}`) so it POPS, reverting as the next
-  word speaks. Accent is a per-account config value in ASS `&HBBGGRR` order (reversed hex),
-  `subtitle_accent_color`, default punchy yellow `&H00FFFF&`. **Timing (the critical part):**
+  word shows the FULL line with only the currently-spoken word emphasised so it POPS, reverting
+  as the next word speaks. **Per-clip VARIETY comes from the named STYLE-SET** (`DEFAULT_STYLE_SET`
+  + `resolve_clip_style`, overridable via config `style_set` so each account/category can ship its
+  own): each clip's accent COLOUR (curated high-contrast palette), active-word EMPHASIS ("color" =
+  accent fill `{\c…}` / "box" = accent highlight border `{\3c…\bord…}`), and HOOK POSITION are
+  rotated DETERMINISTICALLY off a stable md5 hash of the moment id (`_style_hash`) — the pipeline is
+  audio-only, so variety is rotation-based, NOT matched to visuals, and identical on every re-cut.
+  The hook text is tinted to the clip's accent when `hook_accent_match`. `subtitle_accent_color` is
+  now only the FALLBACK when no style-set applies. **Karaoke lowercasing keeps the pronoun "I"
+  CAPITAL** (`_subtitle_word`: `i`→`I`, `I'm/I'll/I've/I'd`→`Im/Ill/Ive/Id`, gated on a real
+  apostrophe so `ill`/`id` and `i`-inside-words are untouched). **Timing (the critical part):**
   index.py stores per-word `{word,start,end}` (whisper `word_timestamps`) in moments.json;
   cut.py's `map_words_to_output` maps those SOURCE-absolute times through the EXACT same
   `segments` list compose plays (cold-open reorder + dead-air trims + cmax tail cut), so a word

@@ -85,6 +85,10 @@ DEFAULT_CONFIG = {
     # Karaoke subtitle look (lower-center, ASS/libass). The active (currently-spoken) word
     # pops in the accent colour + upscale, then reverts as the next word speaks. Accent is a
     # per-account/config value in ASS &HBBGGRR order (reversed hex) — default punchy yellow.
+    # NOTE: per-clip VARIETY (accent colour, active-word emphasis mode, hook position) now comes
+    # from the named STYLE-SET in cut.py (DEFAULT_STYLE_SET, resolve_clip_style), rotated
+    # deterministically per clip. Override the whole set per account/category via config
+    # "style_set": {...}. subtitle_accent_color below is only the FALLBACK when no style-set applies.
     "subtitle_accent_color": "&H00FFFF&",  # active-word colour (ASS &HBBGGRR); yellow
     "subtitle_active_scale": 110,  # % upscale applied to the active word (the "pop")
     "subtitle_ass_fontsize": 54,   # subtitle font size at 1080x1920 output res
