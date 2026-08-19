@@ -57,14 +57,14 @@ DEFAULT_STYLE_SET = {
     "accent_palette": ["FFFF00", "00E5FF", "39FF14", "FF2D95", "FF8C00"],
     #                   yellow    cyan      lime      hot-pink  orange
     # Active-word emphasis: "color" = accent FILL (current look); "box" = accent HIGHLIGHT behind
-    # the word (thick accent border reads as a colored box/sticker around it).
+    # the word (a THIN accent border/halo reads as a clean highlight around it — not a heavy box).
     "emphasis_modes": ["color", "box"],
-    "box_border": 12,             # accent border thickness (px @ output res) for "box" mode
-    # Hook vertical positions (top-y on the 1920 canvas): top → upper. All sit in the upper third,
-    # well clear of the karaoke safe-zone (~1300+), so the hook never overlaps the subtitles.
-    "hook_positions": [175, 250, 330],
-    "hook_accent_match": True,    # tint the hook text in the clip's accent so the two layers complement
+    "box_border": 5,              # accent border thickness (px @ output res) for "box" mode
 }
+# NOTE: this style-set is KARAOKE-ONLY. The HOOK (top plate) is deliberately kept CONSTANT — plain
+# white text, fixed TOP position — and its plate/outline look is chosen by the hook_style preset
+# (HOOK_STYLES, config `hook_style`). Per-clip hook colour/position variance was intentionally
+# reverted so a hook style can be judged and locked on its own.
 
 
 def _style_hash(seed):
@@ -93,14 +93,13 @@ def _rgb_to_pil(rgb):
 
 
 def resolve_clip_style(cfg, clip_id):
-    """Pick THIS clip's caption/hook style deterministically from the (config-mergeable) style-set,
-    seeded by the clip id — accent color, active-word emphasis mode, and hook position. Different
-    salts per attribute so a clip's color, emphasis, and position rotate independently (a batch
-    spreads across the palette / modes / positions instead of moving in lockstep)."""
+    """Pick THIS clip's KARAOKE style deterministically from the (config-mergeable) style-set,
+    seeded by the clip id — accent color + active-word emphasis mode. Different salts per attribute
+    so a batch spreads across the palette / modes instead of moving in lockstep. (The HOOK is NOT
+    styled here — it's constant white/top with a hook_style plate preset; see resolve_hook_style.)"""
     ss = {**DEFAULT_STYLE_SET, **(cfg.get("style_set") or {})}
     palette = list(ss.get("accent_palette") or ["FFFF00"])
     modes = list(ss.get("emphasis_modes") or ["color"])
-    positions = list(ss.get("hook_positions") or [CAPTION_TOP_Y])
     h = _style_hash(clip_id)
     accent_rgb = palette[h % len(palette)]
     return {
@@ -108,8 +107,6 @@ def resolve_clip_style(cfg, clip_id):
         "accent_ass": _rgb_to_ass(accent_rgb),
         "emphasis": modes[(h // 7) % len(modes)],
         "box_border": int(ss.get("box_border", 12)),
-        "hook_y": int(positions[(h // 13) % len(positions)]),
-        "hook_accent_match": bool(ss.get("hook_accent_match", True)),
     }
 
 
@@ -393,15 +390,47 @@ CAPTION_PLATE_PAD_X = 20
 CAPTION_PLATE_PAD_Y = 9
 CAPTION_PLATE_RADIUS = 18
 
+# --- HOOK STYLE PRESETS (top caption plate/outline ONLY) ------------------------
+# Selectable via config `hook_style` (A|B|C|D). HOOK-ONLY: this does NOT touch the karaoke
+# subtitle styling (its per-clip colour/box/emphasis variety is separate — see resolve_clip_style).
+# Each preset is a set of render_caption_png kwargs (plate opacity + outline stroke + plate padding).
+HOOK_STYLES = {
+    # A: NO plate, bold white text, THICK black outline.
+    "A": {"plate_opacity": 0,   "stroke": 6, "pad_x": 20, "pad_y": 9, "radius": 18},
+    # B: NO plate, bold white text, THIN black outline.
+    "B": {"plate_opacity": 0,   "stroke": 2, "pad_x": 20, "pad_y": 9, "radius": 18},
+    # C: THIN semi-transparent plate, small padding, thin outline.
+    "C": {"plate_opacity": 90,  "stroke": 2, "pad_x": 12, "pad_y": 5, "radius": 12},
+    # D: thick plate, thin outline.
+    "D": {"plate_opacity": 105, "stroke": 2, "pad_x": 20, "pad_y": 9, "radius": 18},
+}
+DEFAULT_HOOK_STYLE = "A"          # LOCKED: no plate, bold white text, thick black outline
+
+# The hook auto-shrinks to fit width, but SHORT hooks used to balloon (they fit at the big start
+# size). Cap the start so a short hook lands at/near the reference (clipA rendered ~61px) instead
+# of ~89px — a little natural size variation is fine, but nothing should exceed this noticeably.
+HOOK_MAX_FONT = 64
+
+
+def resolve_hook_style(cfg):
+    """Return the render_caption_png kwargs for the configured hook_style (A|B|C|D), defaulting to
+    the current thick-plate look (D). The HOOK is always plain WHITE text at the fixed TOP position;
+    only the plate/outline changes between presets."""
+    key = str(cfg.get("hook_style", DEFAULT_HOOK_STYLE)).strip().upper()
+    return dict(HOOK_STYLES.get(key, HOOK_STYLES[DEFAULT_HOOK_STYLE]))
+
 
 def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=2,
-                       emoji=True, plate_opacity=105, font_scale=1.0, text_color="white"):
+                       emoji=True, plate_opacity=105, font_scale=1.0, text_color="white",
+                       pad_x=CAPTION_PLATE_PAD_X, pad_y=CAPTION_PLATE_PAD_Y,
+                       radius=CAPTION_PLATE_RADIUS, max_font=HOOK_MAX_FONT):
     """The HOOK caption — the scroll-stopper, so it is the PROMINENT of the two text layers
     (larger/bolder than the burned subtitles). Clean, understated (Title Case, emoji as
     punctuation): white text on a SEMI-TRANSPARENT DARK PLATE so it stays legible on ANY
     background — bright, dark, or busy — with only a THIN (or no) outline; the plate does the
     contrast work, not a heavy stroke. `plate_opacity` (0-255, 0 = no plate), `font_scale`
-    (>1 = larger/bolder-looking) and `stroke` (0 = no outline) are the tunable knobs.
+    (>1 = larger/bolder-looking), `stroke` (0 = no outline), and the plate `pad_x`/`pad_y`/`radius`
+    are the tunable knobs — driven by the hook_style preset (see HOOK_STYLES).
 
     When `emoji` is on we render emoji with a color-emoji font (Segoe UI Emoji / Noto) and DROP
     any glyph the font can't draw (never a tofu box); each emoji is vertically centered on the
@@ -417,9 +446,12 @@ def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=
 
     scratch = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
     # Leave room inside the box for the plate padding so a full-width line still fits the plate.
-    inner = box_w - 2 * CAPTION_PLATE_PAD_X - 16
-    smax = max(int(round(84 * font_scale)), 34)   # hook runs larger than the subtitles
+    inner = box_w - 2 * pad_x - 16
+    # Start at the (capped) max and shrink to fit width. The cap is what stops a SHORT hook from
+    # ballooning: it can only start as big as max_font, so it lands at/near the reference size, not
+    # ~89px. Long hooks still shrink further to fit ≤max_lines.
     smin = max(int(round(30 * font_scale)), 20)
+    smax = max(min(int(round(84 * font_scale)), int(max_font)), smin)
     size, lines, tf, ef = smax, [[]], None, None
     while size >= smin:
         tf = ImageFont.truetype(text_font_path, size)
@@ -432,18 +464,17 @@ def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=
 
     ascent, descent = tf.getmetrics()
     line_h = ascent + descent + 8
-    pad_x, pad_y = CAPTION_PLATE_PAD_X, CAPTION_PLATE_PAD_Y
     img_h = line_h * len(lines) + 2 * pad_y
     img = Image.new("RGBA", (box_w, img_h), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
 
     # Semi-transparent dark plate hugging the widest line — guarantees white-on-anything
-    # contrast without a loud outline. plate_opacity<=0 disables it.
+    # contrast without a loud outline. plate_opacity<=0 disables it (no plate).
     maxw = max((sum(c["w"] for c in ln) for ln in lines), default=0.0)
     if plate_opacity > 0 and maxw > 0:
         pw = min(float(box_w), maxw + 2 * pad_x)
         px0 = (box_w - pw) / 2
-        d.rounded_rectangle([px0, 0, px0 + pw, img_h], radius=CAPTION_PLATE_RADIUS,
+        d.rounded_rectangle([px0, 0, px0 + pw, img_h], radius=radius,
                             fill=(0, 0, 0, int(plate_opacity)))
 
     # Text optical midline (from a sample ascender+descender glyph) — emoji are centered on it.
@@ -1327,9 +1358,12 @@ def run(state):
     # at the top (Pillow PNG, larger text, denser plate — hook_font_scale / hook_plate_opacity).
     # The SUBTITLES are word-level karaoke lower-center (ASS/libass, build_ass) — a different
     # KIND of element, not a smaller plate.
-    hook_plate_opacity = int(cfg.get("hook_plate_opacity", 105))  # dark plate alpha (0-255; 0=off)
     hook_font_scale = float(cfg.get("hook_font_scale", 1.06))     # >1 = larger/bolder hook
-    caption_outline = int(cfg.get("caption_outline_width", 2))  # text stroke px (0 = none)
+    # HOOK plate/outline preset (A|B|C|D). Constant across clips (white text, fixed TOP) so the
+    # plate/outline choice can be judged on its own — the karaoke keeps its per-clip variety.
+    hook_style = resolve_hook_style(cfg)
+    C.log(f"== hook style: {str(cfg.get('hook_style', DEFAULT_HOOK_STYLE)).upper()} "
+          f"(plate_opacity={hook_style['plate_opacity']}, stroke={hook_style['stroke']}) ==")
     # Karaoke subtitles need per-word timings from index (whisper) → off in offline mode
     # (index skips whisper) and when moments.json predates the feature (no words stored).
     subs_on = bool(cfg.get("subtitles_enabled", True)) and not C.offline_mode()
@@ -1404,14 +1438,13 @@ def run(state):
         name = f"{rank:02d}_{score_i:03d}_{slugify(c['caption'])}.mp4"
         out_path = C.DRAFTS / name
         cap_png = C.DRAFTS / f".cap_{rank:02d}.png"
-        # PER-CLIP STYLE (deterministic, seeded by the moment id → stable on re-cut): the karaoke
-        # accent colour + emphasis mode, the hook's vertical position, and whether the hook text is
-        # tinted to match the accent. All non-visual (rotation), so it varies tastefully per clip.
+        # PER-CLIP KARAOKE STYLE (deterministic, seeded by moment id → stable on re-cut): accent
+        # colour + active-word emphasis mode. The HOOK is intentionally CONSTANT — plain white text
+        # at the fixed TOP position — with only its plate/outline set by the hook_style preset.
         style = resolve_clip_style(cfg, c["moment_id"])
-        hook_color = _rgb_to_pil(style["accent_rgb"]) if style["hook_accent_match"] else "white"
         render_caption_png(c["caption"], cap_png, emoji=emoji_in_caption,
-                           stroke=caption_outline, plate_opacity=hook_plate_opacity,
-                           font_scale=hook_font_scale, text_color=hook_color)
+                           font_scale=hook_font_scale, text_color="white",
+                           max_font=int(cfg.get("hook_max_font_size", HOOK_MAX_FONT)), **hook_style)
 
         # --- LAYOUT: resolve TRACK vs GENERAL (blur_fill) for THIS clip ---
         # blur_fill/crop_fill are forced GENERAL; track forces TRACK; auto samples the clip and
@@ -1464,14 +1497,14 @@ def run(state):
         if use_track:
             if not compose_track(src_path, start, end, segments, cold_open, cap_png, watermark,
                                  out_path, cfg, has_audio, n_audio, ass_path, detectors, rank,
-                                 caption_y=style["hook_y"]):
+                                 caption_y=CAPTION_TOP_Y):
                 eff_layout = "blur_fill"
                 C.warn(f"  {c['moment_id']}: TRACK reframe failed → blur_fill fallback.")
                 compose(src_path, start, end, segments, cold_open, cap_png, watermark, out_path,
-                        cfg, has_audio, n_audio, ass_path=ass_path, caption_y=style["hook_y"])
+                        cfg, has_audio, n_audio, ass_path=ass_path, caption_y=CAPTION_TOP_Y)
         else:
             compose(src_path, start, end, segments, cold_open, cap_png, watermark, out_path,
-                    cfg, has_audio, n_audio, ass_path=ass_path, caption_y=style["hook_y"])
+                    cfg, has_audio, n_audio, ass_path=ass_path, caption_y=CAPTION_TOP_Y)
         cap_png.unlink(missing_ok=True)
         if ass_path:
             ass_path.unlink(missing_ok=True)
@@ -1483,7 +1516,7 @@ def run(state):
             "source": c["source"], "source_start": start, "source_end": end,
             "layout": eff_layout,
             "accent": "#" + style["accent_rgb"], "emphasis": style["emphasis"],
-            "hook_y": style["hook_y"], "hook_accent_match": style["hook_accent_match"],
+            "hook_style": str(cfg.get("hook_style", DEFAULT_HOOK_STYLE)).upper(),
             "cold_open": cold_open, "dead_air_trimmed": len(keeps) > 1,
             "subtitles": subtitled, "score": c.get("score"),
             "tiktok_caption": c["tiktok_caption"], "shorts_title": c["shorts_title"],

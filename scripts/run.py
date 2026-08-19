@@ -99,6 +99,12 @@ DEFAULT_CONFIG = {
                                    # campaign banned words (bet/gamble) stay FULLY masked
     "subtitle_band_margin": 28,    # px below the footage rectangle to pin the karaoke line
                                    # (blur_fill) so it sits in the lower black band, off the video
+    # HOOK (top caption) plate/outline PRESET (A|B|C|D — see cut.HOOK_STYLES). HOOK-ONLY; the
+    # karaoke keeps its own per-clip colour/box variety. A=no plate + thick outline, B=no plate +
+    # thin outline, C=thin semi-transparent plate, D=thick plate. LOCKED to A.
+    "hook_style": "A",
+    "hook_max_font_size": 64,      # cap on the hook font size so SHORT hooks don't balloon (px @
+                                   # 1080-wide; ~clipA reference). Long hooks still shrink to fit.
     # Caption/subtitle readability (understated but always legible on any background). The dark
     # plate guarantees white-text contrast; keep the outline thin so it stays clean.
     "plate_opacity": 120,          # dark plate alpha behind caption+subtitles (0-255; 0 = off)

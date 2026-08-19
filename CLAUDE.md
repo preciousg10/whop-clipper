@@ -204,14 +204,20 @@ into `memory/longterm.md`.**
   offline mode and when moments.json predates the feature — both lack word timings).
   Rendered via **ASS/libass** (`cut.build_ass`), NOT Pillow/drawtext: one ASS Dialogue per
   word shows the FULL line with only the currently-spoken word emphasised so it POPS, reverting
-  as the next word speaks. **Per-clip VARIETY comes from the named STYLE-SET** (`DEFAULT_STYLE_SET`
-  + `resolve_clip_style`, overridable via config `style_set` so each account/category can ship its
-  own): each clip's accent COLOUR (curated high-contrast palette), active-word EMPHASIS ("color" =
-  accent fill `{\c…}` / "box" = accent highlight border `{\3c…\bord…}`), and HOOK POSITION are
-  rotated DETERMINISTICALLY off a stable md5 hash of the moment id (`_style_hash`) — the pipeline is
-  audio-only, so variety is rotation-based, NOT matched to visuals, and identical on every re-cut.
-  The hook text is tinted to the clip's accent when `hook_accent_match`. `subtitle_accent_color` is
-  now only the FALLBACK when no style-set applies. **Karaoke lowercasing keeps the pronoun "I"
+  as the next word speaks. **Per-clip KARAOKE VARIETY comes from the named STYLE-SET**
+  (`DEFAULT_STYLE_SET` + `resolve_clip_style`, overridable via config `style_set` so each account/
+  category can ship its own): each clip's accent COLOUR (curated high-contrast palette) and
+  active-word EMPHASIS ("color" = accent fill `{\c…}` / "box" = accent highlight, a THIN accent border
+  `{\3c…\bord…}` via `box_border`, default 5 — subtle, not a heavy box) are rotated DETERMINISTICALLY
+  off a stable md5 hash of the moment id (`_style_hash`) — the pipeline is audio-only, so variety is
+  rotation-based, NOT matched to visuals, and identical on every re-cut. `subtitle_accent_color` is
+  only the FALLBACK when no style-set applies. **The HOOK is SEPARATE and intentionally CONSTANT** —
+  plain white text at the fixed TOP position; only its plate/outline changes, via the `hook_style`
+  preset (`cut.HOOK_STYLES` A|B|C|D, **LOCKED to A** = no-plate + thick black outline; B=no-plate+thin,
+  C=thin semi-transparent plate, D=thick plate). Hook font auto-shrinks to fit width but is CAPPED at
+  `HOOK_MAX_FONT` (config `hook_max_font_size`, ~64px) so a SHORT hook lands at/near the reference size
+  instead of ballooning. Per-clip hook colour/position variance was reverted so the style is fixed.
+  **Karaoke lowercasing keeps the pronoun "I"
   CAPITAL** (`_subtitle_word`: `i`→`I`, `I'm/I'll/I've/I'd`→`Im/Ill/Ive/Id`, gated on a real
   apostrophe so `ill`/`id` and `i`-inside-words are untouched). **Timing (the critical part):**
   index.py stores per-word `{word,start,end}` (whisper `word_timestamps`) in moments.json;
