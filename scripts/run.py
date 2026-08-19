@@ -52,8 +52,12 @@ DEFAULT_CONFIG = {
                                    # letterbox; >1 trims only far L/R edges to fill more
                                    # vertical space (never crops top/bottom or subjects)
     # TRACK mode (OpenShorts-style face/person reframe; needs mediapipe+ultralytics+opencv).
-    "track_safe_zone": 0.35,       # center dead-zone as a fraction of the crop width — the crop
-                                   # HOLDS while the subject stays inside it (no jitter)
+    "track_subject_scale": 0.60,   # ZOOM knob: fraction of the OUTPUT HEIGHT the subject fills.
+                                   # ~0.6 = head+shoulders+room (looser); LOWER = looser/more room,
+                                   # HIGHER = tighter head crop. THIS controls zoom (not track_safe_zone).
+    "track_safe_zone": 0.35,       # PAN trigger only (NOT zoom): center dead-zone as a fraction of
+                                   # the crop width — the crop HOLDS while the subject stays inside
+                                   # it and only pans when they leave it (anti-jitter)
     "track_smooth": 0.12,          # pan easing when the subject leaves the safe zone (0-1; lower=slower)
     "track_max_pan": 12.0,         # max crop pan speed in source px/frame (caps fast whip-pans)
     "track_detect_every": 3,       # run detection every Nth frame (reuse between) — ~10fps at 30fps

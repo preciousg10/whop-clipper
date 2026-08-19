@@ -146,6 +146,30 @@ class Detectors:
             return (p[0][0], p[0][1])
         return None
 
+    def subject_box(self, frame_bgr):
+        """Primary subject BOUNDING BOX for FRAMING: (cx, cy, w, h). Prefers the largest PERSON
+        (head+torso — the natural unit to frame around); falls back to expanding the largest FACE
+        into an approximate head+shoulders box. None if nothing is detected. This box drives the
+        crop SIZE (how much padding to leave around the subject) — see track_subject_scale."""
+        if self._yolo is not None:
+            conf = float(self.cfg.get("track_person_conf", 0.4))
+            r = self._yolo.predict(frame_bgr, classes=[0], conf=conf, verbose=False)[0]
+            best = None
+            for box in r.boxes:
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                a = (x2 - x1) * (y2 - y1)
+                if best is None or a > best[0]:
+                    best = (a, (x1 + x2) / 2.0, (y1 + y2) / 2.0, x2 - x1, y2 - y1)
+            if best:
+                return best[1:]
+        f = self.faces(frame_bgr)
+        if f:
+            cx, cy, area = f[0]
+            fh = area ** 0.5                          # face box ~square → side length
+            # head+shoulders ≈ a face ~3.2x tall / ~2.2x wide, centered a bit below the face.
+            return (cx, cy + fh * 0.9, fh * 2.2, fh * 3.2)
+        return None
+
 
 # --- stabilizer (heavy tripod) --------------------------------------------------------------
 class SmoothedCameraman:
@@ -229,12 +253,62 @@ def decide_track(video_path, cfg, detectors, n_samples=14, window=None):
     return False, f"subject not consistent ({stats}) → blur_fill"
 
 
+def _measure_subject(cap, detectors, n=14):
+    """Sample the clip and return the MEDIAN subject bbox (cx, cy, h) — used to size the crop
+    ONCE per clip so the zoom stays fixed (no per-frame pulsing). None if no subject sampled.
+    Rewinds the capture to the start when done."""
+    import cv2
+    import numpy as np
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    hs, cxs, cys = [], [], []
+    for i in range(n):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * (i + 0.5) / n))
+        ok, fr = cap.read()
+        if not ok:
+            continue
+        b = detectors.subject_box(fr)
+        if b:
+            cxs.append(b[0]); cys.append(b[1]); hs.append(b[3])
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    if not hs:
+        return None
+    return float(np.median(cxs)), float(np.median(cys)), float(np.median(hs))
+
+
+def _plan_crop(cfg, fw, fh, subj):
+    """Compute the FIXED per-clip crop geometry from the subject bbox + track_subject_scale.
+
+    track_subject_scale = the fraction of the OUTPUT height the subject should fill (~0.6 = head
+    +shoulders+room; lower = looser, higher = tighter). We size a 9:16 window so the subject fills
+    that fraction. If the needed window fits inside the source we crop it directly (edge-to-edge).
+    If the subject is so close that filling the frame edge-to-edge would be TIGHTER than the target
+    (a webcam close-up), we can't crop 'wider than the source', so we scale a full-height 9:16 crop
+    DOWN and letterbox it on a blurred background — giving the looser framing the crop alone can't.
+
+    Returns dict: {letterbox, crop_w, crop_h, y0, fg_h}."""
+    target = min(0.95, max(0.30, float(cfg.get("track_subject_scale", 0.60))))
+    _, cy, bbox_h = subj
+    scale = target * H / max(1.0, bbox_h)              # output px per source px
+    crop_w_want = int(round(W / scale))                # 9:16 source window that hits the target
+    crop_h_want = int(round(H / scale))
+    if crop_h_want <= fh and crop_w_want <= fw:
+        # fits: crop the window directly, positioned on the subject with a little headroom.
+        crop_h, crop_w = crop_h_want, crop_w_want
+        y0 = int(round(min(max(0.0, cy - crop_h * 0.47), fh - crop_h)))
+        return {"letterbox": False, "crop_w": crop_w, "crop_h": crop_h, "y0": y0, "fg_h": H}
+    # too close to reach the target by cropping → full-height crop, scaled down + blurred bars.
+    crop_w = min(fw, crop_w_want)
+    crop_h = fh
+    fg_h = min(H, int(round(fh * scale)))              # foreground height (< H → letterbox)
+    return {"letterbox": True, "crop_w": crop_w, "crop_h": crop_h, "y0": 0, "fg_h": fg_h}
+
+
 # --- the reframe pass ------------------------------------------------------------------------
 def track_reframe(content_mp4, out_mp4, cfg, detectors, fps=30):
     """Read the 16:9 clip, follow the subject with SmoothedCameraman, and write a 1080x1920
-    video-only mp4 at CFR `fps`. Detection runs every `track_detect_every` frames (reusing the
-    last center between) to stay cheap; every frame is cropped + written so output is CFR and
-    frame-count-exact. Returns True on success, False to signal the caller to fall back."""
+    video-only mp4 at CFR `fps`. The crop SIZE is fixed per clip from the subject bbox +
+    track_subject_scale (loose/tight zoom); only the horizontal center pans. Detection runs every
+    `track_detect_every` frames (reusing the last center between). Returns True, or False to fall back."""
     import cv2
     import numpy as np  # noqa: F401
     cap = cv2.VideoCapture(str(content_mp4))
@@ -243,8 +317,16 @@ def track_reframe(content_mp4, out_mp4, cfg, detectors, fps=30):
         return False
     fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    crop_w = int(round(fh * TARGET_AR))
-    if crop_w >= fw or fh <= 0:
+    if fh <= 0 or fw <= 0:
+        cap.release()
+        return False
+    subj = _measure_subject(cap, detectors)
+    if subj is None:                                   # no subject found — nothing to track
+        subj = (fw / 2.0, fh / 2.0, fh * TARGET_AR / 0.6)   # neutral: ~full-height framing
+    plan = _plan_crop(cfg, fw, fh, subj)
+    crop_w, crop_h, y0, letterbox, fg_h = (
+        plan["crop_w"], plan["crop_h"], plan["y0"], plan["letterbox"], plan["fg_h"])
+    if crop_w >= fw and not letterbox:                 # nothing to crop horizontally → not useful
         cap.release()
         return False
     cam = SmoothedCameraman(
@@ -252,7 +334,8 @@ def track_reframe(content_mp4, out_mp4, cfg, detectors, fps=30):
         safe_ratio=float(cfg.get("track_safe_zone", 0.35)),
         smooth=float(cfg.get("track_smooth", 0.12)),
         max_pan=float(cfg.get("track_max_pan", 12.0)))
-    detect_every = max(1, int(cfg.get("track_detect_every", 3)))    # ~10fps detection at 30fps
+    detect_every = max(1, int(cfg.get("track_detect_every", 3)))
+    fg_y = (H - fg_h) // 2                              # letterbox: vertical offset of the fg
 
     proc = subprocess.Popen(
         ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -271,10 +354,19 @@ def track_reframe(content_mp4, out_mp4, cfg, detectors, fps=30):
             if fi % detect_every == 0:
                 s = detectors.subject(frame)
                 if s is not None:
-                    last_subject = s[0]                  # subject center x (hold y = full height)
+                    last_subject = s[0]                  # subject center x (crop size is fixed)
             x0 = cam.update(last_subject)
-            crop = frame[0:fh, x0:x0 + crop_w]
-            out = cv2.resize(crop, (W, H), interpolation=cv2.INTER_LINEAR)
+            region = frame[y0:y0 + crop_h, x0:x0 + crop_w]
+            if not letterbox:
+                out = cv2.resize(region, (W, H), interpolation=cv2.INTER_LINEAR)
+            else:
+                fg = cv2.resize(region, (W, fg_h), interpolation=cv2.INTER_LINEAR)
+                # blurred letterbox bg — blur at LOW res then upscale (visually identical for a
+                # blurred bg, ~10x cheaper than gblur at 1080x1920, which was the bottleneck).
+                small = cv2.resize(region, (135, 240), interpolation=cv2.INTER_LINEAR)
+                small = cv2.GaussianBlur(small, (0, 0), sigmaX=6)
+                out = cv2.resize(small, (W, H), interpolation=cv2.INTER_LINEAR)
+                out[fg_y:fg_y + fg_h, 0:W] = fg
             proc.stdin.write(out.tobytes())
             fi += 1
     finally:
@@ -287,6 +379,8 @@ def track_reframe(content_mp4, out_mp4, cfg, detectors, fps=30):
     if proc.returncode != 0 or not Path(out_mp4).exists():
         C.warn("TRACK: reframe encode failed — falling back to blur_fill.")
         return False
+    frac = subj[2] * fg_h / (crop_h * H)               # subject bbox height as a fraction of output
     C.log(f"    TRACK reframe: {fi} frames in {time.time() - t0:.1f}s "
-          f"(crop {crop_w}x{fh}→{W}x{H}, detect every {detect_every} frames).")
+          f"(crop {crop_w}x{crop_h}{'+letterbox' if letterbox else ''}→{W}x{H}, subject ~{frac:.0%} "
+          f"of height, target {float(cfg.get('track_subject_scale', 0.60)):.0%}).")
     return True

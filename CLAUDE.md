@@ -160,9 +160,14 @@ into `memory/longterm.md`.**
   crops 16:9→9:16 following the subject so the streamer FILLS the frame. `auto` picks per clip:
   a single clear subject → TRACK, a group shot / subject-less landscape / already-vertical →
   GENERAL (`reframe.decide_track`). Detection = **MediaPipe BlazeFace (Tasks API) → YOLOv8n
-  person** fallback; models auto-download once into `models/` (gitignored). Stabilizer
-  (`SmoothedCameraman`, "heavy tripod"): HOLDS the crop while the subject stays in a center safe
-  zone, pans only when they leave it, eased + speed-capped (`track_max_pan`) so it never jitters.
+  person** fallback; models auto-download once into `models/` (gitignored).
+  **ZOOM/tightness = `track_subject_scale`** (fraction of output height the subject fills; ~0.6 =
+  head+shoulders+room, lower = looser, higher = tighter) — sized ONCE per clip from the subject
+  bbox (`_measure_subject`/`_plan_crop`) so zoom never pulses; a too-close webcam subject is scaled
+  onto a blurred letterbox to still reach a looser target. `track_safe_zone` is a DIFFERENT knob —
+  the `SmoothedCameraman` PAN dead-zone (anti-jitter), NOT zoom; don't confuse them. Stabilizer
+  (`SmoothedCameraman`, "heavy tripod"): HOLDS the crop while the subject stays in that safe zone,
+  pans only when they leave it, eased + speed-capped (`track_max_pan`) so it never jitters.
   TRACK renders in **3 passes** — `build_content_cmd` (trim/cold-open/CFR 16:9 + audio) →
   `reframe.track_reframe` (OpenCV per-frame crop, detection every `track_detect_every` frames) →
   `build_overlay_cmd` (hook + karaoke + watermark burned on top) — so EVERY other feature is
