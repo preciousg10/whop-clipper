@@ -186,6 +186,12 @@ def t1_intake_rules(footage_path, watermark_path, brief_path):
     man = C.load_json(C.CAMPAIGN_MANIFEST) or {}
     kinds = {d["kind"] for d in man.get("downloads", [])}
     record("T1 manifest has footage + asset", {"footage", "asset"} <= kinds, f"kinds={sorted(kinds)}")
+    # POSTING_CHECKLIST.md is generated with REAL requirements from the rules (the brief's
+    # "Tag #WTFLeagues" must surface; the header must be present) — not invented.
+    checklist = C.POSTING_CHECKLIST.read_text(encoding="utf-8") if C.POSTING_CHECKLIST.exists() else ""
+    record("T1 posting checklist written with real requirements",
+           "This campaign requires when posting:" in checklist and "#WTFLeagues" in checklist,
+           f"chars={len(checklist)}, has_tag={'#WTFLeagues' in checklist}")
 
 
 def t2_gauntlet():

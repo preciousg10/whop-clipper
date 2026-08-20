@@ -38,6 +38,7 @@ STATE_PATH = ROOT / "state.json"
 BRIEF_MD = CAMPAIGN / "brief.md"
 RULES_JSON = CAMPAIGN / "rules.json"
 KNOWLEDGE_MD = CAMPAIGN / "knowledge.md"   # per-campaign digest (never leaks to longterm)
+POSTING_CHECKLIST = CAMPAIGN / "POSTING_CHECKLIST.md"  # human do-this-when-posting checklist
 CAMPAIGN_MANIFEST = CAMPAIGN / "manifest.json"
 MOMENTS_JSON = CAMPAIGN / "moments.json"
 SELECTED_JSON = CAMPAIGN / "selected.json"

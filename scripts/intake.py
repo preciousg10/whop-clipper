@@ -526,6 +526,209 @@ def write_brief_md(campaign, rules, raw):
 """, encoding="utf-8")
 
 
+# --- POSTING / SUBMISSION checklist (what the HUMAN must do when posting) -------
+# Posting is ALWAYS manual, and campaigns reject submissions for a missing tag/mention/hashtag/
+# time-window the clip itself can't show. This builds a plain-English do-this-when-posting
+# checklist STRICTLY from the already-extracted rules.json fields (+ a light scan of the raw
+# brief for time-windows / link-in-bio that structured fields commonly miss). It never invents a
+# requirement — anything unclear is surfaced as "VERIFY:", not asserted.
+_HANDLE_RE = re.compile(r"@[A-Za-z0-9_.]+")
+_TAG_RE = re.compile(r"#[A-Za-z0-9_]+")
+# a posting/submission sentence that also names a time window ("submit within 30 min of posting")
+_POST_WORD_RE = re.compile(r"\b(submit|submission|post|posting|upload|publish)\b", re.I)
+_TIME_WIN_RE = re.compile(r"\b\d+\s*(?:min(?:ute)?s?|hours?|hrs?|days?)\b", re.I)
+_LINK_BIO_RE = re.compile(r"link[\s-]*in[\s-]*bio|in\s+bio", re.I)
+# min views / watch-time for payout ("min 1000 views", "at least 10 seconds")
+_MIN_VIEWS_RE = re.compile(r"(?:min(?:imum)?|at least|>=|over)\s*[^.\n]*?\b[\d,]+\s*(?:k|m)?\s*views?"
+                           r"|\b[\d,]+\s*(?:k|m)?\s*views?\s*(?:min(?:imum)?|required|to qualify)", re.I)
+_MIN_DUR_RE = re.compile(r"(?:min(?:imum)?|at least)\s*[^.\n]*?\b\d+\s*(?:seconds?|secs?|s)\b", re.I)
+
+
+def _split_sentences(text):
+    return [s.strip() for s in re.split(r"(?<=[.!?\n])\s+|\n+", text or "") if s.strip()]
+
+
+def build_posting_checklist(campaign, rules, raw_brief=""):
+    """Return the POSTING_CHECKLIST.md text for `campaign`, built ONLY from `rules` (rules.json)
+    + `raw_brief`. Deterministic — every item traces to an extracted rule or a quoted line; no
+    requirement is invented. Ambiguities become VERIFY items."""
+    req = rules.get("required_elements", []) or []
+    by_type = {}
+    for r in req:
+        by_type.setdefault(str(r.get("type") or "other").lower(), []).append(str(r.get("detail") or "").strip())
+
+    lines, seen_items = [], set()
+
+    def emit(kind, text):
+        text = " ".join((text or "").split())
+        if not text:
+            return
+        key = (kind, text.lower())
+        if key in seen_items:
+            return
+        seen_items.add(key)
+        if kind == "box":
+            lines.append(f"- [ ] {text}")
+        elif kind == "verify":
+            lines.append(f"- [ ] **VERIFY:** {text}")
+        else:
+            lines.append(f"- {text}")
+
+    def section(title):
+        lines.append("")
+        lines.append(f"## {title}")
+
+    # combined raw text we can quote from (real strings only)
+    scan_parts = [raw_brief] + list(rules.get("submission_process") or []) \
+        + list(rules.get("platform_rules") or []) + list(rules.get("deadlines") or []) \
+        + [d for ds in by_type.values() for d in ds] + list(rules.get("payout_terms") or [])
+    scan_text = "\n".join(p for p in scan_parts if p)
+
+    # 1) CAPTION — account mentions / tags -------------------------------------
+    mentions = []
+    for src in list(rules.get("mentions") or []) + by_type.get("mention", []) + by_type.get("tag", []):
+        mentions += _HANDLE_RE.findall(src)
+    mentions = list(dict.fromkeys(mentions))
+    section("Caption — mentions & tags")
+    if mentions:
+        for h in mentions:
+            emit("box", f"mention {h} in the caption")
+    for d in by_type.get("caption", []):
+        emit("box", d)
+    if not mentions and not by_type.get("caption"):
+        lines.append("- _(no required caption mention/tag found in the rules)_")
+
+    # 2) HASHTAGS --------------------------------------------------------------
+    tags = []
+    for src in list(rules.get("hashtags") or []) + by_type.get("hashtag", []):
+        found = _TAG_RE.findall(src)
+        tags += found or ([src.strip()] if src.strip().startswith("#") else [])
+    tags = list(dict.fromkeys(t if t.startswith("#") else f"#{t}" for t in tags if t))
+    section("Hashtags")
+    if tags:
+        for t in tags:
+            emit("box", f"include {t}")
+    else:
+        lines.append("- _(no required hashtag found in the rules)_")
+
+    # 3) LINK IN BIO -----------------------------------------------------------
+    bio_hits = [s for s in _split_sentences(scan_text) if _LINK_BIO_RE.search(s)]
+    if bio_hits:
+        section("Link in bio")
+        for s in bio_hits[:4]:
+            emit("box", s)
+
+    # 4) ON-SCREEN / WATERMARK -------------------------------------------------
+    section("On-screen / watermark")
+    wm = rules.get("watermark_required")
+    if wm is True:
+        emit("note", "Watermark: REQUIRED — the pipeline auto-burns the campaign watermark; "
+                     "confirm it's visible on the exported clip before posting.")
+    elif wm is False:
+        emit("note", "Watermark: not required for this campaign.")
+    else:
+        emit("verify", "Watermark requirement unclear — check the campaign page.")
+    for d in by_type.get("logo", []) + by_type.get("text_overlay", []) + by_type.get("overlay", []):
+        emit("box", d)
+    # a restriction that forbids watermarks/end-screens can conflict with the above — surface it
+    for d in by_type.get("restriction", []):
+        if re.search(r"watermark|end\s*screen|logo", d, re.I) and wm is True:
+            emit("verify", f"possible conflict — rules also say: \"{d}\" (confirm which watermark/"
+                           f"overlay is allowed).")
+        else:
+            emit("note", f"restriction: {d}")
+
+    # 5) QUALITY / FORMAT ------------------------------------------------------
+    fmt = rules.get("format_specs") or {}
+    quality_items = []
+    if fmt.get("resolution"):
+        quality_items.append(f"resolution: {fmt['resolution']}")
+    if fmt.get("aspect_ratio"):
+        quality_items.append(f"aspect ratio: {fmt['aspect_ratio']}")
+    if fmt.get("length"):
+        quality_items.append(f"length: {fmt['length']}")
+    for d in by_type.get("quality", []) + by_type.get("resolution", []):
+        quality_items.append(d)
+    if quality_items:
+        section("Quality / format")
+        for q in dict.fromkeys(quality_items):
+            emit("box", q)
+
+    # 6) SUBMISSION (how + time window) ---------------------------------------
+    section("Submission")
+    subs = [s for s in (rules.get("submission_process") or []) if not s.strip().startswith("#")]
+    for s in subs:
+        emit("box", s)
+    # time window: a sentence that mentions posting/submitting AND a duration
+    windows = []
+    for s in _split_sentences(scan_text):
+        if _POST_WORD_RE.search(s) and _TIME_WIN_RE.search(s):
+            windows.append(s)
+    for w in list(dict.fromkeys(windows))[:4]:
+        emit("box", f"time window — {w}")
+    for d in (rules.get("deadlines") or []):
+        emit("box", f"deadline: {d}")
+    if not subs and not windows and not rules.get("deadlines"):
+        lines.append("- _(no explicit submission step/time-window found — submit via the "
+                     "campaign page; VERIFY any post→submit window)_")
+
+    # 7) PLATFORM-SPECIFIC -----------------------------------------------------
+    plats = [p for p in (rules.get("platform_rules") or []) if not p.strip().startswith("#")]
+    if plats:
+        section("Platform notes (TikTok / Reels / Shorts / etc.)")
+        for p in plats:
+            emit("note", p)
+
+    # 8) PAYOUT — minimum views / watch-time ----------------------------------
+    payout = [p for p in (rules.get("payout_terms") or []) if not p.strip().startswith("#")]
+    view_hits = [s for s in _split_sentences(scan_text) if _MIN_VIEWS_RE.search(s)]
+    dur_hits = [s for s in _split_sentences(scan_text) if _MIN_DUR_RE.search(s)]
+    if payout or view_hits or dur_hits:
+        section("Payout requirements")
+        for s in list(dict.fromkeys(view_hits + dur_hits))[:6]:
+            emit("box", s)
+        for p in dict.fromkeys(payout):
+            emit("note", f"payout: {p}")
+
+    # 8b) OTHER required elements — catch-all so NO extracted requirement is dropped just
+    # because its type isn't one of the sections above (e.g. content_source, account_setup,
+    # multi_platform_posting). Better to surface a real rule verbatim than silently miss it.
+    consumed = {"mention", "tag", "caption", "hashtag", "logo", "text_overlay", "overlay",
+                "quality", "resolution", "restriction"}
+    other = []
+    for r in req:
+        t = str(r.get("type") or "other").lower()
+        d = str(r.get("detail") or "").strip()
+        if d and t not in consumed:
+            other.append(d)
+    if other:
+        section("Other requirements")
+        for d in dict.fromkeys(other):
+            emit("box", d)
+
+    # 9) VERIFY (ambiguities the rules left unclear) --------------------------
+    ambig = rules.get("ambiguities") or []
+    if ambig:
+        section("⚠ VERIFY before relying on these (unclear in the rules)")
+        for a in ambig:
+            emit("verify", a)
+
+    body = "\n".join(lines)
+    return (f"# Posting checklist — {campaign}\n\n"
+            "> Auto-generated by intake from campaign/rules.json. **Posting is manual** — run "
+            "through this when you post EACH clip so a submission isn't rejected for a missing "
+            "mention/tag/hashtag or a blown time-window. Every item comes from the campaign's "
+            "own rules; items marked **VERIFY** were unclear and should be confirmed on the "
+            "campaign page (never guessed).\n\n"
+            "## This campaign requires when posting:\n"
+            f"{body}\n")
+
+
+def write_posting_checklist(campaign, rules, raw_brief=""):
+    C.POSTING_CHECKLIST.write_text(build_posting_checklist(campaign, rules, raw_brief),
+                                   encoding="utf-8")
+
+
 def write_knowledge_md(campaign, rules, resources, harvested, other_urls, corpus_chars, llm_used):
     L = [f"# Campaign knowledge — {campaign}", "",
          "_Per-campaign memory built by intake. Every later stage (select, captions, cut) "
@@ -791,6 +994,10 @@ def main():
     manifest = build_manifest(args.campaign, resources, failures, harvested, other_urls)
     C.save_json(C.CAMPAIGN_MANIFEST, manifest)
     write_knowledge_md(args.campaign, rules, resources, harvested, other_urls, len(corpus), llm_used)
+    # Human-facing do-this-when-posting checklist (posting is always manual) — real requirements
+    # pulled from rules.json, ambiguities flagged as VERIFY, never invented.
+    write_posting_checklist(args.campaign, rules, brief)
+    C.log(f"wrote {C.POSTING_CHECKLIST.name} — posting/submission checklist for this campaign.")
 
     state = C.load_state()
     # Scope checkpoints per-campaign: if this is a NEW campaign, stash the prior campaign's
