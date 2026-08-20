@@ -386,32 +386,39 @@ def _footage_seconds(entries):
     return total
 
 
+# A YouTube CHANNEL link expands to this many recent VODs at most (newest-first); the footage
+# cap is the real limiter — we stop as soon as the running total fills, usually well before this.
+CHANNEL_MAX_VIDEOS = 40
+
+
 def download_links(links, cookies, downloaded, max_source_height=720, original=False,
                    prior_by_source=None, budget=None):
     """Download each source, routing files by type. When `budget` is given
     ({"seconds": <float>, "cap": <seconds or None>}) footage is capped VOD-by-VOD: sources are
     downloaded one at a time while the running total is tracked, and once the total reaches the
     cap NO further footage source is STARTED (the source that crosses the line is fully kept —
-    we only stop before starting a new one). Non-footage links are never capped."""
+    we only stop before starting a new one). Non-footage links are never capped.
+
+    A YouTube CHANNEL link is EXPANDED into its recent VODs (newest-first) and each is downloaded
+    as its own capped, individually-skippable source — so a channel handle (@name) works, one bad
+    video skips instead of failing the campaign, and we never try to pull the whole channel."""
     prior_by_source = prior_by_source or {}
     resources, failures = [], []
     cap = (budget or {}).get("cap")
-    for url in links:
-        if url in downloaded:
-            continue
-        downloaded.add(url)
-        # FOOTAGE CAP: don't START a new footage source once we're already at/over the cap.
-        if cap is not None and budget["seconds"] >= cap and _is_footage_source(url):
-            C.log(f"footage cap: running total {budget['seconds'] / 3600:.2f}h ≥ cap "
-                  f"{cap / 3600:.1f}h — skipping remaining footage source: {url}")
-            continue
+
+    def _capped():
+        return cap is not None and budget["seconds"] >= cap
+
+    def _download_one(url):
+        """Reuse-or-download a SINGLE source (video/folder/file), account footage, collect
+        results. Per-source failure is recoverable (skip + record), never fatal."""
         safe = looks_safe_margin(url)
         reused = _reuse_if_unchanged(url, prior_by_source)
         if reused is not None:
             C.log(f"unchanged — skipping re-download: {url} ({len(reused)} file(s) present)")
             resources.extend(reused)
             _account_footage(budget, reused, url, cap)
-            continue
+            return
         try:
             entries = DL.download_source(url, cookies_from_browser=cookies,
                                          max_source_height=max_source_height,
@@ -419,12 +426,51 @@ def download_links(links, cookies, downloaded, max_source_height=720, original=F
         except DL.DownloadError as e:
             C.warn(f"optional source failed — skipping and continuing: {url} — {e}")
             failures.append({"source": url, "error": str(e)})
-            continue
+            return
         added = [{"path": e["path"], "kind": e["kind"], "source": url,
                   "safe_margin": bool(safe) if e["kind"] == "footage" else False}
                  for e in entries]
         resources.extend(added)
         _account_footage(budget, added, url, cap)
+
+    for url in links:
+        if url in downloaded:
+            continue
+        downloaded.add(url)
+        # YOUTUBE CHANNEL/PLAYLIST → expand to recent VODs and download each individually.
+        if DL.is_youtube_channel(url):
+            if _capped():
+                C.log(f"footage cap reached — not expanding channel: {url}")
+                continue
+            try:
+                vids = DL.list_channel_videos(url, limit=CHANNEL_MAX_VIDEOS,
+                                              cookies_from_browser=cookies)
+            except DL.DownloadError as e:
+                C.warn(f"channel could not be listed — skipping and continuing: {url} — {e}")
+                failures.append({"source": url, "error": str(e)})
+                continue
+            if not vids:
+                C.warn(f"channel resolved but no videos found — skipping: {url}")
+                failures.append({"source": url, "error": "no videos found in channel/playlist"})
+                continue
+            C.log(f"channel {url}: {len(vids)} recent video(s) found — downloading newest-first "
+                  f"up to the footage cap.")
+            for v in vids:
+                if v in downloaded:
+                    continue
+                downloaded.add(v)
+                if _capped():
+                    C.log(f"footage cap: running total {budget['seconds'] / 3600:.2f}h ≥ cap "
+                          f"{cap / 3600:.1f}h — stopping channel {url} (budget filled).")
+                    break
+                _download_one(v)
+            continue
+        # FOOTAGE CAP: don't START a new footage source once we're already at/over the cap.
+        if _capped() and _is_footage_source(url):
+            C.log(f"footage cap: running total {budget['seconds'] / 3600:.2f}h ≥ cap "
+                  f"{cap / 3600:.1f}h — skipping remaining footage source: {url}")
+            continue
+        _download_one(url)
     return resources, failures
 
 

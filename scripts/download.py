@@ -74,6 +74,76 @@ def is_drive_file(url):
     return "/file/d/" in low or "id=" in low
 
 
+def is_youtube_channel(url):
+    """A YouTube CHANNEL / uploads-tab / playlist link — NOT a single video. These must be
+    expanded to individual VOD URLs (grab recent ones), never handed to yt-dlp whole (which
+    would try to pull the entire channel). A specific video (watch?v=/youtu.be//shorts//live)
+    is NOT a channel."""
+    low = url.lower()
+    if "youtube.com" not in low and "youtu.be" not in low:
+        return False
+    if ("watch?v=" in low or "youtu.be/" in low or "/shorts/" in low
+            or "/live/" in low or "/embed/" in low):
+        return False
+    stripped = low.rstrip("/")
+    return ("/@" in low or "/channel/" in low or "/user/" in low or "/c/" in low
+            or "list=" in low
+            or stripped.endswith(("/videos", "/streams", "/featured", "youtube.com")))
+
+
+def _channel_videos_url(url):
+    """Point a bare channel link at its VIDEOS tab so we list uploaded VODs newest-first
+    (a bare handle otherwise resolves to multiple tabs: Videos/Shorts/Live)."""
+    low = url.lower().rstrip("/")
+    if "list=" in low or low.endswith(("/videos", "/streams", "/shorts", "/featured")):
+        return url
+    return url.rstrip("/") + "/videos"
+
+
+def _flat_entry_url(entry):
+    """Best watch-URL for a flat-extracted playlist entry."""
+    u = entry.get("url") or ""
+    if u.startswith("http"):
+        return u
+    vid = entry.get("id") or u
+    return f"https://www.youtube.com/watch?v={vid}" if vid else None
+
+
+def list_channel_videos(url, limit=40, cookies_from_browser=None):
+    """Recent VOD watch-URLs for a YouTube channel/playlist, newest-first (flat, download-free).
+    Returns [] if none. Raises DownloadError only if the channel itself can't be listed — one
+    bad video never blocks the rest (they're downloaded individually with per-video skip)."""
+    try:
+        from yt_dlp import YoutubeDL
+    except ImportError:
+        raise DownloadError("yt-dlp not installed (pip install -r requirements.txt)")
+    opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist",
+            "playlistend": int(limit), "skip_download": True}
+    if cookies_from_browser:
+        opts["cookiesfrombrowser"] = (cookies_from_browser,)
+    _apply_cookies(opts)      # cookies.txt auth for the channel listing too (keep cookies working)
+    target = _channel_videos_url(url)
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(target, download=False)
+    except Exception as e:
+        raise DownloadError(f"could not list channel videos for {url}: {e}")
+    urls = []
+    for e in (info.get("entries") or []):
+        if not e:
+            continue
+        # A channel page can nest one level (tabs -> a videos playlist); flatten it.
+        if e.get("_type") == "playlist" and e.get("entries"):
+            for sub in e["entries"]:
+                if sub and _flat_entry_url(sub):
+                    urls.append(_flat_entry_url(sub))
+        else:
+            u = _flat_entry_url(e)
+            if u:
+                urls.append(u)
+    return list(dict.fromkeys(urls))[:int(limit)]
+
+
 def _human_size(n):
     if not n:
         return "unknown size"
@@ -225,7 +295,14 @@ def _fetch_ytdlp(url, staging, cookies_from_browser=None, format_id=None,
             "logger": logger,
             # Keep yt-dlp scratch + cache inside the project (see _ytdlp_workdir).
             "paths": {"temp": str(workdir / "temp")},
-            "cachedir": str(workdir / "cache")}
+            "cachedir": str(workdir / "cache"),
+            # FRAGMENT RESILIENCE: a couple of missing/aborted fragments (common on long
+            # YouTube VOD/HLS pulls) must NOT kill an otherwise-complete download. Retry hard,
+            # then skip the few that never arrive — a 98%-downloadable video still succeeds.
+            "retries": 10,
+            "fragment_retries": 10,
+            "skip_unavailable_fragments": True,
+            "continuedl": True}
     if merge_output_format:
         # Explicit container + force ffmpeg as the merger so DASH video+audio muxes
         # deterministically instead of guessing an extension.
@@ -454,12 +531,13 @@ def download_source(url, cookies_from_browser=None, max_source_height=720, origi
                                     original=original,
                                     cookies_from_browser=cookies_from_browser)
         else:
-            # VOD (YouTube/Kick/Twitch) / direct http: cap the format at max_source_height so
-            # yt-dlp never pulls 4K (its default 'best' does). Prefer best video+audio at or
-            # below the cap, then a combined stream at the cap; final '/b' is a last resort for
-            # a rare source with no stream <= the cap (the cut stage downscales anyway).
+            # VOD (YouTube/Kick/Twitch) / direct http. Prefer <= max_source_height so yt-dlp never
+            # pulls 4K, but FALL BACK GRACEFULLY — never hard-fail just because the exact muxed
+            # <=720 combo is missing. Ladder: (1) best video<=h + best audio (ffmpeg-muxed),
+            # (2) best pre-muxed stream <=h, (3) best video + best audio at ANY height (muxed),
+            # (4) absolute best. The cut stage downscales anyway, so a >720 fallback is fine.
             h = int(max_source_height or 720)
-            fmt = f"bv*[height<={h}]+ba/b[height<={h}]/wv*+ba/b"
+            fmt = f"bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
             raw = _fetch_ytdlp(url, staging, cookies_from_browser=cookies_from_browser,
                                format_id=fmt)
 
