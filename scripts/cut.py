@@ -54,8 +54,10 @@ DEFAULT_STYLE_SET = {
     "name": "flzsh_default",
     # Curated accent palette (RGB hex; converted to ASS &HBBGGRR at use). Punchy, high-contrast,
     # video-readable against the black outline/plate — no low-contrast or muddy colors.
-    "accent_palette": ["FFFF00", "00E5FF", "39FF14", "FF2D95", "FF8C00"],
-    #                   yellow    cyan      lime      hot-pink  orange
+    "accent_palette": ["FFFF00", "00BFFF", "39FF14", "FF2D95", "FF8C00"],
+    #                   yellow    sky-blue  lime      hot-pink  orange
+    # (was bright cyan 00E5FF — too washy on light footage; deep-sky-blue 00BFFF is punchier
+    #  and holds contrast against a light background even with the outline behind it.)
     # Active-word emphasis: "color" = accent FILL (current look); "box" = accent HIGHLIGHT behind
     # the word (a THIN accent border/halo reads as a clean highlight around it — not a heavy box).
     "emphasis_modes": ["color", "box"],
@@ -125,7 +127,7 @@ OUTPUT_FPS = 30               # cut output is normalized to this CFR (FIX 3: kil
 # comparable across quiet vs loud VODs). A large range = a standout spike worth teasing; a small
 # range = flat-high sustained energy, which we play straight. Tunable via config.
 COLDOPEN_PEAK_RANGE_MIN = 3.0   # min z-range (σ above baseline) to treat a peak as "sharp"
-COLDOPEN_MIN_SEPARATION = 5.0   # min OUTPUT seconds between the teaser and the payoff's natural
+COLDOPEN_MIN_SEPARATION = 8.0   # min OUTPUT seconds between the teaser and the payoff's natural
                                 # arrival in the body (FIX 2) — else it reads as an instant repeat
 LOUDNORM = "loudnorm=I=-14:TP=-1.5:LRA=11"   # per-clip audio normalization (social target)
 
@@ -782,13 +784,17 @@ def _ass_header(cfg, top_y):
     box_w = int(cfg.get("subtitle_box_w", SUBTITLE_BOX_W))
     font = str(cfg.get("subtitle_font_name", "Arial"))
     fontsize = int(cfg.get("subtitle_ass_fontsize", 54))
-    outline = int(cfg.get("subtitle_outline", cfg.get("caption_outline_width", 3)) or 0)
-    shadow = int(cfg.get("subtitle_shadow", 1))
+    # Readability: karaoke sits over unpredictable footage (bright/light backgrounds wash out
+    # a colored word). A THICK black outline + a defined dark drop shadow keep every word legible
+    # on ANY background, whatever the per-clip accent colour is. Both are tunable via config.
+    outline = int(cfg.get("subtitle_outline", cfg.get("caption_outline_width", 4)) or 0)
+    shadow = int(cfg.get("subtitle_shadow", 2))
     side = max(0, (W - box_w) // 2)                  # keep text inside the safe box (x)
     # Alignment 8 = TOP-center: MarginV is the gap from the FRAME TOP down to the text top, so
     # the line starts at `top_y` (just under the footage) and any 2nd line grows DOWN into the
     # band — it can never ride UP onto the footage. PrimaryColour white, OutlineColour black,
-    # semi-opaque shadow. &HAABBGGRR (AA=00 opaque).
+    # near-opaque black shadow (BackColour &H20…, AA=20 ≈ 87% opaque) so the text reads on light
+    # footage regardless of accent colour. &HAABBGGRR (AA=00 opaque).
     margin_v = max(0, int(top_y))
     return (
         "[Script Info]\n"
@@ -801,7 +807,7 @@ def _ass_header(cfg, top_y):
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
         "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Sub,{font},{fontsize},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,"
+        f"Style: Sub,{font},{fontsize},&H00FFFFFF,&H000000FF,&H00000000,&H20000000,"
         f"-1,0,0,0,100,100,0,0,1,{outline},{shadow},8,{side},{side},{margin_v},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -942,6 +948,14 @@ def clip_bounds(m, duration, cmin, cmax, pre=20.0, post=15.0):
         s, e = s - pad, e + pad
     s = max(0.0, s)
     e = min(duration, e)
+    # If clamping to a source EDGE shrank the window below cmin, recover from the OTHER side so a
+    # moment near the start/end of a long VOD still gets a full-length window. Genuinely short
+    # sources can't be recovered here and fall through to the content-length gate in run().
+    if e - s < cmin:
+        if s <= 0.0:
+            e = min(duration, s + cmin)
+        elif e >= duration:
+            s = max(0.0, e - cmin)
     if e - s < 1.0:
         e = min(duration, s + max(cmin, 3))
     return round(s, 2), round(e, 2)
@@ -1411,7 +1425,7 @@ def run(state):
               f"{len(clips)} unique clip(s) to render.")
 
     manifest = []
-    for rank, (c, start, end) in enumerate(clips, 1):
+    for (c, start, end) in clips:
         # final rules gate (defensive — the gauntlet already filtered)
         for field in ("caption", "tiktok_caption", "shorts_title"):
             from captions import banned_hit
@@ -1433,6 +1447,19 @@ def run(state):
         C.log(f"cold-open [{c['moment_id']}]: {reason}")
         segments = ([cold_rel] if cold_open else []) + keeps
         segments = cap_segments(segments, cmax)      # total playtime <= clip_max_seconds
+
+        # MIN-LENGTH GATE (1c): require >= clip_min_seconds of ACTUAL content, EXCLUDING the
+        # cold-open teaser. dead-air trims and source-edge clamping can shrink a nominal window
+        # well below the minimum; a ~4-6s stub is not postable, so DROP the moment rather than
+        # ship it. This is where clip_min_seconds is truly enforced (clip_bounds only sizes the
+        # window; the played content after trimming is what actually matters).
+        teaser_dur = (segments[0][1] - segments[0][0]) if cold_open else 0.0
+        body_content = sum(b - a for a, b in segments) - teaser_dur
+        if body_content + 1e-6 < cmin:
+            C.log(f"drop [{c['moment_id']}]: only {body_content:.1f}s of content after dead-air "
+                  f"trim (< {cmin:g}s minimum) — skipping stub clip.")
+            continue
+        rank = len(manifest) + 1          # contiguous output rank (drops leave no numbering gaps)
 
         score_i = int(round(c.get("score") or 0))
         name = f"{rank:02d}_{score_i:03d}_{slugify(c['caption'])}.mp4"

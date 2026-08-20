@@ -76,8 +76,10 @@ DEFAULT_CONFIG = {
     "coldopen_peak_range_min": 3.0,  # min "triangle range" (σ of window peak above its median,
                                    # in the source's own RMS std units) to treat a peak as sharp;
                                    # below this the clip is flat-high and plays straight
-    "coldopen_min_separation": 5.0,  # min OUTPUT seconds between the teaser and the payoff's
-                                   # natural arrival in the body — else it reads as an instant repeat
+    "coldopen_min_separation": 8.0,  # min OUTPUT seconds between the teaser and the payoff's
+                                   # natural arrival in the body — else it reads as an instant repeat.
+                                   # If a clip's peak is too early to leave an 8s gap, plan_cold_open
+                                   # rejects it and the clip plays as a straight cut.
     "output_fps": 30,              # cut renders at this constant frame rate (CFR) — fixes the
                                    # VFR concat-seam stutter on cold-open→setup transitions
     "emoji_in_caption": True,      # flzsh DNA: keep emoji as caption punctuation
