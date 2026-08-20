@@ -363,19 +363,54 @@ def _reuse_if_unchanged(url, prior_by_source):
     return reused
 
 
+def _is_footage_source(url):
+    """True if this link will produce VIDEO footage (and is therefore subject to the footage
+    cap). Google Docs/Sheets and other non-video links are never capped."""
+    if not DL.is_url(url):
+        return os.path.splitext(url)[1].lower() in DL.VIDEO_EXTS
+    if AN.classify_url(url) in ("vod", "drive_folder") or DL.is_drive_file(url):
+        return True
+    # bare http(s) link straight to a video file
+    return os.path.splitext(url.split("?", 1)[0])[1].lower() in DL.VIDEO_EXTS
+
+
+def _footage_seconds(entries):
+    """Total playable footage seconds across `entries` (ffprobe each footage file)."""
+    total = 0.0
+    for e in entries:
+        if e.get("kind") == "footage":
+            try:
+                total += float(C.ffprobe_duration(C.ROOT / e["path"]) or 0.0)
+            except Exception:
+                pass
+    return total
+
+
 def download_links(links, cookies, downloaded, max_source_height=720, original=False,
-                   prior_by_source=None):
+                   prior_by_source=None, budget=None):
+    """Download each source, routing files by type. When `budget` is given
+    ({"seconds": <float>, "cap": <seconds or None>}) footage is capped VOD-by-VOD: sources are
+    downloaded one at a time while the running total is tracked, and once the total reaches the
+    cap NO further footage source is STARTED (the source that crosses the line is fully kept —
+    we only stop before starting a new one). Non-footage links are never capped."""
     prior_by_source = prior_by_source or {}
     resources, failures = [], []
+    cap = (budget or {}).get("cap")
     for url in links:
         if url in downloaded:
             continue
         downloaded.add(url)
+        # FOOTAGE CAP: don't START a new footage source once we're already at/over the cap.
+        if cap is not None and budget["seconds"] >= cap and _is_footage_source(url):
+            C.log(f"footage cap: running total {budget['seconds'] / 3600:.2f}h ≥ cap "
+                  f"{cap / 3600:.1f}h — skipping remaining footage source: {url}")
+            continue
         safe = looks_safe_margin(url)
         reused = _reuse_if_unchanged(url, prior_by_source)
         if reused is not None:
             C.log(f"unchanged — skipping re-download: {url} ({len(reused)} file(s) present)")
             resources.extend(reused)
+            _account_footage(budget, reused, url, cap)
             continue
         try:
             entries = DL.download_source(url, cookies_from_browser=cookies,
@@ -385,10 +420,25 @@ def download_links(links, cookies, downloaded, max_source_height=720, original=F
             C.warn(f"optional source failed — skipping and continuing: {url} — {e}")
             failures.append({"source": url, "error": str(e)})
             continue
-        for e in entries:
-            resources.append({"path": e["path"], "kind": e["kind"], "source": url,
-                              "safe_margin": bool(safe) if e["kind"] == "footage" else False})
+        added = [{"path": e["path"], "kind": e["kind"], "source": url,
+                  "safe_margin": bool(safe) if e["kind"] == "footage" else False}
+                 for e in entries]
+        resources.extend(added)
+        _account_footage(budget, added, url, cap)
     return resources, failures
+
+
+def _account_footage(budget, entries, url, cap):
+    """Add this source's footage duration to the running budget and log the running total."""
+    if budget is None:
+        return
+    added = _footage_seconds(entries)
+    if added <= 0:
+        return
+    budget["seconds"] += added
+    tail = f" / cap {cap / 3600:.1f}h" if cap else ""
+    C.log(f"footage: +{added / 3600:.2f}h from {url} → running total "
+          f"{budget['seconds'] / 3600:.2f}h{tail}")
 
 
 # --- outputs -------------------------------------------------------------------
@@ -567,6 +617,9 @@ def main():
                     help="cap for Drive transcoded preview streams in px (default 720)")
     ap.add_argument("--original", action="store_true",
                     help="force raw original Drive files instead of preview streams")
+    ap.add_argument("--footage-cap-hours", type=float, default=None,
+                    help="stop downloading more footage once cumulative duration reaches this "
+                         "many hours, VOD-by-VOD (default: config footage_cap_hours or 10)")
     args = ap.parse_args()
     if args.from_pick or args.pick_json:
         apply_pick(args)
@@ -585,12 +638,20 @@ def main():
     for d in prior.get("downloads", []):
         prior_by_source.setdefault(d.get("source"), []).append(d)
 
+    # FOOTAGE CAP (VOD-by-VOD): resolve hours from CLI > state config > default 10, and thread a
+    # shared budget through both download passes so the running total spans pass 1 + recursion.
+    cfg_cap = (C.load_json(C.STATE_PATH, default={}) or {}).get("config", {}).get("footage_cap_hours")
+    cap_hours = args.footage_cap_hours if args.footage_cap_hours is not None else float(cfg_cap or 10)
+    budget = {"seconds": 0.0, "cap": (cap_hours * 3600.0 if cap_hours and cap_hours > 0 else None)}
+    if budget["cap"]:
+        C.log(f"footage cap: downloading VODs one at a time up to ~{cap_hours:g}h cumulative.")
+
     # Pass 1: download the given links, then read/probe each.
     C.log(f"downloading {len(links)} source(s)…")
     resources, failures = download_links(links, args.cookies_from_browser, downloaded,
                                          max_source_height=args.max_source_height,
                                          original=args.original,
-                                         prior_by_source=prior_by_source)
+                                         prior_by_source=prior_by_source, budget=budget)
     corpus_parts = [brief]
     for r in resources:
         t = process_resource(r)
@@ -611,7 +672,7 @@ def main():
         r2, f2 = download_links(media, args.cookies_from_browser, downloaded,
                                 max_source_height=args.max_source_height,
                                 original=args.original,
-                                prior_by_source=prior_by_source)
+                                prior_by_source=prior_by_source, budget=budget)
         failures += f2
         for r in r2:
             t = process_resource(r)

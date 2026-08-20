@@ -27,6 +27,10 @@ import cut as cut_stage
 # ---- CONFIG (defaults; all tunable per run via flags) ----
 DEFAULT_CONFIG = {
     "clips_per_batch": 25,          # legacy soft target; real limiters are the two below
+    # Intake footage cap: download VODs one at a time and stop starting new ones once the
+    # cumulative footage duration reaches this many hours (the crossing VOD is kept in full).
+    # Bounds transcription/index time on 12h+ campaigns. Consumed by intake.py.
+    "footage_cap_hours": 10,
     # Highlight selection (select stage). We take the genuinely-good peaks, not a fixed
     # count: select_min_quality is the 0-100 Groq bar a moment must clear to ship, and
     # select_hard_cap is the SAFETY CEILING on clips per run (each clip = one caption Groq

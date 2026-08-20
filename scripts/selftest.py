@@ -116,9 +116,12 @@ def make_synth_video(path):
         "ffmpeg", "-y", "-v", "error",
         "-f", "lavfi", "-i", "testsrc=size=1280x720:rate=30:duration=60",
         "-f", "lavfi", "-i", "sine=frequency=220:duration=60",
+        # Base tone kept clearly ABOVE the dead-air silence threshold (-30dB) so a realistic
+        # >=15s of continuous "content" survives the dead-air trim (mirrors real talking footage);
+        # three louder bursts still stand out as audio spikes for offline select / cold-open.
         "-filter_complex",
-        "[1:a]volume=0.1,volume=enable='between(t,10,11)+between(t,25,26)+"
-        "between(t,40,41)':volume=20[a]",
+        "[1:a]volume=0.35,volume=enable='between(t,10,11)+between(t,25,26)+"
+        "between(t,40,41)':volume=6[a]",
         "-map", "0:v", "-map", "[a]", "-t", "60",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(path),
     ])
