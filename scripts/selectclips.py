@@ -35,6 +35,11 @@ MIN_LIVE_SCORE = 1       # drop the model's flat-0 "dead" picks (countdown/hype/
 #     select_min_quality) — see run.py DEFAULT_CONFIG.
 DEFAULT_HARD_CAP = 50
 DEFAULT_GOOD_SCORE = 60
+# LOW dead-floor (0-100). The score is LLM-judged from the TRANSCRIPT ONLY — it can't see the
+# video, so it undersells visually-funny content; the floor is therefore forgiving. If even the
+# BEST moment scores below this, the campaign is genuinely dead (flat/dead even in text) and we
+# STOP + signal auto-advance. A best >= floor SHIPS for human review (we do NOT require 60).
+DEFAULT_DEAD_FLOOR = 40
 # Groq free tier is 6000 tokens/min AND 30 req/min. 97 moments in one call was
 # ~8.7k tokens -> 413 "Request too large". Batch the index into small chunks
 # (~15-20 moments ≈ under 5k tokens each), score each, then combine + rank.
@@ -269,7 +274,7 @@ def _score_batch(client, campaign, knowledge, batch, n):
     return arr
 
 
-def _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap):
+def _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap, dead_floor):
     # Candidate pool = top by audio INTENSITY (the original approach that surfaced the
     # batch-#1 keepers — loud crashes/fights/finishes). The fixed filler-kill + Groq's
     # dead-score drop remove the countdown/hype that used to slip through; action words
@@ -326,21 +331,34 @@ def _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap):
 
     alive.sort(key=lambda x: x["score"], reverse=True)
 
+    # DEAD-FLOOR (Change 2): the score is text-blind, so the floor is LOW/forgiving. Only when
+    # even the BEST moment can't clear it is the campaign genuinely dead — STOP cleanly and signal
+    # auto-advance (NothingUsable) so the pipeline rolls to the next ranked campaign. A best at or
+    # above the floor SHIPS for human review (we do NOT require the 60 highlight bar — 40+ ships).
+    best = alive[0]["score"]
+    if best < dead_floor:
+        raise C.NothingUsable(
+            f"select: best moment {best:.0f} < dead-floor {dead_floor:.0f} — campaign has no "
+            f"usable moments, advancing to the next ranked campaign.")
+    C.log(f"select: best {best:.0f} >= dead-floor {dead_floor:.0f} — proceeding.")
+
     # HIGHLIGHT BAR + SAFETY CEILING. Prefer only the genuinely-good peaks (score >=
     # min_quality) and take AS MANY as clear it, up to hard_cap — we do NOT pad to a target
     # count. If a stream has 6 real highlights we ship 6; if it has 60 we still stop at the
-    # ceiling so downstream caption Groq calls can't run away. When NOTHING clears the bar
-    # (a flat stream) we don't fail — we ship the best available, but capped conservatively.
+    # ceiling so downstream caption Groq calls can't run away. When NOTHING clears the 60 bar we
+    # don't fail (best already cleared the dead-floor) — we ship the best available AT OR ABOVE
+    # the dead-floor for human review, capped conservatively.
     good = [m for m in alive if m["score"] >= min_quality]
     if good:
         pool, cap = good, hard_cap
         C.log(f"select: {len(good)} moment(s) cleared the highlight bar "
               f"(score >= {min_quality:g}); taking up to the {hard_cap} ceiling, no padding.")
     else:
-        pool = alive
+        pool = [m for m in alive if m["score"] >= dead_floor]
         cap = max(1, min(hard_cap, n))
         C.warn(f"select: no moment cleared the highlight bar (score >= {min_quality:g}) — this "
-               f"stream has no standout peaks. Shipping the {cap} best available instead.")
+               f"stream has no standout peaks. Shipping the {min(cap, len(pool))} best "
+               f"moment(s) >= dead-floor {dead_floor:g} for review.")
 
     picked, used = [], []
     for m in pool:
@@ -363,6 +381,7 @@ def run(state):
     # Highlight bar + safety ceiling (Task D): the real limiters on how many clips ship.
     hard_cap = int(cfg.get("select_hard_cap", DEFAULT_HARD_CAP))
     min_quality = float(cfg.get("select_min_quality", DEFAULT_GOOD_SCORE))
+    dead_floor = float(cfg.get("select_dead_floor", DEFAULT_DEAD_FLOOR))
     # merge_gap was 15s, which chained non-stop commentary into 400-550s blobs. Tight
     # gap (~7s) + a hard span cap keep a merged moment one real beat.
     merge_gap = float(cfg.get("merge_gap_seconds", 7))
@@ -393,7 +412,8 @@ def run(state):
         selected = _heuristic_scores(moments, min(n, hard_cap), min_sep)
     else:
         C.log(f"select: LLM provider = {client.status()}")
-        selected = _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap)
+        selected = _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap,
+                                dead_floor)
 
     if not selected:
         raise C.NothingUsable(

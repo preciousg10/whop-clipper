@@ -37,6 +37,9 @@ DEFAULT_CONFIG = {
     # call downstream, so this stops a runaway from burning the free tier overnight).
     "select_hard_cap": 50,
     "select_min_quality": 60,
+    # LOW dead-floor: if even the BEST moment scores below this, the campaign is genuinely dead
+    # (the score is text-blind, so keep this forgiving) → stop + auto-advance. 40+ ships.
+    "select_dead_floor": 40,
     # LLM failover chain order (Unit: never dead-end on one provider's daily cap). All free-tier;
     # keys come ONLY from env (GROQ_API_KEY / GEMINI_API_KEY / CEREBRAS_API_KEY). Drop a name to
     # disable it, or reorder. A provider with a missing key/library is skipped automatically.
