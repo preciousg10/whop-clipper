@@ -367,6 +367,65 @@ def _label_sound_beats(client, context, beats):
     return out
 
 
+# --- LLM-chosen cold-open moment (tease by CONTENT, not loudness) --------------
+# cut.py normally anchors the cold-open teaser on the loudest audio second. But the best tease is
+# often the most SUSPENSEFUL / craziest thing SAID, which can be spoken calmly (low audio energy)
+# and get missed — e.g. "we're gonna open up the box" builds curiosity but isn't loud. Here, where
+# the LLM already reads the transcript, we also ask it for the single most hook-worthy LINE in the
+# clip and store its timestamp; cut.py teases THAT instant (falling back to the audio peak when we
+# can't get a usable one). This adds one small Groq call per clip that actually has dialogue.
+HOOK_MOMENT_MAX_LINES = 40    # cap transcript lines sent (token budget)
+
+
+def _clip_transcript_lines(tr_segs, start, end):
+    """Timestamped transcript lines overlapping the clip window [start, end] (source-absolute),
+    for the cold-open hook-moment pick. Deduped/ordered by time, capped for the token budget."""
+    out = []
+    for s in tr_segs:
+        txt = (s.get("text") or "").strip()
+        if not txt:
+            continue
+        st, en = float(s.get("start", 0)), float(s.get("end", 0))
+        if en >= start and st <= end:
+            out.append({"t": round(st, 2), "text": txt})
+    out.sort(key=lambda x: x["t"])
+    return out[:HOOK_MOMENT_MAX_LINES]
+
+
+def _pick_hook_moment(client, lines, campaign):
+    """Ask the LLM which transcribed line best works as a COLD-OPEN tease — the single most
+    suspenseful / curiosity-baiting / shocking instant to flash BEFORE the clip plays in order.
+    Returns its source-absolute timestamp (float) or None. Returns None on none/parse failure so
+    cut.py falls back to the audio peak — never a guess."""
+    if not client or len(lines) < 2:
+        return None
+    payload = [{"i": i, "t": ln["t"], "text": ln["text"]} for i, ln in enumerate(lines)]
+    system = (
+        "You pick the single most HOOK-WORTHY instant in a short clip to use as a COLD-OPEN "
+        "tease — the line that, flashed BEFORE the clip plays in order, creates the most "
+        "suspense, curiosity, or shock and makes a viewer NEED to keep watching. It is NOT "
+        "necessarily the loudest moment: a CALM line that builds suspense ('wait, what is "
+        "that', 'we're about to open the box', 'no way he just said that') is often the best "
+        "tease. Pick the line whose first couple seconds would STOP a scroll. Do NOT pick the "
+        "actual payoff/punchline (that spoils it) — pick the SETUP that makes the payoff feel "
+        'mandatory. Return ONLY JSON: {"i": <index of the chosen line>}, or {"i": null} if no '
+        "line clearly stands out. No prose.")
+    user = (f"Campaign: {campaign}\nAudience: {C.AUDIENCE_CONTEXT}\n"
+            f"Transcript lines (index, time in seconds, text):\n{json.dumps(payload)}")
+    raw = C.llm_chat(client, system, user, temperature=0.3, max_tokens=60)
+    mm = re.search(r"\{.*\}", raw, re.S)
+    if not mm:
+        return None
+    try:
+        i = json.loads(mm.group(0)).get("i")
+        i = int(i)
+    except (Exception, TypeError, ValueError):
+        return None
+    if 0 <= i < len(lines):
+        return float(lines[i]["t"])
+    return None
+
+
 def _groq_candidates(client, campaign, moment, style_notes, event="", emoji_in_caption=True):
     event = (event or moment.get("text") or "").strip()
     emoji_rule = (
@@ -619,10 +678,36 @@ def run(state):
             if sound_fx:
                 C.log(f"captions: labeled {len(sound_fx)} non-speech beat(s) for {m['id']}: "
                       f"{[fx['label'] for fx in sound_fx]}")
+        # COLD-OPEN HOOK MOMENT (tease by CONTENT): let the LLM pick the most suspenseful/
+        # crazy LINE in the clip so cut.py teases THAT instant instead of the loudest second.
+        # Only for clips with real dialogue; cut.py falls back to the audio peak otherwise.
+        hook_moment = None
+        if client is not None:
+            # Restrict the LLM's choices to lines that will actually SHIP in the clip: mirror
+            # cut.clip_bounds (expand by story pre/post, and when the beat exceeds clip_max center
+            # the window on the peak). A line outside the shipped window can't be teased — cut.py
+            # revalidates and falls back to the audio peak, but matching the window here keeps the
+            # LLM pick usable instead of wasting it on a line that gets trimmed away.
+            ws = float(m["start"]) - float(cfg.get("story_pre_seconds", 4))
+            we = float(m["end"]) + float(cfg.get("story_post_seconds", 4))
+            cmax = float(cfg.get("clip_max_seconds", 45))
+            if we - ws > cmax:
+                pk = m.get("peak")
+                try:
+                    center = float(pk) if pk is not None else (float(m["start"]) + float(m["end"])) / 2.0
+                except (TypeError, ValueError):
+                    center = (float(m["start"]) + float(m["end"])) / 2.0
+                ws, we = center - cmax / 2.0, center + cmax / 2.0
+            hook_lines = _clip_transcript_lines(tr_by_source.get(m["source"], []), ws, we)
+            hook_moment = _pick_hook_moment(client, hook_lines, campaign)
+            if hook_moment is not None:
+                C.log(f"captions: cold-open hook moment for {m['id']} @ {hook_moment:.1f}s "
+                      f"(LLM-chosen from {len(hook_lines)} line(s)).")
         clips.append({
             "moment_id": m["id"], "source": m["source"],
             "start": m["start"], "end": m["end"], "type": m["type"],
-            "peak": m.get("peak"),                # cold-open anchor for the cut stage
+            "peak": m.get("peak"),                # audio-peak cold-open anchor (fallback)
+            "hook_moment": hook_moment,           # LLM-chosen cold-open tease instant (preferred)
             "score": m.get("score"), "reason": m.get("reason"),
             "candidates": cands, "killed": killed,
             "caption": best, "variant": variant, "sound_fx": sound_fx,

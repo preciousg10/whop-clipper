@@ -188,14 +188,17 @@ def coldopen_body_gap(true_peak, start, segments):
     return None
 
 
-def plan_cold_open(src_path, source, start, end, keeps, cmax, cfg):
+def plan_cold_open(src_path, source, start, end, keeps, cmax, cfg, hook_moment=None):
     """Decide whether THIS clip gets a cold-open, and where the teaser is (FIX 1/2/4).
     Returns (cold_rel | None, reason_string). cold_rel is the clip-relative (a,b) teaser span.
 
-    The gate, in order: (1) needs a genuine SINGLE SHARP peak — window z-range >= threshold,
-    else it's flat-high and plays straight; (2) the true peak must sit inside the clip, not at an
-    edge; (3) a clean >=1.5s teaser window must carve out; (4) on the FINAL edit the payoff must
-    arrive with real separation after the teaser, else it reads as an instant repeat."""
+    WHETHER to cold-open still comes from the audio SHAPE: (1) needs a genuine SINGLE SHARP peak
+    — window z-range >= threshold, else it's flat-high and plays straight. WHICH instant to tease
+    is chosen by CONTENT: `hook_moment` (the LLM-picked most suspenseful/craziest LINE, from the
+    caption stage) is preferred as the teaser anchor, falling back to the audio peak when it's
+    absent or sits at a clip edge — the loudest second is often NOT the best tease. Then (2) the
+    anchor must sit inside the clip, not at an edge; (3) a clean >=1.5s teaser window must carve
+    out; (4) on the FINAL edit the payoff must arrive with real separation after the teaser."""
     range_min = float(cfg.get("coldopen_peak_range_min", COLDOPEN_PEAK_RANGE_MIN))
     cold_min_sep = float(cfg.get("coldopen_min_separation", COLDOPEN_MIN_SEPARATION))
     rms, gstd = _rms_stats(source)
@@ -205,19 +208,32 @@ def plan_cold_open(src_path, source, start, end, keeps, cmax, cfg):
     true_peak, z_range = shape
     if z_range < range_min:
         return None, f"flat-high (range {z_range:.1f}σ < {range_min:g}σ) → straight cut"
-    if (true_peak - start) < COLD_OPEN_MIN_SETUP or (end - true_peak) < COLD_OPEN_MIN_PAYOFF:
+    # WHICH instant to tease: prefer the LLM's hook line when it lands inside the clip window and
+    # leaves setup+payoff room; else the audio peak. (The whether-gate above is unchanged.)
+    def _edge_ok(t):
+        return (t - start) >= COLD_OPEN_MIN_SETUP and (end - t) >= COLD_OPEN_MIN_PAYOFF
+    anchor, anchor_src = true_peak, "audio peak"
+    if hook_moment is not None:
+        try:
+            hm = float(hook_moment)
+        except (TypeError, ValueError):
+            hm = None
+        if hm is not None and start <= hm <= end and _edge_ok(hm):
+            anchor, anchor_src = hm, "LLM hook line"
+    if not _edge_ok(anchor):
         return None, f"sharp peak (range {z_range:.1f}σ) but sits at the clip edge → straight cut"
-    cand = cold_open_window(src_path, true_peak, start, end)
+    cand = cold_open_window(src_path, anchor, start, end)
     if cand is None:
         return None, f"sharp peak (range {z_range:.1f}σ) but no clean teaser window → straight cut"
     trial = cap_segments([cand] + keeps, cmax)          # measure separation on the FINAL edit
-    gap = coldopen_body_gap(true_peak, start, trial)
+    gap = coldopen_body_gap(anchor, start, trial)
     if gap is None:
-        return None, f"sharp peak (range {z_range:.1f}σ) but peak trimmed from body → straight cut"
+        return None, f"sharp peak (range {z_range:.1f}σ) but teased moment trimmed from body → straight cut"
     if gap < cold_min_sep:
         return None, (f"sharp peak (range {z_range:.1f}σ) but payoff replays too soon "
                       f"(+{gap:.1f}s < {cold_min_sep:g}s) → straight cut")
-    return cand, f"sharp peak (range {z_range:.1f}σ) → teasing (payoff +{gap:.1f}s later)"
+    return cand, (f"sharp peak (range {z_range:.1f}σ) → teasing {anchor_src} "
+                  f"(payoff +{gap:.1f}s later)")
 
 
 # --- fonts / caption rendering -------------------------------------------------
@@ -1442,7 +1458,8 @@ def run(state):
 
         # COLD-OPEN (FIX 1/2/4) — CONDITIONAL on a genuine single sharp peak with real payoff
         # separation; see plan_cold_open. Flat-high clips and edge/too-soon peaks play straight.
-        cold_rel, reason = plan_cold_open(src_path, c["source"], start, end, keeps, cmax, cfg)
+        cold_rel, reason = plan_cold_open(src_path, c["source"], start, end, keeps, cmax, cfg,
+                                          hook_moment=c.get("hook_moment"))
         cold_open = cold_rel is not None
         C.log(f"cold-open [{c['moment_id']}]: {reason}")
         segments = ([cold_rel] if cold_open else []) + keeps
