@@ -52,6 +52,15 @@ DEFAULT_CONFIG = {
     "gate_language": "en",
     "gate_language_min_prob": 0.6,  # min dominant-language char-share to trust the gate
     "allow_any_language": False,    # set per-run by --allow-any-language (never sticky)
+    # AUTO-ADVANCE WALK (Unit 2c). With --auto-advance, walk DOWN the ranked list — pick →
+    # intake → run; if a campaign yields nothing usable (no footage / dead / dead-floor best<40 /
+    # language gate / failed intake) advance to the NEXT ranked campaign — until clips are
+    # produced, `auto_advance_max` campaigns are tried, or the list is exhausted. Anti-throttle:
+    # each attempt hits YouTube, so SPACE the attempts out (walk_spacing_seconds), and if a
+    # YouTube bot-check/throttle is detected back off harder (walk_throttle_backoff_seconds)
+    # instead of hammering. Cookies (cookies.txt / --cookies-from-browser) stay applied throughout.
+    "walk_spacing_seconds": 20,           # gentle delay between auto-advance attempts
+    "walk_throttle_backoff_seconds": 300,  # longer back-off once a bot-check/throttle is seen
     "layout": "auto",              # vertical fill: "auto" (TRACK a single subject, else blur_fill),
                                    # "track" (force face/person-tracked 9:16 crop), "blur_fill"
                                    # (whole frame on a blurred bg), or "crop_fill" (COVER+center-crop)
@@ -296,23 +305,83 @@ def _run_stages(state, args):
             _stop_daily_cap(name)     # checkpoint already saved by the stage — resumable stop
 
 
-def _advance_to_next_campaign(excluded, n, args, reason):
-    """Re-pick the NEXT ranked clippable campaign (excluding the ones that produced nothing)
-    and run intake on it, so the auto-advance loop can run the pipeline for it. Reads the
-    current pick.json for scout locator + mode. Fails loud if there's no further campaign."""
+# --- AUTO-ADVANCE WALK ---------------------------------------------------------------
+# A campaign that yields nothing usable (no footage / dead / dead-floor / language gate / failed
+# intake) is not a dead-end under --auto-advance: we walk DOWN the ranked list until one produces
+# clips, `auto_advance_max` are tried, or the list is exhausted. YouTube is hit on every attempt,
+# so attempts are SPACED (anti-throttle) and a detected bot-check backs off harder.
+_THROTTLE_MARKERS = (
+    "sign in to confirm you're not a bot", "confirm you're not a bot", "not a bot",
+    "http error 429", "429: too many requests", "too many requests", "429 too many",
+    "temporarily blocked", "rate-limited", "rate limited", "verify you're human",
+    "unusual traffic", "this content isn't available",
+)
+
+
+def _looks_like_throttle(text):
+    """True when yt-dlp/YouTube output looks like a bot-check / rate-limit (so the walk backs off
+    instead of hammering the next request)."""
+    low = (text or "").lower()
+    return any(m in low for m in _THROTTLE_MARKERS)
+
+
+def _reason_tag(msg):
+    """Short label for a NothingUsable reason, for the overnight walk log."""
+    low = (msg or "").lower()
+    if "language" in low:
+        return "language-gate"
+    if "dead-floor" in low or "dead floor" in low:
+        return "dead-floor (best < 40)"
+    if "zero usable" in low or "no usable" in low:
+        return "no usable sources"
+    if "no footage" in low:
+        return "no footage"
+    if "no candidate moments" in low or "no moments" in low:
+        return "no moments"
+    return "nothing usable"
+
+
+def _walk_sleep(spacing, throttle_backoff, throttled):
+    """Anti-throttle pause before the next attempt. Normal gap = `spacing`; a detected bot-check
+    escalates to `throttle_backoff`. Cookies stay applied by the download/intake stages."""
+    import time
+    delay = max(0.0, float(throttle_backoff if throttled else spacing))
+    if delay <= 0:
+        return
+    if throttled:
+        C.warn(f"  anti-throttle: a YouTube bot-check/throttle was detected — backing off "
+               f"{delay:.0f}s before the next attempt (cookies still applied).")
+    else:
+        C.log(f"  spacing {delay:.0f}s before the next campaign (gentle on YouTube)…")
+    time.sleep(delay)
+
+
+def _tee(cmd):
+    """Run a subprocess, STREAM its output live (so the overnight log shows the whole walk) AND
+    capture it, so the text can be scanned for a bot-check/throttle. Returns (returncode, text)."""
     import subprocess
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    chunks = []
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        chunks.append(line)
+    proc.wait()
+    return proc.returncode, "".join(chunks)
+
+
+def _pick_and_intake_next(excluded, args):
+    """Pick the NEXT ranked clippable campaign (excluding the ones already tried) and run intake
+    on it. Returns (status, captured_text): 'ready' (a campaign is intaken + ready to run),
+    'intake_failed' (picked but intake errored — caller advances again), or 'exhausted' (no
+    further clippable campaign). The just-tried campaign's id is added to `excluded` so it's
+    never re-picked."""
     scripts = os.path.dirname(os.path.abspath(__file__))
     pick = C.load_json(C.ROOT / "campaign_inputs" / "pick.json") or {}
-    failed_id, failed_name = pick.get("scout_id"), pick.get("campaign")
-    if failed_id and failed_id not in excluded:
-        excluded.append(failed_id)
-    bar = "=" * 70
-    C.warn(bar)
-    C.warn(f"AUTO-ADVANCE #{n}/{args.auto_advance_max}: campaign {failed_name!r} produced "
-           f"nothing usable.")
-    C.warn(f"  reason: {reason}")
-    C.warn(f"  advancing to the next ranked clippable campaign (excluding {len(excluded)} failed).")
-    C.warn(bar)
+    tried_id = pick.get("scout_id")
+    if tried_id and tried_id not in excluded:
+        excluded.append(tried_id)
 
     pc = [sys.executable, os.path.join(scripts, "pickcampaign.py")]
     if pick.get("scout_json"):
@@ -322,15 +391,59 @@ def _advance_to_next_campaign(excluded, n, args, reason):
     for eid in excluded:
         if eid:
             pc += ["--exclude-id", str(eid)]
-    if subprocess.run(pc).returncode != 0:
-        C.fail("auto-advance: pickcampaign found no further clippable campaign (all remaining "
-               "were skipped/excluded). Stopping.")
-    if subprocess.run([sys.executable, os.path.join(scripts, "intake.py"),
-                       "--from-pick"]).returncode != 0:
-        C.fail("auto-advance: intake failed for the next campaign. Stopping.")
+    rc, txt = _tee(pc)
+    if rc != 0:
+        return "exhausted", txt
+
+    rc2, txt2 = _tee([sys.executable, os.path.join(scripts, "intake.py"), "--from-pick"])
+    text = txt + txt2
+    if rc2 != 0:
+        # Exclude the just-picked campaign too, so the next advance skips it.
+        newpick = C.load_json(C.ROOT / "campaign_inputs" / "pick.json") or {}
+        nid = newpick.get("scout_id")
+        if nid and nid not in excluded:
+            excluded.append(nid)
+        return "intake_failed", text
     newpick = C.load_json(C.ROOT / "campaign_inputs" / "pick.json") or {}
     C.log(f"auto-advance: now on {newpick.get('campaign')!r} — running the pipeline for it.")
-    return excluded
+    return "ready", text
+
+
+def walk(process_fn, advance_fn, walk_depth):
+    """Core auto-advance walk (pure, so it's unit-testable without downloads).
+
+    process_fn(attempt) runs the pipeline on the CURRENT campaign — returns on success, raises
+    C.NothingUsable(reason) on a dead/no-footage/language failure. advance_fn(attempt) prepares
+    the NEXT campaign (spacing → pick → intake) and returns one of 'ready' / 'intake_failed' /
+    'exhausted'. Walks up to `walk_depth` ATTEMPTS (a pipeline run OR a failed intake each count
+    as one), stopping on the first success, the depth cap, or an exhausted list.
+
+    Returns (ok, attempts, reasons)."""
+    reasons = []
+    attempt = 0
+    need_advance = False
+    while attempt < walk_depth:
+        if need_advance:
+            status = advance_fn(attempt)
+            if status == "exhausted":
+                reasons.append("exhausted (no further ranked campaign)")
+                return False, attempt, reasons
+            if status == "intake_failed":
+                attempt += 1
+                reasons.append("intake failed")
+                C.warn(f"  [walk {attempt}/{walk_depth}] intake failed — advancing.")
+                continue                      # need_advance stays True → pick the next one
+            need_advance = False              # 'ready' → fall through and run the pipeline
+        attempt += 1
+        try:
+            process_fn(attempt)
+            return True, attempt, reasons
+        except C.NothingUsable as e:
+            tag = _reason_tag(str(e))
+            reasons.append(tag)
+            C.warn(f"  [walk {attempt}/{walk_depth}] FAILED: {tag}.")
+            need_advance = True
+    return False, attempt, reasons
 
 
 def main():
@@ -359,11 +472,17 @@ def main():
     ap.add_argument("--no-cleanup", action="store_true", help="never prompt for footage cleanup")
     ap.add_argument("--auto-advance", action="store_true", dest="auto_advance",
                     help="if the picked campaign produces NOTHING usable (no footage / zero "
-                         "indexable sources / no live moments), advance to the NEXT ranked "
-                         "campaign (re-pick + intake + run). OFF by default — it downloads a "
-                         "second campaign, so it never happens unless you ask.")
-    ap.add_argument("--auto-advance-max", type=int, default=2, dest="auto_advance_max",
-                    help="max campaigns to auto-advance through before giving up (default 2).")
+                         "indexable sources / dead-floor / language gate), WALK DOWN the ranked "
+                         "list — re-pick + intake + run the next campaign — until one produces "
+                         "clips, --auto-advance-max are tried, or the list is exhausted. OFF by "
+                         "default — it downloads more campaigns, so it never happens unless asked.")
+    ap.add_argument("--auto-advance-max", type=int, default=10, dest="auto_advance_max",
+                    help="max campaigns to walk through before giving up (default 10). Each "
+                         "attempt hits YouTube, so attempts are SPACED (see --walk-spacing).")
+    ap.add_argument("--walk-spacing", type=int, default=None, dest="walk_spacing",
+                    help="seconds to wait between auto-advance attempts (anti-throttle; default "
+                         "from config walk_spacing_seconds=20). A detected bot-check backs off "
+                         "longer (walk_throttle_backoff_seconds).")
     args = ap.parse_args()
 
     global _COOKIES, _ORIGINAL
@@ -379,28 +498,52 @@ def main():
         cut_only(state)
         return
 
-    # AUTO-ADVANCE loop (Unit 2c): normally runs exactly once. With --auto-advance, a campaign
-    # that produces NOTHING usable (NothingUsable) triggers a re-pick of the NEXT ranked
-    # campaign (excluding the failed one) + intake, then the pipeline runs again for it.
-    excluded, advances = [], 0
-    while True:
-        require_intake()                       # re-checked each pass (a new campaign after advance)
+    # Default (no --auto-advance): run the pipeline ONCE and dead-end LOUD on NothingUsable —
+    # exactly as before.
+    if not args.auto_advance:
+        require_intake()
         state = _prepare_state(args)
         C.log(f"config: {state['config']}")
         try:
             _run_stages(state, args)
         except C.NothingUsable as e:
-            if not args.auto_advance:
-                C.fail(str(e))                 # default: dead-end LOUD, exactly as before
-            if advances >= args.auto_advance_max:
-                C.fail(f"{e}\nauto-advance: reached the limit ({args.auto_advance_max}) — "
-                       f"stopping. Excluded so far: {excluded}.")
-            advances += 1
-            excluded = _advance_to_next_campaign(excluded, advances, args, str(e))
-            continue                           # re-run the pipeline for the newly-picked campaign
-        break
+            C.fail(str(e))
+        C.log("pipeline complete — drafts in drafts/ (best first), see drafts/manifest.json.")
+        offer_cleanup(args)
+        return
 
-    C.log("pipeline complete — drafts in drafts/ (best first), see drafts/manifest.json.")
+    # AUTO-ADVANCE WALK (Unit 2c): walk DOWN the ranked list until a campaign produces clips,
+    # --auto-advance-max are tried, or the list is exhausted. Spacing between attempts (+ a
+    # longer back-off on a detected bot-check) keeps 10 attempts from throttling YouTube.
+    walk_depth = max(1, args.auto_advance_max)
+    excluded = []
+    throttled = {"v": False}
+
+    def process_fn(attempt):
+        require_intake()                       # re-checked each pass (a new campaign after advance)
+        state = _prepare_state(args)
+        campaign = (C.load_json(C.RULES_JSON) or {}).get("campaign")
+        C.log("=" * 70)
+        C.log(f"WALK attempt {attempt}/{walk_depth} — campaign {campaign!r}")
+        C.log("=" * 70)
+        C.log(f"config: {state['config']}")
+        _run_stages(state, args)               # raises C.NothingUsable on a dead campaign
+
+    def advance_fn(attempt):
+        cfg = {**DEFAULT_CONFIG}
+        spacing = args.walk_spacing if args.walk_spacing is not None else cfg["walk_spacing_seconds"]
+        _walk_sleep(spacing, cfg["walk_throttle_backoff_seconds"], throttled["v"])
+        status, text = _pick_and_intake_next(excluded, args)
+        throttled["v"] = _looks_like_throttle(text)   # back off harder next time if throttled
+        return status
+
+    ok, attempts, reasons = walk(process_fn, advance_fn, walk_depth)
+    if not ok:
+        C.fail(f"auto-advance walk stopped after {attempts} attempt(s) without a clippable "
+               f"campaign. Reasons: {reasons}. Excluded ids: {excluded}.")
+
+    C.log(f"pipeline complete after {attempts} walk attempt(s) — drafts in drafts/ "
+          f"(best first), see drafts/manifest.json.")
     offer_cleanup(args)
 
 

@@ -108,22 +108,35 @@ into `memory/longterm.md`.**
   continue) — the stage completes as long as ≥1 file indexed, hard-failing (`C.NothingUsable`)
   only at ZERO usable sources. **LLM calls go through a 3-provider FAILOVER CHAIN**
   (`common.LLMChain`, `llm_client`/`llm_chat`): GROQ → GEMINI → CEREBRAS, all free-tier, order
-  via config `llm_providers`. Keys come ONLY from env (`GROQ_API_KEY` / `GEMINI_API_KEY` /
-  `CEREBRAS_API_KEY`) — never written to disk; a provider with a missing key/library is skipped
-  (warn once). `common.classify_rate_limit` tells a DAILY cap (TPD/RPD/PerDay, or a wait > 90s)
-  from a short per-minute limit: a per-minute limit backs off + retries the CURRENT provider; a
-  DAILY cap switches to the NEXT provider for the rest of the run (and STAYS there — no bounce
-  back; a fresh process restarts at Groq). Every provider returns a PLAIN STRING so the select/
-  caption JSON parsers, prompts, and banned-word logic are unchanged. Only when ALL THREE are
-  capped does it raise `C.GroqDailyCapError`; select/captions checkpoint each finished batch/clip
+  via config `llm_providers`. **MULTIPLE KEYS PER PROVIDER**: each provider expands to ONE chain
+  entry per env key — numbered `GROQ_API_KEY_1..N` (however many are set, auto-detected — add a
+  5th and it's picked up with zero code change) then the bare `GROQ_API_KEY` as a fallback when
+  no numbered keys exist (same scheme for `GEMINI_API_KEY_*` / `CEREBRAS_API_KEY_*`). Effective
+  order: GROQ key1 → key2 → … → GEMINI → CEREBRAS (`_collect_provider_keys` + `_make_providers`).
+  Keys come ONLY from env — never written to disk, never logged (logs name the provider + key
+  INDEX only, e.g. "GROQ key 2/4"); a provider with no key/library is skipped (warn once).
+  `common.classify_rate_limit` tells a DAILY cap (TPD/RPD/PerDay, or a wait > 90s)
+  from a short per-minute limit: a per-minute limit backs off + retries the CURRENT key; a
+  DAILY cap advances to the NEXT KEY of the same provider, and only after ALL that provider's
+  keys are capped does it fall to the next provider (STAYS there — no bounce back; a fresh
+  process restarts at Groq key 1). Every provider returns a PLAIN STRING so the select/
+  caption JSON parsers, prompts, and banned-word logic are unchanged. Only when EVERY key of
+  EVERY provider is capped does it raise `C.GroqDailyCapError`; select/captions checkpoint each
+  finished batch/clip
   to `select_partial.json` / `captions_partial.json`, so run.py reports "N of M done" and
   `stop_resumable`s (exit 7) — `--resume` continues without re-spending calls (partials deleted
   on stage completion). `groq_client`/`groq_chat` remain as back-compat aliases (intake/analyze
   get failover free). A campaign that yields
   NOTHING usable raises `C.NothingUsable`; run.py dead-ends loud by default, or with
-  `--auto-advance` re-picks the NEXT ranked campaign (`pickcampaign --exclude-id` the failed
-  one) + intake and runs again (opt-in — it downloads a second campaign; bounded by
-  `--auto-advance-max`, default 2).
+  `--auto-advance` **WALKS DOWN the ranked list** (`run.walk`): pick → intake → run, and on a
+  dead campaign (no footage / dead-floor best<40 / language gate / failed intake) re-picks
+  (`pickcampaign --exclude-id` each tried one) + intake and runs the NEXT one — until clips are
+  produced, `--auto-advance-max` campaigns are tried (default **10**), or the list is exhausted.
+  Opt-in (it downloads more campaigns). **Anti-throttle:** every attempt hits YouTube, so attempts
+  are SPACED (`walk_spacing_seconds`, default 20; `--walk-spacing`) and a detected bot-check /
+  429 (`_looks_like_throttle`) triggers a longer back-off (`walk_throttle_backoff_seconds`,
+  default 300) instead of hammering — cookies stay applied throughout. `run.walk` is a pure,
+  unit-tested core (inject process/advance fns); each pipeline run OR failed intake = one attempt.
 - **Everything is resumable.** New work must checkpoint to `state.json` (and to disk)
   before the next step. `index.py` checkpoints per 5-min VOD chunk — preserve that. It
   REUSES the on-disk transcript/rms/words partials ONLY when `chunks_done > 0` (a genuine
