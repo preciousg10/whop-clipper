@@ -315,11 +315,15 @@ def audio_stream_count(path):
     return len([ln for ln in (proc.stdout or "").splitlines() if ln.strip()])
 
 
-# --- LLM failover chain: Groq -> Gemini -> Cerebras --------------------------------
-# All three are free-tier; stacking them ~triples daily capacity. Keys come ONLY from env
-# vars — never hardcoded, never written to disk. On a DAILY cap (or a very long retry-after)
-# we switch to the NEXT provider for the rest of the run and STAY there; short per-minute
-# limits back off + retry on the CURRENT provider first. All three capped -> GroqDailyCapError
+# --- LLM failover chain: Groq(keys 1..N) -> Gemini -> Cerebras ---------------------
+# All three are free-tier; stacking them + MULTIPLE KEYS per provider multiplies daily capacity.
+# Keys come ONLY from env vars — never hardcoded, never written to disk, never logged. Each
+# provider expands to one entry PER KEY: numbered keys `GROQ_API_KEY_1..N` (however many are set)
+# then the bare `GROQ_API_KEY` as a fallback when no numbered keys exist (same for GEMINI_/
+# CEREBRAS_). On a DAILY cap (or a very long retry-after) we advance to the NEXT KEY of the same
+# provider, and only after ALL that provider's keys are capped do we fall to the next provider —
+# staying put for the rest of the run; short per-minute limits back off + retry on the CURRENT
+# key first. All keys of all providers capped -> GroqDailyCapError
 # (the caller checkpoints + stops resumably). Every provider returns a PLAIN STRING so the
 # existing select/caption JSON parsers are unchanged.
 _MAX_MINUTE_WAIT_S = 90.0     # a required wait longer than this reads as a daily cap
@@ -441,15 +445,33 @@ def _openai_content(resp, provider_name):
     return ""
 
 
-class _GroqProvider:
+class _BaseProvider:
+    """Shared per-instance key metadata + a human LABEL for logging. One provider CLASS can be
+    instantiated once PER KEY (GROQ key 1/4, key 2/4, …); `label` distinguishes them in logs
+    without EVER printing the key value."""
+    name = "?"
+
+    def _set_key_meta(self, key_index, key_total):
+        self.key_index = key_index
+        self.key_total = key_total
+
+    @property
+    def label(self):
+        if getattr(self, "key_total", 1) > 1:
+            return f"{self.name} key {self.key_index}/{self.key_total}"
+        return self.name
+
+
+class _GroqProvider(_BaseProvider):
     name = "GROQ"
 
-    def __init__(self):
+    def __init__(self, api_key, key_index=1, key_total=1):
+        self._set_key_meta(key_index, key_total)
         from groq import Groq
         self.model = GROQ_MODEL
-        self._client = Groq(api_key=os.environ["GROQ_API_KEY"])
+        self._client = Groq(api_key=api_key)
         self._reasoning = _is_reasoning_model(self.model)
-        if self._reasoning:
+        if self._reasoning and key_index == 1:
             log(f"GROQ: '{self.model}' is a reasoning model — using reasoning_effort=low "
                 f"+ token reserve so answer content isn't starved by reasoning tokens.")
 
@@ -466,19 +488,24 @@ class _GroqProvider:
         return _openai_content(resp, self.name)
 
 
-class _GeminiProvider:
+class _GeminiProvider(_BaseProvider):
     name = "GEMINI"
 
-    def __init__(self):
+    def __init__(self, api_key, key_index=1, key_total=1):
+        self._set_key_meta(key_index, key_total)
         import warnings
         with warnings.catch_warnings():          # hush the lib's own deprecation FutureWarning
             warnings.simplefilter("ignore")
             import google.generativeai as genai
         self.model = GEMINI_MODEL
-        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+        # Gemini configures the key globally per generate; we re-apply it before each call so
+        # multiple Gemini keys don't clobber each other on the module-level config.
+        self._api_key = api_key
+        genai.configure(api_key=api_key)
         self._genai = genai
 
     def complete(self, system, user, temperature, max_tokens):
+        self._genai.configure(api_key=self._api_key)   # ensure THIS key is active (multi-key safe)
         model = self._genai.GenerativeModel(self.model, system_instruction=system)
         resp = model.generate_content(
             user, generation_config={"temperature": temperature,
@@ -496,13 +523,14 @@ class _GeminiProvider:
             return "".join(out)
 
 
-class _CerebrasProvider:
+class _CerebrasProvider(_BaseProvider):
     name = "CEREBRAS"
 
-    def __init__(self):
+    def __init__(self, api_key, key_index=1, key_total=1):
+        self._set_key_meta(key_index, key_total)
         from openai import OpenAI          # Cerebras exposes an OpenAI-compatible endpoint
         self.model = CEREBRAS_MODEL
-        self._client = OpenAI(api_key=os.environ["CEREBRAS_API_KEY"],
+        self._client = OpenAI(api_key=api_key,
                               base_url="https://api.cerebras.ai/v1")
         self._reasoning = _is_reasoning_model(self.model)
 
@@ -527,31 +555,65 @@ _PROVIDER_SPECS = {
 _MISSING_WARNED = set()      # warn once per missing provider
 
 
-def _make_provider(name):
-    """Build a provider if its key is set and its library imports; else None (skip it)."""
+def _collect_provider_keys(base):
+    """Ordered list of API-key VALUES for a provider, read ONLY from env (never logged/returned
+    to callers that could log them). Detects HOWEVER MANY numbered keys are set — `BASE_1`,
+    `BASE_2`, … in numeric order (non-contiguous is fine: 1,2,4 → three keys). The bare `BASE`
+    (e.g. GROQ_API_KEY) is used as a FALLBACK/alias only when NO numbered keys exist, so adding a
+    5th numbered key later is picked up automatically with zero code change."""
+    pat = re.compile(r"^" + re.escape(base) + r"_(\d+)$")
+    numbered = []
+    for env_name, val in os.environ.items():
+        m = pat.match(env_name)
+        if m and val and val.strip():
+            numbered.append((int(m.group(1)), val.strip()))
+    if numbered:
+        numbered.sort(key=lambda t: t[0])
+        return [v for _, v in numbered]
+    bare = os.environ.get(base)
+    return [bare.strip()] if bare and bare.strip() else []
+
+
+def _make_providers(name):
+    """Build ALL available provider instances for `name` — ONE per env key (GROQ key 1/4 … 4/4)
+    — or [] if no key is set / the library won't import. Multiple keys of a provider are
+    exhausted (in order) before the chain falls to the NEXT provider."""
     spec = _PROVIDER_SPECS.get(name)
     if not spec:
         warn(f"unknown LLM provider '{name}' in llm_providers — skipping.")
-        return None
-    env_key, cls = spec
-    if not os.environ.get(env_key):
+        return []
+    env_base, cls = spec
+    keys = _collect_provider_keys(env_base)
+    if not keys:
         if name not in _MISSING_WARNED:
-            warn(f"LLM provider {name.upper()} skipped — {env_key} not set.")
+            warn(f"LLM provider {name.upper()} skipped — no key set "
+                 f"({env_base} or {env_base}_1, {env_base}_2, …).")
             _MISSING_WARNED.add(name)
-        return None
-    try:
-        return cls()
-    except Exception as e:
-        if name not in _MISSING_WARNED:
-            warn(f"LLM provider {name.upper()} unavailable ({e.__class__.__name__}: {e}) — skipping.")
-            _MISSING_WARNED.add(name)
-        return None
+        return []
+    total = len(keys)
+    out = []
+    for i, key in enumerate(keys, 1):
+        try:
+            out.append(cls(api_key=key, key_index=i, key_total=total))
+        except Exception as e:
+            # A library/import problem hits every key the same way — warn once and stop trying
+            # this provider. (A per-key credential problem surfaces later as a normal API error.)
+            if name not in _MISSING_WARNED:
+                warn(f"LLM provider {name.upper()} unavailable "
+                     f"({e.__class__.__name__}: {e}) — skipping.")
+                _MISSING_WARNED.add(name)
+            break
+    if total > 1 and out:
+        log(f"LLM provider {name.upper()}: {len(out)} keys detected → will rotate "
+            f"key 1..{len(out)} before failing over.")
+    return out
 
 
 class LLMChain:
-    """An ordered chain of available providers with a CURRENT pointer. On a daily cap the
-    pointer advances (and never rewinds within the process); per-minute limits retry in place.
-    A process restart (a fresh `run.py`) rebuilds the chain at the front (Groq)."""
+    """An ordered chain of available provider+key entries with a CURRENT pointer (Groq key1,
+    Groq key2, …, Gemini, Cerebras). On a daily cap the pointer advances to the next KEY/provider
+    (and never rewinds within the process); per-minute limits retry in place. A process restart
+    (a fresh `run.py`) rebuilds the chain at the front (Groq key 1)."""
 
     def __init__(self, providers):
         self.providers = providers
@@ -559,8 +621,8 @@ class LLMChain:
         self._answered = set()
 
     def status(self):
-        chain = "→".join(p.name for p in self.providers)
-        return f"{chain} (active: {self.providers[self.idx].name})"
+        chain = "→".join(p.label for p in self.providers)
+        return f"{chain} (active: {self.providers[self.idx].label})"
 
     def _try(self, p, system, user, temperature, max_tokens, retries):
         """(text, 'ok', None) on success, or (None, 'failover', reason). Backs off + retries a
@@ -570,19 +632,19 @@ class LLMChain:
                 return p.complete(system, user, temperature, max_tokens), "ok", None
             except Exception as e:
                 if is_dead_model_error(str(e)):     # 404/model-gone: not transient, skip NOW
-                    return None, "failover", (f"{p.name} model '{p.model}' unavailable "
+                    return None, "failover", (f"{p.label} model '{p.model}' unavailable "
                                               f"(404/model-not-found) — {str(e)[:80]}")
                 kind, wait = classify_rate_limit(str(e))
                 if kind == "daily":
-                    return None, "failover", f"{p.name} DAILY cap"
+                    return None, "failover", f"{p.label} DAILY cap"
                 if attempt < retries:
                     w = (wait + 0.5) if (wait and kind == "minute") else min(2.0 * (attempt + 1), 20.0)
-                    warn(f"{p.name} {'rate limit' if kind == 'minute' else 'error'} "
+                    warn(f"{p.label} {'rate limit' if kind == 'minute' else 'error'} "
                          f"({str(e)[:80]}) — retry in {w:.1f}s ({attempt + 1}/{retries})…")
                     time.sleep(w)
                     continue
-                return None, "failover", (f"{p.name} per-minute limit persisted"
-                                          if kind == "minute" else f"{p.name} error: {str(e)[:80]}")
+                return None, "failover", (f"{p.label} per-minute limit persisted"
+                                          if kind == "minute" else f"{p.label} error: {str(e)[:80]}")
 
     def chat(self, system, user, temperature=0.8, max_tokens=1024, retries=6):
         tried = []
@@ -590,16 +652,16 @@ class LLMChain:
             p = self.providers[self.idx]
             text, action, reason = self._try(p, system, user, temperature, max_tokens, retries)
             if action == "ok":
-                if p.name not in self._answered:      # log which provider answered (once each)
-                    log(f"LLM: answered by {p.name} ({p.model}).")
-                    self._answered.add(p.name)
+                if p.label not in self._answered:     # log which provider+key answered (once each)
+                    log(f"LLM: answered by {p.label} ({p.model}).")
+                    self._answered.add(p.label)
                 return text
-            tried.append(p.name)
-            nxt = self.providers[self.idx + 1].name if self.idx + 1 < len(self.providers) else None
+            tried.append(p.label)
+            nxt = self.providers[self.idx + 1].label if self.idx + 1 < len(self.providers) else None
             if nxt:
-                warn(f"{reason} — failing over to {nxt}.")
+                warn(f"{reason} → failing over to {nxt}.")
             else:
-                warn(f"{reason} — no more providers in the chain.")
+                warn(f"{reason} — no more providers/keys in the chain.")
             self.idx += 1
         raise GroqDailyCapError(
             f"all LLM providers capped/unavailable ({', '.join(tried)}) — checkpoint and "
@@ -618,7 +680,9 @@ def llm_client(cfg=None):
         return None
     if _LLM_CHAIN is None:
         order = list((cfg or {}).get("llm_providers") or DEFAULT_LLM_PROVIDERS)
-        providers = [p for p in (_make_provider(str(n).lower().strip()) for n in order) if p]
+        providers = []
+        for n in order:                       # each provider expands to ONE entry per env key
+            providers.extend(_make_providers(str(n).lower().strip()))
         if not providers:
             fail("no LLM provider available — set at least one of GROQ_API_KEY / GEMINI_API_KEY "
                  "/ CEREBRAS_API_KEY (or run offline with CLIPPER_OFFLINE=1).")
