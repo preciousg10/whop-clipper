@@ -24,9 +24,11 @@ Per-source download errors raise DownloadError (catchable) so a failed OPTIONAL 
 Environment errors (missing yt-dlp/gdown) still fail loud.
 """
 import os
+import re
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -180,20 +182,197 @@ def _fetch_local(url, staging):
     return [out]
 
 
+# --- Google Drive folder download (robust, TWO-failure-mode aware) -------------
+# gdown emits the SAME opaque sentence for two OPPOSITE problems:
+#   "Cannot retrieve the public link of the file. You may need to change the permission
+#    to 'Anyone with the link', or have had many accesses."
+# The wording alone can't separate them (it names BOTH causes), but gdown's message also
+# carries the HTTP status code — that IS the discriminator:
+#   * PERMISSION-LOCKED (401/403/404) — the folder isn't shared publicly. PERMANENT: never
+#     downloadable. Skip FAST (no wasted retries), log clearly, let the campaign advance.
+#   * THROTTLED (429, or a 5xx server hiccup, or explicit 'many accesses' wording) — Drive
+#     rate-limited us. TEMPORARY: retry with backoff; if still throttled, skip but flag it
+#     as temporary (NOT permanently dead) so a later run can succeed.
+DRIVE_MAX_ATTEMPTS = 4          # folder-download attempts before giving up on a throttle
+DRIVE_BACKOFF_SECONDS = 8       # base backoff between throttled retries (grows linearly)
+
+_STATUS_CODE_RE = re.compile(r"status code[:\s]+(\d{3})", re.IGNORECASE)
+_DRIVE_PERMISSION_MARKERS = (
+    "change the permission", "anyone with the link", "not have access",
+    "access denied", "no longer available", "permission denied",
+)
+_DRIVE_THROTTLE_MARKERS = (
+    "have had many accesses", "many accesses", "too many users", "too many requests",
+    "rate limit", "quota exceeded", "try again later",
+)
+
+
+class DriveNotPublicError(DownloadError):
+    """A Drive folder isn't shared 'Anyone with the link' — PERMANENT, never downloadable.
+    A DownloadError subclass so the existing per-source skip logic handles it, but its own
+    type + message make the permanent case unmistakable (vs a temporary throttle)."""
+
+
+def _first_line(s, n=180):
+    lines = [ln.strip() for ln in str(s or "").splitlines() if ln.strip()]
+    return (lines[0][:n] if lines else "").strip()
+
+
+def _drive_status_code(msg):
+    m = _STATUS_CODE_RE.search(str(msg or ""))
+    return int(m.group(1)) if m else None
+
+
+def _classify_drive_error(msg):
+    """Bucket a gdown Drive failure into 'permission' | 'throttle' | 'unknown'.
+
+    HTTP status code is the primary signal (it disambiguates gdown's one-size-fits-all
+    sentence); the wording is only a fallback when no code is present. 'unknown' is treated
+    as retryable by the caller but, if it never clears, reported as a temporary throttle."""
+    code = _drive_status_code(msg)
+    if code in (401, 403, 404):
+        return "permission"
+    if code == 429 or (code is not None and 500 <= code <= 599):
+        return "throttle"
+    low = str(msg).lower()
+    if any(m in low for m in _DRIVE_THROTTLE_MARKERS):
+        return "throttle"
+    if any(m in low for m in _DRIVE_PERMISSION_MARKERS):
+        return "permission"
+    return "unknown"
+
+
+_GDOWN_COOKIES_APPLIED = False
+
+
+def _apply_gdown_cookies():
+    """Make gdown's HTTP session use our cookies (a logged-in session eases Drive throttling).
+    gdown reads ~/.cache/gdown/cookies.txt (Netscape/MozillaCookieJar) — the SAME format as our
+    yt-dlp cookies file — so copy ours into place ONCE. No-op when the cookies file is absent;
+    never fatal. Contents are never logged."""
+    global _GDOWN_COOKIES_APPLIED
+    if _GDOWN_COOKIES_APPLIED:
+        return
+    _GDOWN_COOKIES_APPLIED = True
+    cf = C.cookies_file()
+    if not cf:
+        return
+    try:
+        dest = Path.home() / ".cache" / "gdown" / "cookies.txt"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.exists() or dest.stat().st_mtime < Path(cf).stat().st_mtime:
+            shutil.copy2(cf, dest)
+        C.log(f"gdown using cookies file: {cf}")
+    except Exception as e:
+        C.warn(f"could not apply cookies to gdown (continuing without): {e}")
+
+
+def _list_drive_for_download(url, attempts=3):
+    """List a Drive folder's files WITHOUT downloading. Returns (files, last_error): files is a
+    list of gdown GoogleDriveFileToDownload (id/path/local_path), last_error the last exception
+    string (None on success). Retries transient failures; bails out FAST on a permission wall."""
+    import gdown
+    last = None
+    for a in range(attempts):
+        try:
+            files = gdown.download_folder(url=url, skip_download=True, quiet=True,
+                                          use_cookies=True)
+            return [f for f in (files or []) if getattr(f, "id", None)], None
+        except Exception as e:
+            last = str(e)
+            if _classify_drive_error(last) == "permission":
+                return [], last          # permanent — do not retry a permission wall
+        if a < attempts - 1:
+            time.sleep(2.0 * (a + 1))
+    return [], last
+
+
+def _drive_direct_fallback(url, staging):
+    """Last resort: list the folder's file ids and pull each one directly via gdown's file
+    endpoint (drive.google.com/uc?id=...). Skip-not-fail PER FILE — return whatever downloads.
+    Recovers a folder whose BATCH pull choked but whose individual files are still reachable.
+    Returns (paths, error) — error carries a permission verdict up when listing itself is locked."""
+    import gdown
+    files, err = _list_drive_for_download(url)
+    if not files:
+        return [], err
+    got = []
+    for f in files:
+        fid = getattr(f, "id", None)
+        if not fid:
+            continue
+        name = os.path.basename((getattr(f, "path", "") or "").replace("\\", "/")) or fid
+        out = staging / name
+        try:
+            res = gdown.download(id=fid, output=str(out), quiet=True, use_cookies=True,
+                                 resume=True)
+            if res and Path(res).exists():
+                got.append(Path(res))
+            else:
+                C.warn(f"  Drive file skipped (no data returned): {name}")
+        except Exception as e:
+            kind = _classify_drive_error(e)
+            tag = "not public" if kind == "permission" else "throttled/failed"
+            C.warn(f"  Drive file skipped ({tag}): {name} — {_first_line(e)}")
+    return got, None
+
+
 def _fetch_drive(url, staging):
     try:
-        import gdown
+        import gdown  # noqa: F401  (import-guard; used by the helpers below)
     except ImportError:
         raise DownloadError("gdown not installed (pip install -r requirements.txt)")
+    _apply_gdown_cookies()
     C.log(f"gdown folder: {url}")
-    try:
-        gdown.download_folder(url=url, output=str(staging), quiet=False, use_cookies=False)
-    except Exception as e:
-        raise DownloadError(f"gdown failed: {e}")
-    files = [p for p in staging.rglob("*") if p.is_file()]
-    if not files:
-        raise DownloadError("Drive folder produced no files")
-    return files
+
+    saw_permission = False
+    last_err = None
+    for attempt in range(1, DRIVE_MAX_ATTEMPTS + 1):
+        err = None
+        try:
+            gdown.download_folder(url=url, output=str(staging), quiet=False,
+                                  use_cookies=True, resume=True)
+        except Exception as e:
+            err = str(e)
+            last_err = err
+        got = [p for p in staging.rglob("*") if p.is_file()]
+        if got:
+            # SKIP-NOT-FAIL: keep whatever downloaded even if some files errored — a folder only
+            # fails when NOTHING comes down.
+            if err:
+                C.warn(f"Drive folder partially downloaded ({len(got)} file(s)); some files "
+                       f"failed but keeping what we got: {_first_line(err)}")
+            return got
+        if not err:
+            break                         # no error but no files — undownloadable/empty folder
+        if _classify_drive_error(err) == "permission":
+            saw_permission = True         # PERMANENT — do NOT waste further retries
+            break
+        # throttle / unknown → back off and retry (Drive rate-limited us; it may clear).
+        if attempt < DRIVE_MAX_ATTEMPTS:
+            wait = DRIVE_BACKOFF_SECONDS * attempt
+            C.warn(f"Drive folder throttled (temporary) — retry {attempt}/{DRIVE_MAX_ATTEMPTS - 1} "
+                   f"after {wait}s: {url} [{_first_line(err)}]")
+            time.sleep(wait)
+
+    # The batch folder-pull produced nothing. Before giving up, try the folder's files
+    # INDIVIDUALLY (direct uc?id= endpoint) — recovers a folder whose batch pull choked.
+    if not saw_permission:
+        got, ferr = _drive_direct_fallback(url, staging)
+        if got:
+            C.log(f"Drive folder: recovered {len(got)} file(s) via per-file direct download.")
+            return got
+        if ferr and _classify_drive_error(ferr) == "permission":
+            saw_permission, last_err = True, ferr
+
+    if saw_permission:
+        C.warn(f"Drive folder not public — permanently unclippable, advancing: {url} "
+               f"(share it 'Anyone with the link' to clip it). [{_first_line(last_err)}]")
+        raise DriveNotPublicError(f"Drive folder not public (permission-locked): {url}")
+    C.warn(f"Drive folder throttled (temporary) — no files after {DRIVE_MAX_ATTEMPTS} attempts; "
+           f"skipping, NOT permanently dead (retryable on a later run): {url} "
+           f"[{_first_line(last_err)}]")
+    raise DownloadError(f"Drive folder throttled (temporary), skipping: {url}")
 
 
 class _CollectingLogger:
