@@ -14,6 +14,7 @@ everything. Long stages (index) also checkpoint internally per VOD chunk.
 """
 import argparse
 import os
+import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -61,6 +62,13 @@ DEFAULT_CONFIG = {
     # instead of hammering. Cookies (cookies.txt / --cookies-from-browser) stay applied throughout.
     "walk_spacing_seconds": 20,           # gentle delay between auto-advance attempts
     "walk_throttle_backoff_seconds": 300,  # longer back-off once a bot-check/throttle is seen
+    # BATCH FLOOR (auto-advance walk). Accumulate clips ACROSS campaigns until the running total
+    # reaches this many — a MINIMUM, not a cap: the current campaign always finishes and ALL its
+    # clips are kept, so the final batch may exceed it (20 + 8 → keep all 28). The walk stops when
+    # EITHER the total >= target_batch_min OR auto_advance_max campaigns have been attempted,
+    # whichever comes first (so a thin board still terminates). Dead campaigns (0 clips) count
+    # toward the campaign cap but add 0 to the total.
+    "target_batch_min": 25,
     "layout": "auto",              # vertical fill: "auto" (TRACK a single subject, else blur_fill),
                                    # "track" (force face/person-tracked 9:16 crop), "blur_fill"
                                    # (whole frame on a blurred bg), or "crop_fill" (COVER+center-crop)
@@ -409,25 +417,114 @@ def _pick_and_intake_next(excluded, args):
     return "ready", text
 
 
-def walk(process_fn, advance_fn, walk_depth):
-    """Core auto-advance walk (pure, so it's unit-testable without downloads).
+# --- BATCH ACCUMULATION (auto-advance walk) ------------------------------------------
+# A batch walk keeps EVERY campaign's finished clips instead of stopping at the first that
+# produces any. After each campaign's cut, its drafts are HARVESTED into drafts_batch/ (so the
+# next campaign's activate_campaign archive is a no-op and cut can renumber from 01 again), then
+# FINALIZED back into drafts/ as one best-first batch with a merged manifest when the walk ends.
 
-    process_fn(attempt) runs the pipeline on the CURRENT campaign — returns on success, raises
-    C.NothingUsable(reason) on a dead/no-footage/language failure. advance_fn(attempt) prepares
-    the NEXT campaign (spacing → pick → intake) and returns one of 'ready' / 'intake_failed' /
-    'exhausted'. Walks up to `walk_depth` ATTEMPTS (a pipeline run OR a failed intake each count
-    as one), stopping on the first success, the depth cap, or an exhausted list.
 
-    Returns (ok, attempts, reasons)."""
+def _harvest_batch(campaign):
+    """Move the just-cut campaign's drafts into drafts_batch/ and record their manifest entries.
+    Empties drafts/ so the next campaign's activate_campaign draft-archive is a no-op and the
+    prior campaigns' clips can never be nuked by the footage-clear-on-campaign-change logic.
+    Returns the number of clips harvested from this campaign."""
+    man = C.load_json(C.DRAFTS_MANIFEST) or {}
+    clips = man.get("clips", [])
+    C.DRAFTS_BATCH.mkdir(parents=True, exist_ok=True)
+    batch_man = C.DRAFTS_BATCH / "manifest.json"
+    batch = C.load_json(batch_man) or {"campaigns": [], "clips": []}
+    base = len(batch["clips"])
+    harvested = 0
+    for i, c in enumerate(clips):
+        src = C.DRAFTS / c["filename"]
+        if not src.exists():
+            C.warn(f"batch harvest: {c['filename']} missing from drafts/ — skipping.")
+            continue
+        # Unique collision-safe staging name; keep the slug tail (NN_SSS_<slug>.mp4 → <slug>.mp4)
+        # so finalize can rebuild a clean best-first name without re-slugifying the caption.
+        parts = c["filename"].split("_", 2)
+        tail = parts[2] if len(parts) == 3 else c["filename"]
+        stage_name = f"b{base + i:03d}_{c['filename']}"
+        shutil.move(str(src), str(C.DRAFTS_BATCH / stage_name))
+        entry = dict(c)
+        entry["filename"] = stage_name
+        entry["_slug_tail"] = tail
+        entry["batch_campaign"] = campaign
+        batch["clips"].append(entry)
+        harvested += 1
+    if campaign and campaign not in batch["campaigns"]:
+        batch["campaigns"].append(campaign)
+    C.save_json(batch_man, batch)
+    # Clear anything left in drafts/ (the per-campaign manifest / stray temp files) so the
+    # archive step and the next campaign's cut start from a clean drafts/.
+    for p in list(C.DRAFTS.glob("*")):
+        try:
+            p.unlink()
+        except Exception as e:
+            C.warn(f"batch harvest: could not clear {p.name}: {e}")
+    C.log(f"batch harvest: staged {harvested} clip(s) from {campaign!r} → drafts_batch/.")
+    return harvested
+
+
+def _finalize_batch():
+    """Assemble all staged batch clips into drafts/ as ONE best-first batch with a merged
+    manifest, renumbered contiguously. Returns the number of clips finalized. No-op (returns 0)
+    when nothing was staged (e.g. the walk never produced a clip)."""
+    batch_man = C.DRAFTS_BATCH / "manifest.json"
+    batch = C.load_json(batch_man)
+    if not batch or not batch.get("clips"):
+        shutil.rmtree(C.DRAFTS_BATCH, ignore_errors=True)
+        return 0
+    C.DRAFTS.mkdir(parents=True, exist_ok=True)
+    clips = sorted(batch["clips"], key=lambda c: (c.get("score") or 0), reverse=True)
+    final = []
+    for rank, c in enumerate(clips, 1):
+        src = C.DRAFTS_BATCH / c["filename"]
+        if not src.exists():
+            C.warn(f"batch finalize: {c['filename']} missing from drafts_batch/ — skipping.")
+            continue
+        score_i = int(round(c.get("score") or 0))
+        tail = c.get("_slug_tail") or c["filename"]
+        name = f"{rank:02d}_{score_i:03d}_{tail}"
+        shutil.move(str(src), str(C.DRAFTS / name))
+        entry = {k: v for k, v in c.items() if k != "_slug_tail"}
+        entry["filename"] = name
+        final.append(entry)
+    C.save_json(C.DRAFTS_MANIFEST, {"batch": True, "campaigns": batch.get("campaigns", []),
+                                    "created_at": C.now_iso(), "clips": final})
+    shutil.rmtree(C.DRAFTS_BATCH, ignore_errors=True)
+    C.log(f"batch finalize: {len(final)} clip(s) from {len(batch.get('campaigns', []))} "
+          f"campaign(s) assembled into drafts/ (best first).")
+    return len(final)
+
+
+def walk(process_fn, advance_fn, walk_depth, target_batch_min):
+    """Core auto-advance BATCH walk (pure, so it's unit-testable without downloads).
+
+    process_fn(attempt) runs the pipeline on the CURRENT campaign and RETURNS the number of clips
+    it produced (>= 0). It raises C.NothingUsable(reason) on a dead/no-footage/language failure
+    (counts as 0 clips for that campaign). advance_fn(attempt) prepares the NEXT campaign
+    (spacing → pick → intake) and returns one of 'ready' / 'intake_failed' / 'exhausted'.
+
+    ACCUMULATES clips ACROSS campaigns: after EACH campaign fully finishes (0, 1, or many clips)
+    the running total is checked. `target_batch_min` is a FLOOR, not a cap — the current campaign
+    always finishes and ALL its clips are kept, so the final total may EXCEED it (20 + 8 → keep
+    all 28). The walk stops when EITHER the running total >= target_batch_min OR `walk_depth`
+    ATTEMPTS have been made (a pipeline run OR a failed intake each count as one) OR the ranked
+    list is exhausted — whichever comes first.
+
+    Returns (ok, attempts, total_clips, reasons). ok = at least one clip was produced."""
     reasons = []
     attempt = 0
+    total = 0
     need_advance = False
     while attempt < walk_depth:
         if need_advance:
             status = advance_fn(attempt)
             if status == "exhausted":
                 reasons.append("exhausted (no further ranked campaign)")
-                return False, attempt, reasons
+                break
             if status == "intake_failed":
                 attempt += 1
                 reasons.append("intake failed")
@@ -436,14 +533,26 @@ def walk(process_fn, advance_fn, walk_depth):
             need_advance = False              # 'ready' → fall through and run the pipeline
         attempt += 1
         try:
-            process_fn(attempt)
-            return True, attempt, reasons
+            n = process_fn(attempt)
+            total += n
+            reasons.append(f"{n} clip(s)")
         except C.NothingUsable as e:
             tag = _reason_tag(str(e))
             reasons.append(tag)
-            C.warn(f"  [walk {attempt}/{walk_depth}] FAILED: {tag}.")
-            need_advance = True
-    return False, attempt, reasons
+            C.warn(f"  [walk {attempt}/{walk_depth}] FAILED: {tag} (0 clips).")
+        # Batch check after EVERY campaign (whether it made 0, 1, or many). FLOOR, not a cap.
+        if total >= target_batch_min:
+            C.log(f"batch: {total} clip(s) after {attempt} campaign(s) — target "
+                  f"({target_batch_min}) met, stopping.")
+            break
+        if attempt >= walk_depth:
+            C.warn(f"batch: {total} clip(s) after {attempt} campaign(s) — hit the {walk_depth}-"
+                   f"campaign cap under target ({target_batch_min}); stopping with what we got.")
+            break
+        C.log(f"batch so far: {total} clip(s) after {attempt} campaign(s) — under "
+              f"{target_batch_min}, advancing.")
+        need_advance = True
+    return total > 0, attempt, total, reasons
 
 
 def main():
@@ -479,6 +588,12 @@ def main():
     ap.add_argument("--auto-advance-max", type=int, default=10, dest="auto_advance_max",
                     help="max campaigns to walk through before giving up (default 10). Each "
                          "attempt hits YouTube, so attempts are SPACED (see --walk-spacing).")
+    ap.add_argument("--target-batch-min", type=int, default=None, dest="target_batch_min",
+                    help="auto-advance BATCH floor: accumulate clips across campaigns until the "
+                         "running total reaches this many (default from config target_batch_min="
+                         "25). A FLOOR, not a cap — the current campaign always finishes and ALL "
+                         "its clips are kept. The walk stops at total>=target OR --auto-advance-max "
+                         "campaigns, whichever comes first.")
     ap.add_argument("--walk-spacing", type=int, default=None, dest="walk_spacing",
                     help="seconds to wait between auto-advance attempts (anti-throttle; default "
                          "from config walk_spacing_seconds=20). A detected bot-check backs off "
@@ -516,6 +631,12 @@ def main():
     # --auto-advance-max are tried, or the list is exhausted. Spacing between attempts (+ a
     # longer back-off on a detected bot-check) keeps 10 attempts from throttling YouTube.
     walk_depth = max(1, args.auto_advance_max)
+    target_batch_min = args.target_batch_min if args.target_batch_min is not None \
+        else DEFAULT_CONFIG["target_batch_min"]
+    # Fresh batch: clear any stale staging from a previously-interrupted walk so we never mix a
+    # new batch with an abandoned one. (The finished drafts/ from the LAST completed run are left
+    # alone here — they're archived per-campaign by activate_campaign on the first pick/intake.)
+    shutil.rmtree(C.DRAFTS_BATCH, ignore_errors=True)
     excluded = []
     throttled = {"v": False}
 
@@ -524,10 +645,14 @@ def main():
         state = _prepare_state(args)
         campaign = (C.load_json(C.RULES_JSON) or {}).get("campaign")
         C.log("=" * 70)
-        C.log(f"WALK attempt {attempt}/{walk_depth} — campaign {campaign!r}")
+        C.log(f"WALK attempt {attempt}/{walk_depth} — campaign {campaign!r} "
+              f"(batch target: {target_batch_min})")
         C.log("=" * 70)
         C.log(f"config: {state['config']}")
         _run_stages(state, args)               # raises C.NothingUsable on a dead campaign
+        # Cut finished for this campaign → harvest its drafts into the batch so the NEXT
+        # campaign's activate_campaign can't archive them away. Returns this campaign's count.
+        return _harvest_batch(campaign)
 
     def advance_fn(attempt):
         cfg = {**DEFAULT_CONFIG}
@@ -537,13 +662,17 @@ def main():
         throttled["v"] = _looks_like_throttle(text)   # back off harder next time if throttled
         return status
 
-    ok, attempts, reasons = walk(process_fn, advance_fn, walk_depth)
+    ok, attempts, total, reasons = walk(process_fn, advance_fn, walk_depth, target_batch_min)
+    # Assemble every campaign's staged clips into drafts/ as one best-first batch (even a partial
+    # batch that fell short of the floor — we keep whatever the thin board yielded).
+    finalized = _finalize_batch()
     if not ok:
-        C.fail(f"auto-advance walk stopped after {attempts} attempt(s) without a clippable "
-               f"campaign. Reasons: {reasons}. Excluded ids: {excluded}.")
+        C.fail(f"auto-advance walk stopped after {attempts} attempt(s) without producing a "
+               f"single clip. Reasons: {reasons}. Excluded ids: {excluded}.")
 
-    C.log(f"pipeline complete after {attempts} walk attempt(s) — drafts in drafts/ "
-          f"(best first), see drafts/manifest.json.")
+    met = "target met" if total >= target_batch_min else f"under target ({target_batch_min})"
+    C.log(f"pipeline complete after {attempts} walk attempt(s) — batch of {finalized} clip(s) "
+          f"[{met}]. Drafts in drafts/ (best first), see drafts/manifest.json.")
     offer_cleanup(args)
 
 

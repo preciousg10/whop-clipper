@@ -32,6 +32,8 @@ OTHER = CAMPAIGN / "other"        # kept-but-unhandled files (never silently dro
 TRANSCRIPTS = CAMPAIGN / "transcripts"
 DRAFTS = ROOT / "drafts"
 DRAFTS_ARCHIVE = ROOT / "drafts_archive"   # prior-campaign drafts moved here (never deleted)
+DRAFTS_BATCH = ROOT / "drafts_batch"       # auto-advance batch accumulation (staging across
+                                           # campaigns; finalized back into drafts/ at walk end)
 MEMORY = ROOT / "memory"
 STATE_PATH = ROOT / "state.json"
 
