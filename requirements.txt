@@ -14,6 +14,12 @@ Pillow>=10.0
 pypdf>=4.0
 python-docx>=1.1
 openpyxl>=3.1
+# TIER 2 footage hunt (hunt.py): load a JS-rendered THIRD-PARTY footage/rules site headlessly to
+# scrape the Drive/YouTube links off it. OPTIONAL — intake's Tier 1 (docs/drive/direct links, no
+# browser) handles the common case; if Playwright is missing, Tier 2 degrades to "unresolved" with
+# a loud install hint (never a crash). After installing, fetch the browser binary once:
+#   python -m playwright install chromium
+playwright>=1.40
 # TRACK-mode vertical reframe (cut.py layout=track/auto; OpenShorts-style face/person crop).
 # Heavy (ultralytics pulls torch); OPTIONAL — cut.py falls back to blur_fill and warns loudly if
 # missing. Models auto-download once into models/ (BlazeFace ~230KB, yolov8n.pt ~6MB).

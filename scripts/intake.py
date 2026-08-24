@@ -3,7 +3,10 @@
 Instead of just filing downloads and keyword-scanning the brief, intake now:
   1. READS EVERYTHING — extracts text from every doc (pdf/docx/sheets/txt/md/gdoc),
      probes every video (duration/resolution/aspect), classifies reference images,
-     and harvests URLs from all text (recursing ONE level to pull linked Drive/VODs).
+     and HUNTS for nested footage (hunt_and_download_footage + hunt.py): a tiered
+     frontier that follows docs/gdocs/drive up to 3 hops (Tier 1, no browser) and loads
+     a third-party site with Playwright only when needed (Tier 2), skipping any campaign
+     whose footage sits behind a login/signup/payment/manual gate.
   2. LLM-ANALYZES the whole corpus (brief + every doc + filenames) via Groq into
      structured rules.json. Deterministic keyword rules are a FLOOR the LLM augments,
      never removes.
@@ -25,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common as C
 import download as DL
 import analyze as AN
+import hunt as HUNT
 
 HASHTAG_RE = re.compile(r"(?<!\w)#[A-Za-z0-9_]+")
 MENTION_RE = re.compile(r"(?<!\w)@[A-Za-z0-9_.]+")
@@ -487,6 +491,158 @@ def _account_footage(budget, entries, url, cap):
           f"{budget['seconds'] / 3600:.2f}h{tail}")
 
 
+# --- TIERED FOOTAGE HUNT (Tiers 1 & 2) -----------------------------------------
+# Scout hands over links; intake HUNTS for where the real footage actually is before giving up.
+# A bounded frontier loop (hunt.MAX_HOPS hops) expands the seed links: footage is downloaded &
+# routed, Google Docs are read and their inner footage links followed, and a THIRD-PARTY website
+# is loaded with Playwright (only when a simple fetch can't extract its links). A login/signup/
+# payment/manual gate is recorded; intake acts on it only if NO free footage was found. See hunt.py.
+def _classify_hop(url):
+    """Route a discovered URL for the hunt:
+      'download' — hand to download_source, which routes by type (video→footage, image→asset,
+                   doc→doc): a Drive folder/file, YouTube/Kick/Twitch VOD or channel, a direct
+                   downloadable-file URL, or ANY local path (a provided watermark/doc/clip);
+      'gdoc'     — a Google Doc/Sheet: fetch its text (Tier 1) and follow the links inside;
+      'site'     — a third-party webpage: resolve via Tier 2 (simple fetch → Playwright);
+      'other'    — anything else: listed, not fetched.
+    NOTE: a Drive *file* link is 'download' here (DL.is_drive_file), NOT a gdoc — AN.classify_url
+    lumps all of drive.google.com under 'gdoc', which would misroute a Drive video found in a doc."""
+    if not DL.is_url(url):
+        return "download"                       # local path — download_source._fetch_local routes it
+    if DL.is_drive_folder(url) or DL.is_drive_file(url):
+        return "download"
+    cu = AN.classify_url(url)
+    if cu == "gdoc":
+        return "gdoc"
+    if cu == "vod":
+        return "download"
+    # A direct URL straight to a downloadable file (video/image/doc) → fetch & route it.
+    ext = os.path.splitext(url.split("?", 1)[0])[1].lower()
+    if ext in DL.VIDEO_EXTS or ext in DL.IMAGE_EXTS or ext in DL.DOC_EXTS:
+        return "download"
+    return "site"
+
+
+def hunt_and_download_footage(seed_urls, *, cookies, downloaded, max_source_height, original,
+                              prior_by_source, budget, resources, corpus_parts, failures):
+    """Expand `seed_urls` into ALL freely-reachable footage, following docs/gdocs/drive/sites up
+    to hunt.MAX_HOPS hops (Tier 1 first; Playwright only for third-party sites). Downloads
+    discovered footage with the CAPPED machinery (footage cap, cookies, per-file skip-not-fail
+    all intact). Mutates `resources`/`corpus_parts`/`failures` in place.
+
+    Returns (harvested_urls, other_urls, barriers, path_log): barriers is a list of
+    (category, url) gates encountered; path_log is the human hunt trace for the coverage report."""
+    harvested, other_urls, barriers, path_log = [], [], [], []
+    seen_docs, seen_sites, seen_all = set(), set(), set()
+
+    def _dl(urls, label):
+        """Download footage-class urls with the capped machinery; process any docs among the
+        results and return the URLs harvested from those docs (to feed the next hop)."""
+        if not urls:
+            return []
+        C.log(f"  [{label}] resolving {len(urls)} footage/source link(s)…")
+        r2, f2 = download_links(urls, cookies, downloaded, max_source_height=max_source_height,
+                                original=original, prior_by_source=prior_by_source, budget=budget)
+        failures.extend(f2)
+        new_urls = []
+        for r in r2:
+            t = process_resource(r)
+            if t:
+                corpus_parts.append(f"\n\n### {r['path']}\n{t}")
+            new_urls += r.get("urls_found", [])
+        resources.extend(r2)
+        n_foot = sum(1 for r in r2 if r["kind"] == "footage")
+        if r2 or f2:
+            path_log.append(f"[{label}] downloaded {len(r2)} file(s) ({n_foot} footage"
+                            f"{f', {len(f2)} failed' if f2 else ''}); harvested {len(new_urls)} "
+                            f"link(s) from docs")
+        return new_urls
+
+    frontier = list(dict.fromkeys(seed_urls))
+    hop = 0
+    while frontier and hop <= HUNT.MAX_HOPS:
+        label = "seed" if hop == 0 else f"hop{hop}"
+        media, gdocs, sites = [], [], []
+        for u in frontier:
+            seen_all.add(u)
+            harvested.append(u)
+            k = _classify_hop(u)
+            if k == "download":
+                media.append(u)
+            elif k == "gdoc":
+                gdocs.append(u)
+            elif k == "site":
+                sites.append(u)
+            else:
+                other_urls.append(u)
+        next_frontier = []
+
+        # 1) DOWNLOAD & ROUTE (Tier 1) — footage/asset/doc. Docs pulled from a Drive folder or a
+        #    direct doc URL harvest more links to follow.
+        next_frontier += _dl(media, label)
+
+        # 2) GOOGLE DOCS (Tier 1) — fetch text, follow the footage links inside.
+        for u in gdocs:
+            if u in seen_docs:
+                continue
+            seen_docs.add(u)
+            downloaded.add(u)
+            text, method = AN.fetch_gdoc_text(u)
+            if text and text.strip():
+                dest = C.DOCS / ("gdoc_" + re.sub(r"\W+", "_", u)[-40:] + ".txt")
+                dest.write_text(text, encoding="utf-8")
+                inner = AN.harvest_urls(text)
+                resources.append({
+                    "path": os.path.relpath(dest, C.ROOT), "kind": "doc", "source": u,
+                    "usage": [f"fetched linked Google file text ({len(text)} chars via {method})"],
+                    "notes": [], "urls_found": inner})
+                corpus_parts.append(f"\n\n### {u}\n{text}")
+                next_frontier += inner
+                C.log(f"  [{label}] Google Doc → read ({len(text)} chars) → {len(inner)} link(s): {u[:60]}")
+                path_log.append(f"[{label}] Google Doc {u[:55]} → read → found {len(inner)} link(s)")
+            else:
+                b = HUNT.detect_barrier(method)
+                if b or "login" in method.lower():
+                    b = b or "login"
+                    barriers.append((b, u))
+                    C.warn(f"  [{label}] Google Doc requires {b} ({method}) — not following: {u}")
+                    path_log.append(f"[{label}] Google Doc {u[:55]} → {b} wall ({method})")
+                else:
+                    other_urls.append(u)
+                    path_log.append(f"[{label}] Google Doc {u[:55]} → unreadable ({method})")
+
+        # 3) THIRD-PARTY SITES (Tier 2) — simple fetch, then Playwright only if needed.
+        for u in sites:
+            if u in seen_sites:
+                continue
+            seen_sites.add(u)
+            other_urls.append(u)
+            res = HUNT.extract_footage_links_from_site(u, cookies=cookies)
+            links = res.get("links") or []
+            if links:
+                how = "simple fetch" if res.get("tier") == "fetch" else "Playwright loaded"
+                C.log(f"  [{label}] third-party site → {how} → found {len(links)} footage/doc "
+                      f"link(s): {u[:60]}")
+                path_log.append(f"[{label}] site {u[:55]} → {how} → {len(links)} link(s) found")
+                next_frontier += links
+            elif res.get("barrier"):
+                barriers.append((res["barrier"], u))
+                C.warn(f"  [{label}] site requires {res['barrier']} — skipping this route: {u}")
+                path_log.append(f"[{label}] site {u[:55]} → {res['barrier']} wall — skipped")
+            else:
+                note = res.get("note") or "no footage links found"
+                C.warn(f"  [{label}] site yielded no footage ({note}): {u}")
+                path_log.append(f"[{label}] site {u[:55]} → {note}")
+
+        # Advance: only follow links we haven't already handled/downloaded.
+        frontier = [u for u in dict.fromkeys(next_frontier)
+                    if u not in downloaded and u not in seen_docs and u not in seen_sites
+                    and u not in seen_all]
+        hop += 1
+
+    return (list(dict.fromkeys(harvested)), list(dict.fromkeys(other_urls)), barriers, path_log)
+
+
 # --- outputs -------------------------------------------------------------------
 def write_brief_md(campaign, rules, raw):
     def block(items):
@@ -819,12 +975,16 @@ def build_ambiguities(rules, resources, llm_used):
     return amb
 
 
-def print_coverage(campaign, rules, resources, manifest, failures, other_urls):
+def print_coverage(campaign, rules, resources, manifest, failures, other_urls, hunt_path=None):
     foot = [r for r in resources if r["kind"] == "footage"]
     print("\n" + "=" * 66)
     print(f"INTAKE COVERAGE REPORT — {campaign}")
     print("=" * 66)
     print(f"Footage: {len(foot)} file(s), ~{manifest['footage_total_hours']} h")
+    if hunt_path:
+        print("\nFootage hunt path (how footage was resolved):")
+        for step in hunt_path:
+            print(f"  → {step}")
     print("\nEvery resource and how it was used:")
     for r in resources:
         print(f"  • {r['path']}  [{r['kind']}]")
@@ -888,62 +1048,44 @@ def main():
         prior_by_source.setdefault(d.get("source"), []).append(d)
 
     # FOOTAGE CAP (VOD-by-VOD): resolve hours from CLI > state config > default 10, and thread a
-    # shared budget through both download passes so the running total spans pass 1 + recursion.
+    # shared budget through the whole footage hunt so the running total spans every hop.
     cfg_cap = (C.load_json(C.STATE_PATH, default={}) or {}).get("config", {}).get("footage_cap_hours")
     cap_hours = args.footage_cap_hours if args.footage_cap_hours is not None else float(cfg_cap or 10)
     budget = {"seconds": 0.0, "cap": (cap_hours * 3600.0 if cap_hours and cap_hours > 0 else None)}
     if budget["cap"]:
         C.log(f"footage cap: downloading VODs one at a time up to ~{cap_hours:g}h cumulative.")
 
-    # Pass 1: download the given links, then read/probe each.
-    C.log(f"downloading {len(links)} source(s)…")
-    resources, failures = download_links(links, args.cookies_from_browser, downloaded,
-                                         max_source_height=args.max_source_height,
-                                         original=args.original,
-                                         prior_by_source=prior_by_source, budget=budget)
+    # TIERED FOOTAGE HUNT: expand the seed links (+ URLs in the brief) into all freely-reachable
+    # footage — following docs/gdocs/drive/sites up to hunt.MAX_HOPS hops (Playwright only for
+    # third-party sites). Footage is downloaded with the CAPPED machinery (cap/cookies/skip intact).
+    resources, failures = [], []
     corpus_parts = [brief]
-    for r in resources:
-        t = process_resource(r)
-        if t:
-            corpus_parts.append(f"\n\n### {r['path']}\n{t}")
+    seed_frontier = list(dict.fromkeys(list(links) + AN.harvest_urls(brief)))
+    C.log(f"footage hunt: resolving from {len(seed_frontier)} seed link(s) "
+          f"(up to {HUNT.MAX_HOPS} hop(s); Playwright only for third-party sites)…")
+    harvested, other_urls, barriers, hunt_path = hunt_and_download_footage(
+        seed_frontier, cookies=args.cookies_from_browser, downloaded=downloaded,
+        max_source_height=args.max_source_height, original=args.original,
+        prior_by_source=prior_by_source, budget=budget,
+        resources=resources, corpus_parts=corpus_parts, failures=failures)
 
-    # Harvest URLs from brief + all docs; recurse ONE level.
-    harvested = AN.harvest_urls("\n".join(corpus_parts))
-    for r in resources:
-        harvested += r.get("urls_found", [])
-    harvested = list(dict.fromkeys(harvested))
-    media = [u for u in harvested if AN.classify_url(u) in ("drive_folder", "vod") and u not in downloaded]
-    gdocs = [u for u in harvested if AN.classify_url(u) == "gdoc" and u not in downloaded]
-    other_urls = [u for u in harvested if AN.classify_url(u) == "other"]
+    if hunt_path:
+        C.log("footage hunt path:")
+        for step in hunt_path:
+            C.log(f"    {step}")
 
-    if media:
-        C.log(f"recursing one level: downloading {len(media)} linked media source(s)…")
-        r2, f2 = download_links(media, args.cookies_from_browser, downloaded,
-                                max_source_height=args.max_source_height,
-                                original=args.original,
-                                prior_by_source=prior_by_source, budget=budget)
-        failures += f2
-        for r in r2:
-            t = process_resource(r)
-            if t:
-                corpus_parts.append(f"\n\n### {r['path']}\n{t}")
-        resources += r2
-
-    for u in gdocs:                       # fetch linked Google Docs/Sheets as text
-        downloaded.add(u)
-        text, method = AN.fetch_gdoc_text(u)
-        dest = C.DOCS / ("gdoc_" + re.sub(r"\W+", "_", u)[-40:] + ".txt")
-        res = {"path": os.path.relpath(dest, C.ROOT), "kind": "doc", "source": u,
-               "usage": [], "notes": [], "urls_found": []}
-        if text and text.strip():
-            dest.write_text(text, encoding="utf-8")
-            res["text_len"] = len(text)
-            res["usage"].append(f"fetched linked Google file text ({len(text)} chars via {method})")
-            corpus_parts.append(f"\n\n### {u}\n{text}")
-        else:
-            res["usage"].append(f"UNREAD linked Google file — {method}")
-            res["notes"].append(method)
-        resources.append(res)
+    # HARD STOP — decide reachability BEFORE spending LLM tokens. If the hunt found no video and a
+    # login / signup / payment / manual gate stood between us and the footage, name it and skip
+    # (fail loud → the auto-advance walk moves on). We NEVER enter credentials or pay, ever.
+    footage_now = [r for r in resources if r["kind"] == "footage"]
+    if not footage_now:
+        if barriers:
+            cats = ", ".join(sorted({b for b, _ in barriers}))
+            urls = ", ".join(u for _, u in barriers[:4])
+            C.fail(f"footage requires {cats} — skipping campaign. No freely-reachable footage was "
+                   f"found; every route to it hit a login/signup/payment/manual wall ({urls}).")
+        C.fail("intake produced no reachable footage — nothing to clip. Followed every free "
+               "link / doc / site to the hop limit and found no video. Check the links/log above.")
 
     tree = "\n".join(r["path"] for r in resources)
     corpus = "\n".join(corpus_parts) + "\n\n### FILES\n" + tree
@@ -1007,11 +1149,15 @@ def main():
     C.mark_stage(state, "intake", footage_hours=manifest["footage_total_hours"],
                  banned_words=len(rules.get("banned_words", [])), resources=len(resources))
 
-    print_coverage(args.campaign, rules, resources, manifest, failures, other_urls)
+    print_coverage(args.campaign, rules, resources, manifest, failures, other_urls, hunt_path)
 
+    # Footage reachability was already enforced (HARD STOP) right after the hunt — by here we have
+    # at least one footage file. A gate we routed AROUND (free footage still found) is just noted.
     footage = [r for r in resources if r["kind"] == "footage"]
-    if not footage:
-        C.fail("intake produced no footage — cannot produce clips. Check the links/log above.")
+    if barriers:
+        cats = ", ".join(sorted({b for b, _ in barriers}))
+        C.warn(f"note: {len(barriers)} gated route(s) ({cats}) were skipped, but "
+               f"{len(footage)} footage file(s) were freely reachable — proceeding.")
     if failures:
         C.warn(f"{len(failures)} optional source(s) failed (see report) — continuing with "
                f"{len(footage)} footage file(s).")

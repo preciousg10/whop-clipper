@@ -87,10 +87,30 @@ cause, not just the guard.
 
 **Intake is an analyst** (`intake.py` + `analyze.py`): it routes every file by type
 (video/image/doc/other — nothing dropped), extracts text from every doc + link-shared
-Google Docs, probes videos, harvests URLs and recurses ONE level, then LLM-extracts
+Google Docs, probes videos, HUNTS for nested footage (below), then LLM-extracts
 structured rules via Groq (deterministic keyword rules are a FLOOR the LLM augments,
 never removes). It writes `knowledge.md` (per-campaign digest) and ends with a coverage
 report; unused/ambiguous items are flagged, never guessed.
+
+**TIERED FOOTAGE HUNT** (`intake.hunt_and_download_footage` + `hunt.py`): scout hands over
+links; intake resolves WHERE the real footage actually is before giving up, simplest-method-first
+via a bounded frontier loop (`hunt.MAX_HOPS`=3 hops: resource → doc → drive/link). **TIER 1 (no
+browser):** direct footage (YouTube/Drive/Kick/direct video URL), Google Docs (fetch text + follow
+the footage links inside), Drive folders (list/route — if only docs inside, a doc one level deeper
+is followed); `_classify_hop` routes each URL — **a Drive *file* link is `download`, NOT a gdoc**
+(`AN.classify_url` lumps all of drive.google.com under gdoc, which would misroute a Drive video
+found in a doc). Footage is downloaded with the EXISTING capped machinery (footage cap / cookies /
+per-file skip-not-fail all intact). **TIER 2 (Playwright, ONLY when needed):** a THIRD-PARTY website
+whose links a simple fetch can't extract → `hunt.extract_footage_links_from_site` (plain fetch
+FIRST, escalate to headless chromium only if that finds nothing) scrapes the Drive/YouTube links off
+the rendered page. NEVER used for Drive/YouTube/Doc. Playwright is OPTIONAL — missing lib/binary
+degrades Tier 2 to "unresolved" with a loud install hint, never a crash. **HARD STOP:** if reaching
+footage needs login / signup / payment / any manual step (`hunt.detect_barrier`), intake NEVER
+proceeds — it fails loud ("footage requires login/signup/payment — skipping campaign") so the
+auto-advance walk moves on. We never enter credentials or pay. A gate is acted on ONLY when NO free
+footage was found (a route we can go around is ignored: footage-found wins). Campaign fails only if
+NO reachable footage exists. The whole hunt path is logged ("Google Doc → found link → downloading"
+/ "site → Playwright loaded → 5 Drive links" / "site → signup wall — skipped") in the coverage report.
 
 `rules.json` (banned words + **banned topics** + required elements + spatial
 constraints + …) is the contract the caption gauntlet and the cut-stage rules gate
