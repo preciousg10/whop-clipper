@@ -268,7 +268,7 @@ def t7_intake_analyst(footage, watermark, brief):
     record("T7 url harvested from doc", any("example.com" in u for u in man.get("harvested_urls", [])))
     amb = rules.get("ambiguities", [])
     record("T7 ambiguities flag the unused file + LLM-skipped",
-           any("telemetry.bin" in a for a in amb) and any("LLM extraction skipped" in a for a in amb))
+           any("telemetry.bin" in a for a in amb) and any("LLM extraction did NOT run" in a for a in amb))
 
 
 def t4_full_pipeline(synth, watermark_path, brief_path):

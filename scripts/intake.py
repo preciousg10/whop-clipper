@@ -298,6 +298,9 @@ def build_floor(text, asset_names):
         "style_guidance": "",
         "examples_good": [],
         "examples_bad": [],
+        # Required onscreen-text/hook FORMAT (LLM fills it from the rules). Kept as a falsy {} in the
+        # floor so merge_rules takes the LLM's extracted pattern; stays {} when no format is required.
+        "required_onscreen_text_pattern": {},
     }
 
 
@@ -916,6 +919,17 @@ def build_posting_checklist(campaign, rules, raw_brief=""):
         else:
             emit("note", f"restriction: {d}")
 
+    # 4b) REQUIRED ONSCREEN-TEXT FORMAT ---------------------------------------
+    pat = rules.get("required_onscreen_text_pattern") or {}
+    if isinstance(pat, dict) and pat.get("required"):
+        section("Onscreen text / hook format (REQUIRED — wrong format = rejected)")
+        if pat.get("description"):
+            emit("note", pat["description"])
+        for t in (pat.get("templates") or [])[:8]:
+            emit("note", f"template: {t}")
+        emit("verify", "the hook's onscreen text follows this required format for THIS clip's "
+                       "content before posting.")
+
     # 5) QUALITY / FORMAT ------------------------------------------------------
     fmt = rules.get("format_specs") or {}
     quality_items = []
@@ -1048,6 +1062,10 @@ def write_knowledge_md(campaign, rules, resources, harvested, other_urls, corpus
     sec("Submission process", rules.get("submission_process"))
     sec("Deadlines", rules.get("deadlines"))
     sec("Payout terms", rules.get("payout_terms"))
+    _pat = rules.get("required_onscreen_text_pattern") or {}
+    if isinstance(_pat, dict) and _pat.get("required"):
+        sec("Required onscreen-text/hook format (MANDATORY)",
+            [_pat.get("description", "")] + [f"template: {t}" for t in (_pat.get("templates") or [])])
     sec("Style guidance", [rules.get("style_guidance")] if rules.get("style_guidance") else [])
     sec("Examples — good", rules.get("examples_good"))
     sec("Examples — bad", rules.get("examples_bad"))
@@ -1092,8 +1110,10 @@ def build_ambiguities(rules, resources, llm_used):
     for s in rules.get("spatial_constraints", []):
         amb.append(f"Spatial constraint from {s['file']} needs confirmation (exact margins/positions).")
     if not llm_used:
-        amb.append("LLM extraction skipped (offline / no GROQ_API_KEY) — rules are "
-                   "deterministic-only; re-run with Groq for full extraction.")
+        amb.append("LLM extraction did NOT run (offline mode, or no LLM keys in this process's "
+                   "env, or the model returned no usable JSON) — rules are deterministic-only and "
+                   "likely INCOMPLETE. Verify required hashtags/mentions/onscreen-text format/"
+                   "banned words, then re-run intake with GROQ_API_KEY[_1..N] set.")
     return amb
 
 
@@ -1222,10 +1242,27 @@ def main():
     asset_names = [os.path.basename(r["path"]) for r in resources if r["kind"] == "asset"]
     floor = build_floor(corpus, asset_names)
     client = C.groq_client()
-    llm = AN.groq_extract(client, args.campaign, corpus, floor) if client else {}
-    llm_used = client is not None and bool(llm)
     if client is None:
-        C.warn("offline / no GROQ_API_KEY — skipping LLM extraction; deterministic rules only.")
+        # Be explicit about WHY — the common trap is running without the keys in THIS process's env
+        # (GROQ_API_KEY_1..N are read from env only) or with CLIPPER_OFFLINE=1.
+        why = ("CLIPPER_OFFLINE=1 (offline mode)" if C.offline_mode()
+               else "no LLM keys in this process's environment (set GROQ_API_KEY_1..N / "
+                    "GEMINI_API_KEY / CEREBRAS_API_KEY)")
+        C.warn(f"LLM extraction OFF — {why}. Rules will be deterministic-only and likely "
+               f"INCOMPLETE (missed hashtags/mentions/onscreen-text/banned words).")
+        llm = {}
+    else:
+        C.log(f"intake: extracting campaign rules via LLM — {client.status()}")
+        llm = AN.groq_extract(client, args.campaign, corpus, floor)
+        if llm:
+            C.log(f"intake: LLM extracted {sum(1 for k in llm if llm.get(k))} populated rule "
+                  f"field(s) (hashtags={len(llm.get('hashtags') or [])}, "
+                  f"mentions={len(llm.get('mentions') or [])}, "
+                  f"required_elements={len(llm.get('required_elements') or [])}).")
+        else:
+            C.warn("LLM extraction ran but returned no usable JSON — deterministic rules only. "
+                   "Check the corpus actually contains the rules text.")
+    llm_used = client is not None and bool(llm)
     rules = AN.merge_rules(floor, llm)
     rules["campaign"] = args.campaign
 

@@ -212,7 +212,8 @@ def image_dims(path):
 # --- LLM structured extraction -------------------------------------------------
 LLM_FIELDS = ("required_elements", "banned_words", "banned_topics", "platform_rules",
               "format_specs", "hashtags", "mentions", "submission_process", "deadlines",
-              "payout_terms", "style_guidance", "examples_good", "examples_bad")
+              "payout_terms", "style_guidance", "examples_good", "examples_bad",
+              "required_onscreen_text_pattern")
 
 
 def groq_extract(client, campaign, corpus, floor):
@@ -222,14 +223,32 @@ def groq_extract(client, campaign, corpus, floor):
         return {}
     corpus = corpus[:24000]     # keep within context; note truncation upstream
     system = (
-        "You are a meticulous campaign-rules analyst for a short-form clipping team. "
-        "Extract EVERYTHING relevant from the campaign corpus into STRICT JSON with keys: "
-        + ", ".join(LLM_FIELDS) + ". "
-        "banned_words = individual words/phrases that must never appear. "
-        "banned_topics = themes to avoid. format_specs = {length, aspect_ratio, safe_zones, "
-        "resolution} if stated. required_elements = list of {type, detail}. examples_good/"
-        "examples_bad = short strings. Use [] or \"\" when unknown — NEVER invent a rule. "
-        "Return ONLY the JSON object."
+        "You are a meticulous campaign-rules analyst for a short-form clipping team. These rules "
+        "are a CONTRACT — a submission is REJECTED if any is missed, so extract them ALL. "
+        "Read the WHOLE corpus (brief + every rules doc) and output STRICT JSON with keys: "
+        + ", ".join(LLM_FIELDS) + ". Field meanings:\n"
+        "- hashtags = EVERY hashtag the caption/description MUST include, verbatim WITH the '#' "
+        "(e.g. \"#santacruzmedicinals\"). Capture mandatory AND explicitly-required ones. Miss "
+        "none — a missing required hashtag = rejected post.\n"
+        "- mentions = every @handle that must be tagged/mentioned (verbatim, with '@').\n"
+        "- banned_words = individual words/phrases that must never appear (campaign-specific — "
+        "include EVERY one the rules name, not just generic examples).\n"
+        "- banned_topics = themes to avoid.\n"
+        "- format_specs = {length, min_length_seconds, max_length_seconds, aspect_ratio, "
+        "safe_zones, resolution, language} — fill any the rules state (e.g. min 15s → "
+        "min_length_seconds: 15; English only → language: \"English\").\n"
+        "- required_elements = list of {type, detail} for EVERY other requirement: subject/person "
+        "who must be visible, watermark/logo rules, forbidden editor logos (e.g. no Opus/CapCut "
+        "logo), CTA, disclosure, caption-style notes, etc. One entry per requirement.\n"
+        "- required_onscreen_text_pattern = if the rules require the ONSCREEN TEXT / hook to follow "
+        "a specific FORMAT or wording pattern, capture it as an object "
+        "{\"required\": true, \"description\": \"<the rule in one line>\", \"templates\": [\"<opener "
+        "1>\", \"<opener 2>\", ...]} where templates are the exact required openers/phrasings from "
+        "the rules (e.g. \"Santa Cruz's take on ___\", \"Santa Cruz explains ___\"). If the rules "
+        "impose NO onscreen-text format, use {\"required\": false}.\n"
+        "- examples_good/examples_bad = short strings. "
+        "Use [] / \"\" / {\"required\": false} when unknown — NEVER invent a rule, but NEVER drop "
+        "one that is stated. Return ONLY the JSON object."
     )
     user = (f"Campaign: {campaign}\n"
             f"Deterministic floor already known (augment, do not drop): {json.dumps(floor)}\n\n"

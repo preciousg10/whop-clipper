@@ -426,8 +426,44 @@ def _pick_hook_moment(client, lines, campaign):
     return None
 
 
-def _groq_candidates(client, campaign, moment, style_notes, event="", emoji_in_caption=True):
+def _groq_candidates(client, campaign, moment, style_notes, event="", emoji_in_caption=True,
+                     onscreen_pattern=None):
     event = (event or moment.get("text") or "").strip()
+    knowledge = C.load_knowledge()[:600]
+    ev_line = (f"What happens / is said in THIS clip (reference it specifically): {event!r}\n"
+               if event else
+               "This clip has no transcript — keep the text specific to the visible moment, "
+               "not generic.\n")
+    # REQUIRED ONSCREEN-TEXT FORMAT (FIX 2): when the campaign mandates a hook wording pattern
+    # (e.g. "Santa Cruz explains ___"), the hook MUST follow it — the five generic hook patterns
+    # do NOT apply. Generate pattern-conforming lines completed from THIS clip's content.
+    if onscreen_pattern:
+        tmpls = onscreen_pattern.get("templates") or []
+        system = (
+            "You write the ONSCREEN TEXT (the top hook) burned onto a vertical short-form clip. "
+            "This campaign REQUIRES the onscreen text to follow a FIXED format — you MUST use it "
+            "verbatim as the opener or the post is REJECTED. "
+            + (f"Required format: {onscreen_pattern.get('description')} " if onscreen_pattern.get("description") else "")
+            + "Use ONE of these exact openers, then COMPLETE it with what THIS clip is about:\n"
+            + "\n".join(f"  - {t}" for t in tmpls) + "\n"
+            "RULES: keep the opener wording EXACTLY, then finish it in ~2-6 words on the clip's "
+            "real topic. Short, punchy, ONE line, max 10 words, NO hashtags, NO emoji. "
+            "GROUNDING (CRITICAL): complete the opener using ONLY the topic/person/thing actually "
+            "in the transcript below — never invent a subject that isn't in the clip. "
+            f"Return {N_CANDIDATES} options, ONE PER LINE — no numbering, no quotes.")
+        user = (f"Audience: {C.AUDIENCE_CONTEXT}\n\n"
+                + (f"Campaign knowledge (apply this):\n{knowledge}\n\n" if knowledge else "")
+                + f"Campaign: {campaign}\n" + ev_line
+                + f"Write {N_CANDIDATES} onscreen-text options, each STARTING with one of the "
+                  f"required openers and completed from THIS clip's actual content.")
+        last = ""
+        for _attempt in range(3):
+            last = C.llm_chat(client, system, user, temperature=0.8, max_tokens=320)
+            cands = [c for c in _parse_caption_lines(last) if c][:N_CANDIDATES]
+            if len(cands) >= 2:
+                return cands
+        C.warn(f"caption (required-format) unparseable for moment {moment.get('id')} — synthesizing.")
+        return [_synth_required(tmpls, event)]
     emoji_rule = (
         "all lowercase, end with 1-2 emoji as punctuation (from: 😭 💀 🔥 👀 ✌️ 🥀 😳 🤣), "
         if emoji_in_caption else
@@ -453,11 +489,6 @@ def _groq_candidates(client, campaign, moment, style_notes, event="", emoji_in_c
         "Be SPECIFIC to this clip. Respect the campaign banned words/topics in the "
         "knowledge below. "
         f"Return {N_CANDIDATES} captions, ONE PER LINE — no numbering, no quotes, no JSON.")
-    knowledge = C.load_knowledge()[:600]
-    ev_line = (f"What happens / is said in THIS clip (reference it specifically): {event!r}\n"
-               if event else
-               "This clip has no transcript — it is a loud, chaotic physical moment; keep the "
-               "caption specific to visible sports/racing action, not generic.\n")
     user = (f"Audience: {C.AUDIENCE_CONTEXT}\n\n"
             + (f"Campaign knowledge (apply this):\n{knowledge}\n\n" if knowledge else "")
             + f"Campaign: {campaign}\nStyle notes: {style_notes}\n"
@@ -476,6 +507,98 @@ def _groq_candidates(client, campaign, moment, style_notes, event="", emoji_in_c
         _LOGGED_BAD_GROQ["done"] = True
     C.warn(f"caption fallback (templates) for moment {moment.get('id')}.")
     return _offline_candidates(moment)
+
+
+# --- required onscreen-text FORMAT (FIX 2) -------------------------------------
+# When intake extracts a mandatory hook/onscreen-text pattern into rules.json
+# (required_onscreen_text_pattern), the caption stage must MAKE the hook follow it, filled from the
+# clip's real content — the generic five-hook style is bypassed for that campaign.
+def _required_onscreen(rules):
+    """The campaign's required onscreen-text pattern as {description, templates}, or None."""
+    p = (rules or {}).get("required_onscreen_text_pattern") or {}
+    if isinstance(p, dict) and p.get("required"):
+        tmpls = list(p.get("templates") or p.get("examples") or [])
+        if tmpls:
+            return {"description": p.get("description", ""), "templates": tmpls}
+    return None
+
+
+def _opener_words(template):
+    """The FIXED opener words of a template — the text before the fill placeholder
+    ('Santa Cruz explains ___' -> ['santa','cruz','explains'])."""
+    head = re.split(r"_{2,}|\[|\{|<|\.\.\.|…", template or "")[0]
+    return re.sub(r"[^a-z0-9 ]", " ", head.lower()).split()
+
+
+def _required_anchor(templates):
+    """Longest common leading word-run shared by every template — the brand anchor the hook must
+    start with ('Santa Cruz [verb]…' family -> ['santa','cruz']). Empty if templates disagree."""
+    seqs = [_opener_words(t) for t in templates if _opener_words(t)]
+    if not seqs:
+        return []
+    pref = seqs[0]
+    for s in seqs[1:]:
+        i = 0
+        while i < len(pref) and i < len(s) and pref[i] == s[i]:
+            i += 1
+        pref = pref[:i]
+    return pref
+
+
+def _matches_required(text, templates):
+    """True if `text` begins with the required brand anchor (so it conforms to the mandated
+    'Santa Cruz …' onscreen format). Anchor-based, so any allowed verb ('explains'/'reveals'/…)
+    passes while an off-format line ('nah this is crazy') is rejected."""
+    anchor = _required_anchor(templates)
+    if not anchor:
+        return True                                    # no shared anchor to enforce
+    words = re.sub(r"[^a-z0-9 ]", " ", (text or "").lower()).split()
+    return words[:len(anchor)] == anchor
+
+
+_SYNTH_STOP = {"that", "this", "them", "they", "just", "like", "really", "actually", "gonna",
+               "yeah", "know", "what", "when", "your", "youre", "with", "have", "here", "there",
+               "about", "because", "would", "could", "should", "their", "then", "than", "into"}
+
+
+def _synth_required(templates, event):
+    """Guaranteed-valid onscreen text when the LLM output can't be used: the first template's
+    opener + a couple of grounded content words from the clip ('Santa Cruz explains lab results')."""
+    opener = re.split(r"_{2,}|\[|\{|<|\.\.\.|…", templates[0])[0].strip().rstrip(":—-").strip()
+    words = [w for w in re.findall(r"[A-Za-z]+", event or "") if len(w) > 3
+             and w.lower() not in _SYNTH_STOP]
+    tail = " ".join(words[:2]) if words else "this"
+    return f"{opener} {tail}".strip()
+
+
+def _required_format_clip(client, campaign, m, event, onscreen, banned):
+    """Build the hook for a campaign that MANDATES an onscreen-text format. Returns
+    (best, variant, cands, killed). Enforces: the required opener, banned words, and grounding on
+    the completion; skips the generic five-hook gauntlet (the format IS the structure)."""
+    tmpls = onscreen["templates"]
+    cands = _groq_candidates(client, campaign, m, "", event, emoji_in_caption=False,
+                             onscreen_pattern=onscreen)
+    cands = [" ".join(c.split()) for c in cands if c and c.strip()]
+    banned_clean, killed = gauntlet(cands, banned)
+    # keep only lines that actually follow the required format
+    conforming = [c for c in banned_clean if _matches_required(c, tmpls)]
+    for c in banned_clean:
+        if not _matches_required(c, tmpls):
+            killed.append({"caption": c, "reason": "does not follow required onscreen-text format"})
+    # grounding on the FILLED part (don't let the completion invent a subject)
+    tvocab = _transcript_vocab(event)
+    anchor = set(_required_anchor(tmpls))
+    if len(tvocab) >= 3:
+        grounded = [c for c in conforming
+                    if not _ungrounded_terms(" ".join(w for w in c.split()
+                                                       if w.lower() not in anchor), tvocab)]
+        conforming = grounded or conforming
+    pool = conforming or [_synth_required(tmpls, event)]
+    # prefer the punchiest conforming line (short, not a bare opener)
+    pool.sort(key=lambda c: (len(c.split()) >= 4, -len(c.split())), reverse=True)
+    best = finalize_caption(pool[0], emoji_in_caption=False)
+    variant = finalize_caption(pool[1], emoji_in_caption=False) if len(pool) > 1 else None
+    return best, variant, cands, killed
 
 
 # --- per-platform text ---------------------------------------------------------
@@ -547,6 +670,67 @@ def finalize_caption(text, emoji_in_caption=True):
     return text or "clip"
 
 
+def _generic_caption(cands, banned, event, m, hook_prefix_use, hook_prefix_cap, emoji_in_caption):
+    """The default flzsh five-hook caption path: banned + quality + grounding gauntlets, then
+    pick the best specific hook under the batch-variety cap. Returns (best, variant, killed).
+    Used when the campaign has NO required onscreen-text format."""
+    # gauntlet 1: banned words (HARD — these can never ship)
+    banned_clean, killed = gauntlet(cands, banned)
+    # gauntlet 2: quality (max 8 words, no describing, single line, has a hook)
+    kept = []
+    for c in banned_clean:
+        reason = quality_kill(c)
+        if reason:
+            killed.append({"caption": c, "reason": reason})
+        else:
+            kept.append(c)
+    # GROUNDING (Task 2): a hook may only be specific about words that are in THIS moment's
+    # transcript. Drop candidates that name something invented/mis-transcribed. Only enforced
+    # when we actually have transcript to ground on.
+    tvocab = _transcript_vocab(event)
+    enforce_ground = len(tvocab) >= 3
+
+    def _grounded_only(cs):
+        if not enforce_ground:
+            return list(cs)
+        return [c for c in cs if not _ungrounded_terms(c, tvocab)]
+
+    kept_g, clean_g = _grounded_only(kept), _grounded_only(banned_clean)
+    if kept_g:
+        pool = kept_g
+    elif clean_g:
+        C.warn(f"moment {m['id']}: no grounded hook-passing caption — using best grounded "
+               f"Groq line (plain + accurate over catchy nonsense).")
+        pool = clean_g
+    elif enforce_ground:
+        C.warn(f"moment {m['id']}: every candidate named something not in the transcript "
+               f"(invented/mis-transcribed) — falling back to a neutral grounded hook.")
+        pool = GROUNDED_FALLBACKS
+    elif kept:
+        pool = kept
+    elif banned_clean:
+        C.warn(f"moment {m['id']}: no candidate hit a hook pattern — keeping best raw "
+               f"Groq caption (specific to the clip) over a generic template.")
+        pool = banned_clean
+    else:
+        C.warn(f"moment {m['id']}: no usable Groq caption — generic curiosity fallback.")
+        pool = GROUNDED_FALLBACKS
+    ranked = sorted(pool, key=score_caption, reverse=True)
+    # FIX 6 — HOOK VARIETY: prefer the best specific hook whose structure is still under the batch
+    # cap; once every specific structure is capped, fall to the least-used neutral grounded hook.
+    best_raw = next((cap for cap in ranked
+                     if hook_prefix_use[_hook_prefix(cap)] < hook_prefix_cap), None)
+    if best_raw is None:
+        best_raw = min(GROUNDED_FALLBACKS,
+                       key=lambda cap: (hook_prefix_use[_hook_prefix(cap)], -score_caption(cap)))
+    hook_prefix_use[_hook_prefix(best_raw)] += 1
+    alt = ([cap for cap in ranked if _hook_prefix(cap) != _hook_prefix(best_raw)]
+           or [cap for cap in GROUNDED_FALLBACKS if _hook_prefix(cap) != _hook_prefix(best_raw)])
+    best = finalize_caption(best_raw, emoji_in_caption)
+    variant = finalize_caption(alt[0], emoji_in_caption) if alt else None
+    return best, variant, killed
+
+
 def run(state):
     selected = C.load_json(C.SELECTED_JSON)
     if not selected:
@@ -557,6 +741,12 @@ def run(state):
     campaign = rules.get("campaign", state.get("campaign") or "campaign")
     cfg = state.get("config", {})
     emoji_in_caption = bool(cfg.get("emoji_in_caption", True))   # flzsh: emoji as punctuation
+    # REQUIRED ONSCREEN-TEXT FORMAT (FIX 2): if the campaign mandates a hook wording pattern, the
+    # hook must FOLLOW it (filled from each clip), not the generic flzsh style.
+    onscreen = _required_onscreen(rules)
+    if onscreen:
+        C.log(f"captions: campaign REQUIRES onscreen-text format — hooks will follow it "
+              f"({len(onscreen['templates'])} template(s): {onscreen['templates'][:3]}…).")
     # Per-source transcript, so a text-less audio_spike can borrow the caster's nearby
     # reaction and get a SPECIFIC caption instead of a generic template.
     moments_doc = C.load_json(C.MOMENTS_JSON) or {}
@@ -600,74 +790,20 @@ def run(state):
             made_call = True
         event = (m.get("text") or "").strip() or _nearby_transcript(
             tr_by_source.get(m["source"], []), float(m["start"]), float(m["end"]))
-        cands = _offline_candidates(m) if client is None else _groq_candidates(
-            client, campaign, m, "stakes+outcome+emotion, specific to the clip", event,
-            emoji_in_caption)
-        # normalize: one line, lowercase energy (flzsh)
-        cands = [" ".join(c.split()).lower() for c in cands if c and c.strip()]
-        # gauntlet 1: banned words (HARD — these can never ship)
-        banned_clean, killed = gauntlet(cands, banned)
-        # gauntlet 2: quality (max 8 words, no describing, single line, has a hook)
-        kept = []
-        for c in banned_clean:
-            reason = quality_kill(c)
-            if reason:
-                killed.append({"caption": c, "reason": reason})
-            else:
-                kept.append(c)
-        # GROUNDING (Task 2): a hook may only be specific about words that are in THIS
-        # moment's transcript. Drop candidates that name something invented/mis-transcribed
-        # (e.g. "hibush") or bled from the prompt examples ("hamster" on a jewelry clip).
-        # Only enforced when we actually have transcript to ground on.
-        tvocab = _transcript_vocab(event)
-        enforce_ground = len(tvocab) >= 3
-
-        def _grounded_only(cands):
-            if not enforce_ground:
-                return list(cands)
-            return [c for c in cands if not _ungrounded_terms(c, tvocab)]
-
-        kept_g, clean_g = _grounded_only(kept), _grounded_only(banned_clean)
-        # Prefer grounded hook-passing captions; then any grounded banned-clean line (plain
-        # but accurate). If grounding is enforced and nothing grounded survives, use a
-        # NEUTRAL fallback that asserts nothing specific — never a catchy invented hook.
-        if kept_g:
-            pool = kept_g
-        elif clean_g:
-            C.warn(f"moment {m['id']}: no grounded hook-passing caption — using best grounded "
-                   f"Groq line (plain + accurate over catchy nonsense).")
-            pool = clean_g
-        elif enforce_ground:
-            C.warn(f"moment {m['id']}: every candidate named something not in the transcript "
-                   f"(invented/mis-transcribed) — falling back to a neutral grounded hook.")
-            pool = GROUNDED_FALLBACKS
-        elif kept:
-            pool = kept
-        elif banned_clean:
-            C.warn(f"moment {m['id']}: no candidate hit a hook pattern — keeping best raw "
-                   f"Groq caption (specific to the clip) over a generic template.")
-            pool = banned_clean
+        # REQUIRED-FORMAT PATH (FIX 2): campaign mandates a hook wording pattern → build a
+        # pattern-conforming hook (own generator + acceptance) and skip the generic five-hook style.
+        # Everything downstream (sound_fx, cold-open, platform text) is shared with the generic path.
+        if onscreen and client is not None:
+            best, variant, cands, killed = _required_format_clip(
+                client, campaign, m, event, onscreen, banned)
         else:
-            C.warn(f"moment {m['id']}: no usable Groq caption — generic curiosity fallback.")
-            pool = GROUNDED_FALLBACKS
-        ranked = sorted(pool, key=score_caption, reverse=True)
-        # FIX 6 — HOOK VARIETY. Prefer the best SPECIFIC (grounded) hook whose structure is still
-        # under the batch cap; keep specificity while a structure has room. Once every available
-        # specific structure is capped (the pools here are mostly 'how did'/'no way'), fall to the
-        # least-used NEUTRAL grounded hook — still accurate, but a different structure — so the
-        # batch spreads instead of repeating one phrasing a dozen times.
-        best_raw = next((cap for cap in ranked
-                         if hook_prefix_use[_hook_prefix(cap)] < hook_prefix_cap), None)
-        if best_raw is None:
-            best_raw = min(GROUNDED_FALLBACKS,
-                           key=lambda cap: (hook_prefix_use[_hook_prefix(cap)], -score_caption(cap)))
-        hook_prefix_use[_hook_prefix(best_raw)] += 1
-        alt = ([cap for cap in ranked if _hook_prefix(cap) != _hook_prefix(best_raw)]
-               or [cap for cap in GROUNDED_FALLBACKS if _hook_prefix(cap) != _hook_prefix(best_raw)])
-        # ALL captions on ALL clips: lowercase energy; emoji kept as punctuation unless
-        # the campaign config turns them off.
-        best = finalize_caption(best_raw, emoji_in_caption)
-        variant = finalize_caption(alt[0], emoji_in_caption) if alt else None
+            cands = _offline_candidates(m) if client is None else _groq_candidates(
+                client, campaign, m, "stakes+outcome+emotion, specific to the clip", event,
+                emoji_in_caption)
+            # normalize: one line, lowercase energy (flzsh)
+            cands = [" ".join(c.split()).lower() for c in cands if c and c.strip()]
+            best, variant, killed = _generic_caption(
+                cands, banned, event, m, hook_prefix_use, hook_prefix_cap, emoji_in_caption)
         # Non-speech sound labels for the karaoke (accurate, or nothing). Only fires when the
         # clip actually has a loud non-speech beat, and only adds ONE extra Groq call then.
         sound_fx = []
