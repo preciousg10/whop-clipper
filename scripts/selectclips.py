@@ -21,7 +21,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common as C
 
 POSTED = C.MEMORY / "posted_moments.json"
-MAX_CANDIDATES = 120     # cap what we hand Groq, to fit context
+# CANDIDATE POOL handed to the LLM scorer. This is deliberately GENEROUS, not a loudness gate:
+# the LLM judges CONTENT quality, so it must SEE a rich, content-diverse set (including quiet-but-
+# interesting moments), then it — not a dumb audio threshold — decides what's good. Candidates are
+# ranked by a CONTENT blend (_content_rank), NOT intensity, and we feed the top select_max_candidates
+# (default 400) of them. 4 rotating Groq keys make the extra batches affordable. (Overridable via
+# config select_max_candidates.) Old behavior took the top-120 by LOUDNESS — that starved the
+# scorer, discarding ~93 text-rich dialogue moments before it ever saw them.
+DEFAULT_MAX_CANDIDATES = 400
+DEFAULT_MIN_CAND_SECONDS = 3.0   # drop true sub-clip fragments (silence/one-word) before ranking
 MIN_LIVE_SCORE = 1       # drop the model's flat-0 "dead" picks (countdown/hype/logistics)
 
 # SAFETY CEILING + QUALITY BAR (Task D). We hunt HIGHLIGHT-worthiness, not a fixed count.
@@ -134,6 +142,71 @@ def _candidate_rank(m):
     action = len(ACTION_RE.findall(text))
     base = float(m.get("intensity", 0) or 0)
     return action * 4.0 + base * 2.0
+
+
+# CONTENT-INTEREST markers beyond ACTION_RE: story/reaction/controversy/opinion cues that make a
+# spoken moment worth clipping even at NORMAL volume. Used only to RANK candidates so the LLM sees
+# them — never to judge quality (that's the LLM's job). Kept broad on purpose.
+MARKER_RE = re.compile(
+    r"\b("
+    # story / narrative setup
+    r"so (i|we|he|she|they)|one time|the other day|turns out|i (told|said|asked|realized)|"
+    r"you know what|let me tell you|here'?s the thing|the story|remember when|back when|"
+    # opinion / controversy / hot-take / beef
+    r"honestly|the truth is|hot take|unpopular|controversial|the problem (is|with)|"
+    r"disagree|i'?m telling you|the reality|nobody (talks|says)|everybody|the fact that|"
+    r"overrated|underrated|the worst|the best|literally the|"
+    # reaction / emotion / emphasis
+    r"i can'?t|oh my|are you (kidding|serious)|no way|that'?s (crazy|insane|wild|nuts)|"
+    r"i swear|dead ass|deadass|lowkey|highkey|actually|"
+    # money / stakes / numbers-driven interest (this campaign is finance/health heavy)
+    r"million|billion|thousand|dollars|\$\d|per month|a month|net worth"
+    r")\b", re.I)
+
+
+def _content_rank(m):
+    """CONTENT-driven candidate score — the replacement for the old loudness gate. Higher = more
+    likely to be an interesting moment a person would clip, judged from the TRANSCRIPT, so a
+    normal-volume good story survives to reach the LLM. Blend of:
+      - richness:  how much is actually SAID (word count) — substance, not a fragment;
+      - density:   words per second — real dialogue vs a long quiet stretch;
+      - markers:   action + story/opinion/controversy/reaction/stakes cues in the text;
+      - intensity: audio loudness — kept as ONE WEAK signal (max ~1 of ~14), never the gate.
+    The LLM still does the actual quality judging; this only decides who gets SEEN by it."""
+    text = m.get("text") or ""
+    words = re.findall(r"[A-Za-z']+", text)
+    nwords = len(words)
+    dur = max(1.0, float(m.get("end", 0) or 0) - float(m.get("start", 0) or 0))
+    richness = min(nwords, 80) / 80.0                       # 0..1 substance / length
+    density = min(nwords / dur, 4.0) / 4.0                  # 0..1 dialogue density
+    markers = len(ACTION_RE.findall(text)) + len(MARKER_RE.findall(text)) + text.count("?")
+    intensity = float(m.get("intensity", 0) or 0)
+    return (richness * 3.0 + density * 2.0 + min(markers, 8) * 1.0
+            + min(intensity, 12.0) / 12.0 * 1.0)           # loudness: weak tiebreak ONLY
+
+
+def _prefilter_candidates(moments, min_seconds):
+    """Remove TRUE junk before ranking — but NEVER 'quiet': a normal-volume interesting moment
+    must survive. Drops: sub-`min_seconds` fragments (too short to be a clip), garbage transcripts
+    (dot-runs / stutter / heavy single-word repetition via _is_junk), and exact-duplicate text.
+    A wordless but LOUD audio_spike is KEPT (a real non-speech beat — scream/crash/laughter — that
+    the captions stage later labels), so junk-removal doesn't quietly delete non-speech action."""
+    out, seen = [], set()
+    for m in moments:
+        dur = float(m.get("end", 0) or 0) - float(m.get("start", 0) or 0)
+        if dur < min_seconds:
+            continue
+        loud_nonspeech = (m.get("type") == "audio_spike"
+                          and float(m.get("intensity", 0) or 0) >= 6.0)
+        if _is_junk(m) and not loud_nonspeech:
+            continue
+        txt = re.sub(r"\s+", " ", (m.get("text") or "").strip().lower())[:200]
+        key = (m.get("source"), txt)
+        if txt and key in seen:
+            continue
+        seen.add(key)
+        out.append(m)
+    return out
 
 
 def merge_close(moments, gap, max_span=60.0):
@@ -274,13 +347,18 @@ def _score_batch(client, campaign, knowledge, batch, n):
     return arr
 
 
-def _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap, dead_floor):
-    # Candidate pool = top by audio INTENSITY (the original approach that surfaced the
-    # batch-#1 keepers — loud crashes/fights/finishes). The fixed filler-kill + Groq's
-    # dead-score drop remove the countdown/hype that used to slip through; action words
-    # in the enriched transcript break intensity ties toward real calls.
-    cand = sorted(moments, key=lambda m: (m.get("intensity", 0), _candidate_rank(m)),
-                  reverse=True)[:MAX_CANDIDATES]
+def _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap, dead_floor,
+                 max_candidates=DEFAULT_MAX_CANDIDATES, min_cand_seconds=DEFAULT_MIN_CAND_SECONDS):
+    # CANDIDATE POOL — content-ranked, NOT loudness-gated. Remove true junk (fragments/garbage/
+    # exact-dupes), then rank by CONTENT (_content_rank: transcript richness, dialogue density,
+    # story/reaction/controversy markers; intensity only a weak tiebreak) and hand the LLM a
+    # generous top-N. The LLM — which actually judges content quality — is the filter now; a
+    # quiet-but-interesting moment (normal volume) reaches it instead of being cut for being soft.
+    pool = _prefilter_candidates(moments, min_cand_seconds)
+    cand = sorted(pool, key=_content_rank, reverse=True)[:max_candidates]
+    C.log(f"select: feeding {len(cand)} candidate(s) to the LLM — CONTENT-ranked, not loudness-"
+          f"gated (from {len(moments)} merged → {len(pool)} after junk-prefilter → cap "
+          f"{max_candidates}). Intensity is only a weak tiebreak.")
     knowledge = C.load_knowledge()[:800]
     by_id = {m["id"]: m for m in moments}
 
@@ -382,6 +460,9 @@ def run(state):
     hard_cap = int(cfg.get("select_hard_cap", DEFAULT_HARD_CAP))
     min_quality = float(cfg.get("select_min_quality", DEFAULT_GOOD_SCORE))
     dead_floor = float(cfg.get("select_dead_floor", DEFAULT_DEAD_FLOOR))
+    # Candidate pool fed to the LLM scorer — content-ranked, generous (not the loudest few).
+    max_candidates = int(cfg.get("select_max_candidates", DEFAULT_MAX_CANDIDATES))
+    min_cand_seconds = float(cfg.get("select_min_candidate_seconds", DEFAULT_MIN_CAND_SECONDS))
     # merge_gap was 15s, which chained non-stop commentary into 400-550s blobs. Tight
     # gap (~7s) + a hard span cap keep a merged moment one real beat.
     merge_gap = float(cfg.get("merge_gap_seconds", 7))
@@ -413,7 +494,7 @@ def run(state):
     else:
         C.log(f"select: LLM provider = {client.status()}")
         selected = _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap,
-                                dead_floor)
+                                dead_floor, max_candidates, min_cand_seconds)
 
     if not selected:
         raise C.NothingUsable(

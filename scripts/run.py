@@ -41,6 +41,14 @@ DEFAULT_CONFIG = {
     # LOW dead-floor: if even the BEST moment scores below this, the campaign is genuinely dead
     # (the score is text-blind, so keep this forgiving) → stop + auto-advance. 40+ ships.
     "select_dead_floor": 40,
+    # CANDIDATE POOL fed to the LLM scorer. The scorer judges CONTENT quality, so we must feed it
+    # a rich, content-diverse set — NOT the loudest moments. Candidates are ranked by a content
+    # blend (transcript richness, dialogue density, question/reaction/controversy markers); audio
+    # intensity is ONLY a weak tiebreak, never the gate. We then hand the LLM a generous top-N so
+    # quiet-but-interesting moments still get scored (4 rotating Groq keys make the extra calls
+    # affordable). select_min_candidate_seconds drops true sub-clip fragments before ranking.
+    "select_max_candidates": 400,
+    "select_min_candidate_seconds": 3.0,
     # LLM failover chain order (Unit: never dead-end on one provider's daily cap). All free-tier;
     # keys come ONLY from env (GROQ_API_KEY / GEMINI_API_KEY / CEREBRAS_API_KEY). Drop a name to
     # disable it, or reorder. A provider with a missing key/library is skipped automatically.
