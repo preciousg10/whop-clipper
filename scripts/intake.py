@@ -60,6 +60,9 @@ def apply_pick(args):
     args.campaign = meta.get("campaign") or args.campaign
     args.brief = _abs(meta.get("brief"))
     args.links = _abs(meta.get("links"))
+    # Scout's non-footage RESOURCE links (rules/requirements/content docs, with labels). Previously
+    # ignored — intake now FOLLOWS these to fetch the real rules doc (see fetch_rules_docs).
+    args.resource_links = list(meta.get("resource_links") or [])
     if not args.brief or not os.path.exists(args.brief):
         C.fail(f"pick references a brief that isn't on disk: {args.brief!r} "
                f"(from {pick_path}). Re-run pickcampaign.py.")
@@ -768,6 +771,143 @@ def hunt_and_download_footage(seed_urls, *, cookies, downloaded, max_source_heig
     return _finish()
 
 
+# --- AUTOMATIC RULES-DOC FETCH (general — all campaigns) ------------------------
+# Scout often captures only a POINTER as rules_text (e.g. "SEE RULES, REQUIREMENTS, AND CONTENT
+# DOCUMENT BELOW IN RESOURCES") — the real rules live in a LINKED document (a Google Doc, or a
+# resource/rules-doc link), NOT the page text. So — mirroring the footage hunt, but for RULES —
+# intake FOLLOWS those links and fetches the document text into the rules corpus BEFORE LLM
+# extraction. Reuses the existing fetchers (Google Doc export / local extract / plain web fetch).
+# A login/signup/payment wall on a rules doc is SKIPPED + flagged (never a crash), the same
+# HARD-STOP principle as footage. Rules docs are classified SEPARATELY from footage: a rules doc is
+# never downloaded as footage, and footage (VOD/Drive folder) is never fetched here.
+_RULES_LABEL_HINTS = ("rule", "requirement", "guideline", "content document", "content doc",
+                      "brief", "sop", "instruction", "clipping", "how to", "campaign doc",
+                      "notion", "must read", "readme", "read me", "policy", "criteria", "faq")
+_RULES_POINTER_RE = re.compile(
+    r"\bsee\b[^.\n]{0,40}\b(rules?|requirements?|documents?|docs?|resources?|below|guidelines?)\b"
+    r"|in (the )?resources?\b|linked (doc|document|below)|content document|refer to (the )?(doc|link)"
+    r"|\battached\b|below in resources|see (the )?(doc|document|link|google doc)", re.I)
+
+
+def _rules_section_text(brief):
+    """The rules-bearing text of the scout brief ('## Rules text' + '## On-modal requirements'
+    sections), used to decide whether the on-page rules are merely a POINTER to a doc."""
+    if not brief:
+        return ""
+    chunks = []
+    for header in ("## Rules text", "## On-modal requirements"):
+        i = brief.find(header)
+        if i == -1:
+            continue
+        rest = brief[i + len(header):]
+        j = rest.find("\n## ")
+        chunks.append(rest[:j] if j != -1 else rest)
+    return "\n".join(chunks).strip()
+
+
+def rules_text_is_pointer(brief):
+    """True when the campaign's on-page rules are just a POINTER to a linked document (or empty /
+    very thin) — i.e. the real rules must be fetched from a linked doc, not read off the page."""
+    sec = _rules_section_text(brief) or brief or ""
+    cleaned = re.sub(r"\(none[^)]*\)", "", sec, flags=re.I).strip()   # drop scout's placeholders
+    if len(cleaned) < 160:
+        return True
+    return bool(_RULES_POINTER_RE.search(cleaned))
+
+
+def classify_rules_doc(url, label=""):
+    """Route a link as a fetchable RULES DOCUMENT (never footage):
+      'gdoc'  — a Google Doc/Sheet/Slides or a Drive FILE (fetched via Google export);
+      'local' — a local path to a doc file (pdf/docx/txt/md/…);
+      'web'   — a direct doc-file URL, or a web page LABELED like a rules doc (rules/requirements/…);
+      None    — footage (YouTube/Kick/Twitch/Vimeo or a Drive FOLDER) or not a rules doc.
+    Drive FOLDERS and VOD hosts are footage — handled by the footage hunt, never fetched here."""
+    if not url:
+        return None
+    if not DL.is_url(url):
+        return "local" if os.path.splitext(url)[1].lower() in DL.DOC_EXTS else None
+    low = url.lower()
+    if any(h in low for h in ("youtube.com", "youtu.be", "kick.com", "twitch.tv", "vimeo.com")):
+        return None
+    if DL.is_drive_folder(url):
+        return None
+    if "docs.google.com" in low or "drive.google.com" in low:
+        return "gdoc"
+    path = low.split("?", 1)[0]                       # ignore the query (campaign names leak in)
+    if os.path.splitext(path)[1] in DL.DOC_EXTS:      # a direct doc-file URL
+        return "web"
+    if "whop.com" in low and ("/discover" in path or "/search" in path):  # Whop search/locator
+        return None                                                       # page is NOT a rules doc
+    # a web PAGE is a rules doc only when its LABEL, or its URL PATH (not the query), says so —
+    # matching hints against the whole URL would false-positive on a campaign name in the query.
+    if any(h in (label or "").lower() for h in _RULES_LABEL_HINTS):
+        return "web"
+    if any(h in path for h in ("rule", "requirement", "guideline", "brief", "/sop",
+                               "instruction", "policy", "criteria", "content-doc")):
+        return "web"
+    return None
+
+
+def _html_to_text(html):
+    """Strip tags/scripts from fetched HTML to plain text (good enough for LLM rule extraction)."""
+    import html as _html
+    txt = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html or "")
+    txt = re.sub(r"(?s)<[^>]+>", " ", txt)
+    txt = _html.unescape(txt)
+    return re.sub(r"[ \t]{2,}", " ", re.sub(r"\n{3,}", "\n\n", txt)).strip()
+
+
+def fetch_rules_docs(candidates, cookies, corpus_parts, resources, already):
+    """Fetch each RULES-doc candidate's text into the corpus, reusing the Google Doc / local /
+    plain-web fetchers. `candidates` = list of (url, label); `already` = urls the footage hunt has
+    already pulled into the corpus (skip them, no double-fetch). A login/signup/payment wall →
+    skip that doc + record a barrier (never a crash). Returns (fetched_count, barriers, path_log)."""
+    fetched, barriers, path_log = 0, [], []
+    seen = set(already or ())
+    for url, label in candidates:
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        kind = classify_rules_doc(url, label)
+        if kind is None:
+            continue
+        if kind == "gdoc":
+            text, method = AN.fetch_gdoc_text(url)
+        elif kind == "local":
+            p = url if os.path.isabs(url) else str(C.ROOT / url)
+            text, method = AN.extract_text(p)
+        else:                                                     # web
+            try:
+                text, method = _html_to_text(AN._fetch_text(url)), "web-fetch"
+            except Exception as e:
+                text, method = None, f"fetch failed: {e}"
+        tag = label or url
+        if text and text.strip():
+            dest = C.DOCS / ("rulesdoc_" + re.sub(r"\W+", "_", url)[-40:] + ".txt")
+            try:
+                dest.write_text(text, encoding="utf-8")
+                rel = os.path.relpath(dest, C.ROOT)
+            except Exception:
+                rel = url
+            corpus_parts.append(f"\n\n### RULES DOC: {tag}\n{text}")
+            resources.append({"path": rel, "kind": "doc", "source": url,
+                              "usage": [f"fetched RULES doc ({len(text)} chars via {method})"],
+                              "notes": [], "urls_found": AN.harvest_urls(text)})
+            fetched += 1
+            C.log(f"  rules-doc → fetched {len(text)} chars ({method}): {tag}")
+            path_log.append(f"rules doc {str(tag)[:55]} → fetched {len(text)} chars ({method})")
+        else:
+            b = HUNT.detect_barrier(method) or ("login" if "login" in (method or "").lower() else None)
+            if b:
+                barriers.append((b, url))
+                C.warn(f"  rules-doc requires {b} ({method}) — skipping + flagging: {url}")
+                path_log.append(f"rules doc {str(tag)[:55]} → {b} wall ({method})")
+            else:
+                C.warn(f"  rules-doc unreadable ({method}) — skipping: {url}")
+                path_log.append(f"rules doc {str(tag)[:55]} → unreadable ({method})")
+    return fetched, barriers, path_log
+
+
 # --- outputs -------------------------------------------------------------------
 def write_brief_md(campaign, rules, raw):
     def block(items):
@@ -1235,6 +1375,38 @@ def main():
         C.fail("intake produced no reachable footage — nothing to clip. Followed every free "
                "link / doc / site to the hop limit and found no video. Check the links/log above.")
 
+    # AUTOMATIC RULES-DOC FETCH (general, all campaigns): when the on-page rules are just a POINTER,
+    # or scout handed over resource/rules-doc links, FOLLOW those links and pull the REAL rules into
+    # the corpus before LLM extraction — the footage-hunt idea, but for RULES. Reuses the existing
+    # Google Doc / local / web fetchers; a login/signup/payment wall skips that doc + flags it.
+    pointer = rules_text_is_pointer(brief)
+    rules_candidates = []
+    for r in (getattr(args, "resource_links", None) or []):          # scout resource links (labeled)
+        if isinstance(r, dict):
+            rules_candidates.append((r.get("url", ""), r.get("label", "")))
+        else:
+            rules_candidates.append((str(r), ""))
+    # doc-looking links from the brief + those discovered while hunting footage + the --links file
+    for u in list(AN.harvest_urls(brief)) + list(harvested) + list(other_urls) + list(links):
+        rules_candidates.append((u, ""))
+    seen_c, rules_cand = set(), []
+    for u, lab in rules_candidates:
+        if u and u not in seen_c:
+            seen_c.add(u)
+            rules_cand.append((u, lab))
+    already_in_corpus = set(re.findall(r"###(?: RULES DOC:)? +(\S+)", "\n".join(corpus_parts)))
+    if pointer:
+        C.log("rules: on-page rules read as a POINTER to a linked document — auto-fetching the "
+              "rules doc(s) before extraction (like the footage hunt, but for rules).")
+    rules_fetched, rules_barriers, rules_log = fetch_rules_docs(
+        rules_cand, args.cookies_from_browser, corpus_parts, resources, already_in_corpus)
+    if rules_log:
+        C.log("rules-doc fetch path:")
+        for step in rules_log:
+            C.log(f"    {step}")
+    if rules_fetched:
+        C.log(f"rules: fetched {rules_fetched} rules doc(s) into the extraction corpus.")
+
     tree = "\n".join(r["path"] for r in resources)
     corpus = "\n".join(corpus_parts) + "\n\n### FILES\n" + tree
 
@@ -1295,6 +1467,16 @@ def main():
     rules["ambiguities"] = build_ambiguities(rules, resources, llm_used)
     if wm_ambiguity:                       # only when the auto-decision was genuinely unclear
         rules["ambiguities"].insert(0, wm_ambiguity)
+    # POINTER-UNRESOLVED: on-page rules were only a pointer to a doc AND we couldn't fetch one — the
+    # real rules (hashtags/onscreen-text/requirements) may be MISSING. Flag loud (never guess).
+    if pointer and not rules_fetched:
+        gated = ("; ".join(sorted({b for b, _ in rules_barriers})) if rules_barriers else "")
+        rules["ambiguities"].insert(0,
+            "On-page rules are only a POINTER to a linked document, but no rules doc could be "
+            "fetched" + (f" (blocked by: {gated} — login/pay walls are never bypassed)" if gated
+            else " (no reachable rules-doc link was provided)") + ". Required "
+            "hashtags/onscreen-text format/requirements may be MISSING — add the rules-doc link to "
+            "the campaign (scout resource_links) or paste the rules, then re-run intake.")
 
     C.save_json(C.RULES_JSON, rules)
     write_brief_md(args.campaign, rules, brief)
