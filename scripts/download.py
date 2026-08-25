@@ -93,6 +93,31 @@ def is_youtube_channel(url):
             or stripped.endswith(("/videos", "/streams", "/featured", "youtube.com")))
 
 
+def is_youtube_url(url):
+    """Any YouTube link (video, channel, playlist)."""
+    low = (url or "").lower()
+    return "youtube.com" in low or "youtu.be" in low
+
+
+# A YouTube download that 403s or trips a bot-check/JS-challenge is an IP-level block: further
+# YouTube pulls will keep failing and only DEEPEN the block. `looks_like_youtube_block` spots it
+# so the hunt can STOP hammering YouTube for the campaign (FIX 3) rather than burn through dozens.
+_YT_BLOCK_MARKERS = (
+    "http error 403", "403: forbidden", "403 forbidden", "error 403", "forbidden",
+    "sign in to confirm you're not a bot", "confirm you're not a bot", "not a bot",
+    "verify you're human", "unusual traffic", "this content isn't available",
+    "http error 429", "429: too many requests", "too many requests", "429 too many",
+    "failed to extract any player response", "please sign in",
+)
+
+
+def looks_like_youtube_block(text):
+    """True when yt-dlp output looks like a YouTube IP block: a 403 Forbidden or a bot-check /
+    JS-challenge / 429. Distinct from a single unavailable video (a private/deleted VOD)."""
+    low = (text or "").lower()
+    return any(m in low for m in _YT_BLOCK_MARKERS)
+
+
 def _channel_videos_url(url):
     """Point a bare channel link at its VIDEOS tab so we list uploaded VODs newest-first
     (a bare handle otherwise resolves to multiple tabs: Videos/Shorts/Live)."""

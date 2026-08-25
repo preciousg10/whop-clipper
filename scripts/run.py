@@ -62,6 +62,12 @@ DEFAULT_CONFIG = {
     # instead of hammering. Cookies (cookies.txt / --cookies-from-browser) stay applied throughout.
     "walk_spacing_seconds": 20,           # gentle delay between auto-advance attempts
     "walk_throttle_backoff_seconds": 300,  # longer back-off once a bot-check/throttle is seen
+    # CHANNEL EXPANSION CAP (footage hunt). When a campaign points at a YouTube CHANNEL as its
+    # footage source (no specific videos given), expand it to AT MOST this many recent videos —
+    # never burst-pull the whole channel (that IP-bot-flagged us on a 28-video burst). Only SEED
+    # channels expand; a channel merely DISCOVERED while hunting (e.g. surfaced by a search page)
+    # is never expanded. Downloads are spaced by walk_spacing_seconds so even 3 aren't hammered.
+    "channel_max_videos": 3,
     # BATCH FLOOR (auto-advance walk). Accumulate clips ACROSS campaigns until the running total
     # reaches this many — a MINIMUM, not a cap: the current campaign always finishes and ALL its
     # clips are kept, so the final batch may exceed it (20 + 8 → keep all 28). The walk stops when

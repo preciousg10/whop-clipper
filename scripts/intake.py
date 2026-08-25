@@ -390,28 +390,47 @@ def _footage_seconds(entries):
     return total
 
 
-# A YouTube CHANNEL link expands to this many recent VODs at most (newest-first); the footage
-# cap is the real limiter — we stop as soon as the running total fills, usually well before this.
-CHANNEL_MAX_VIDEOS = 40
-
-
 def download_links(links, cookies, downloaded, max_source_height=720, original=False,
-                   prior_by_source=None, budget=None):
-    """Download each source, routing files by type. When `budget` is given
-    ({"seconds": <float>, "cap": <seconds or None>}) footage is capped VOD-by-VOD: sources are
-    downloaded one at a time while the running total is tracked, and once the total reaches the
-    cap NO further footage source is STARTED (the source that crosses the line is fully kept —
-    we only stop before starting a new one). Non-footage links are never capped.
+                   prior_by_source=None, budget=None, channel_max=0, spacing=0.0, yt_block=None):
+    """Download each source, routing files by type. Footage-cap-, channel-, and YouTube-block-aware.
 
-    A YouTube CHANNEL link is EXPANDED into its recent VODs (newest-first) and each is downloaded
-    as its own capped, individually-skippable source — so a channel handle (@name) works, one bad
-    video skips instead of failing the campaign, and we never try to pull the whole channel."""
+    When `budget` is given ({"seconds", "cap"}) footage is capped VOD-by-VOD: once the running
+    total reaches the cap NO further footage source is STARTED (the crossing source is kept whole).
+
+    channel_max: max recent videos a YouTube CHANNEL link may expand to. 0 = do NOT expand — a
+      channel link is SKIPPED with a warning (used for channels merely DISCOVERED while hunting, so
+      the hunt never wanders into a whole channel). Only a caller that knows a link is a legit SEED
+      channel passes >0 (and even then it's the hard cap — never the whole channel).
+    spacing: seconds to sleep BETWEEN successive channel-expanded video downloads (anti-throttle —
+      so even a capped handful isn't hammered in one instant).
+    yt_block: mutable {"blocked": bool}. Set True the moment a YouTube pull 403s / trips a
+      bot-check; thereafter NO new YouTube source is started (FIX 3 — stop hammering a blocked IP).
+    """
+    import time
     prior_by_source = prior_by_source or {}
     resources, failures = [], []
     cap = (budget or {}).get("cap")
+    yt_block = yt_block if yt_block is not None else {"blocked": False}
 
     def _capped():
         return cap is not None and budget["seconds"] >= cap
+
+    def _note_yt_block(err):
+        """FIX 3: if a YouTube error looks like a 403/bot-check, latch the block + log once."""
+        if DL.looks_like_youtube_block(str(err)):
+            if not yt_block["blocked"]:
+                C.warn("YouTube appears to be blocking downloads (403/bot-check) — backing off "
+                       "(no more YouTube sources will be tried for this campaign).")
+            yt_block["blocked"] = True
+
+    def _yt_blocked_skip(url):
+        """True (+ logs/records) when `url` is YouTube and the IP is already blocked → skip it."""
+        if yt_block["blocked"] and DL.is_youtube_url(url):
+            C.log(f"YouTube blocked (403/bot-check already seen) — skipping: {url}")
+            failures.append({"source": url,
+                             "error": "skipped — YouTube blocking downloads (403/bot-check)"})
+            return True
+        return False
 
     def _download_one(url):
         """Reuse-or-download a SINGLE source (video/folder/file), account footage, collect
@@ -428,6 +447,8 @@ def download_links(links, cookies, downloaded, max_source_height=720, original=F
                                          max_source_height=max_source_height,
                                          original=original)
         except DL.DownloadError as e:
+            if DL.is_youtube_url(url):
+                _note_yt_block(e)
             C.warn(f"optional source failed — skipping and continuing: {url} — {e}")
             failures.append({"source": url, "error": str(e)})
             return
@@ -441,15 +462,23 @@ def download_links(links, cookies, downloaded, max_source_height=720, original=F
         if url in downloaded:
             continue
         downloaded.add(url)
-        # YOUTUBE CHANNEL/PLAYLIST → expand to recent VODs and download each individually.
+        if _yt_blocked_skip(url):
+            continue
+        # YOUTUBE CHANNEL/PLAYLIST → expand to recent VODs, but ONLY when allowed and HARD-CAPPED.
         if DL.is_youtube_channel(url):
+            if channel_max <= 0:
+                C.warn(f"channel link NOT expanded (discovered channel / expansion off) — "
+                       f"ignoring so we never burst-pull a whole channel: {url}")
+                failures.append({"source": url, "error": "channel not expanded (channel_max=0)"})
+                continue
             if _capped():
                 C.log(f"footage cap reached — not expanding channel: {url}")
                 continue
             try:
-                vids = DL.list_channel_videos(url, limit=CHANNEL_MAX_VIDEOS,
+                vids = DL.list_channel_videos(url, limit=channel_max,
                                               cookies_from_browser=cookies)
             except DL.DownloadError as e:
+                _note_yt_block(e)
                 C.warn(f"channel could not be listed — skipping and continuing: {url} — {e}")
                 failures.append({"source": url, "error": str(e)})
                 continue
@@ -457,17 +486,25 @@ def download_links(links, cookies, downloaded, max_source_height=720, original=F
                 C.warn(f"channel resolved but no videos found — skipping: {url}")
                 failures.append({"source": url, "error": "no videos found in channel/playlist"})
                 continue
-            C.log(f"channel {url}: {len(vids)} recent video(s) found — downloading newest-first "
-                  f"up to the footage cap.")
+            vids = vids[:channel_max]
+            C.log(f"channel {url}: expanding to {len(vids)} recent video(s) (cap {channel_max}) — "
+                  f"downloading newest-first, spaced (never the whole channel).")
+            started = 0
             for v in vids:
                 if v in downloaded:
                     continue
                 downloaded.add(v)
+                if _yt_blocked_skip(v):
+                    break              # IP blocked mid-channel — stop the rest of THIS channel too
                 if _capped():
                     C.log(f"footage cap: running total {budget['seconds'] / 3600:.2f}h ≥ cap "
                           f"{cap / 3600:.1f}h — stopping channel {url} (budget filled).")
                     break
+                if spacing and spacing > 0 and started > 0:
+                    C.log(f"  spacing {spacing:.0f}s before the next channel video (anti-throttle)…")
+                    time.sleep(spacing)
                 _download_one(v)
+                started += 1
             continue
         # FOOTAGE CAP: don't START a new footage source once we're already at/over the cap.
         if _capped() and _is_footage_source(url):
@@ -523,26 +560,59 @@ def _classify_hop(url):
     return "site"
 
 
-def hunt_and_download_footage(seed_urls, *, cookies, downloaded, max_source_height, original,
-                              prior_by_source, budget, resources, corpus_parts, failures):
-    """Expand `seed_urls` into ALL freely-reachable footage, following docs/gdocs/drive/sites up
-    to hunt.MAX_HOPS hops (Tier 1 first; Playwright only for third-party sites). Downloads
-    discovered footage with the CAPPED machinery (footage cap, cookies, per-file skip-not-fail
-    all intact). Mutates `resources`/`corpus_parts`/`failures` in place.
+def _footage_link_kind(url):
+    """Classify a link as a DIRECT footage SOURCE the campaign pointed at:
+      'video'   — a specific YouTube/Kick/Twitch VOD, or a direct video-file URL / local video;
+      'drive'   — a Google Drive file or folder;
+      'channel' — a YouTube channel / playlist (expanded, hard-capped, and ONLY from the seed);
+      None      — not footage (a Google Doc / third-party site / other link, or a non-video asset).
+    Used by the hunt to PREFER the campaign's OWN specific footage and never wander to a channel."""
+    if not DL.is_url(url):
+        return "video" if os.path.splitext(url)[1].lower() in DL.VIDEO_EXTS else None
+    if DL.is_drive_folder(url) or DL.is_drive_file(url):
+        return "drive"
+    if DL.is_youtube_channel(url):
+        return "channel"
+    low = url.lower()
+    if any(h in low for h in ("youtube.com/watch", "youtu.be/", "youtube.com/shorts",
+                              "youtube.com/live", "kick.com", "twitch.tv")):
+        return "video"
+    if os.path.splitext(url.split("?", 1)[0])[1].lower() in DL.VIDEO_EXTS:
+        return "video"
+    return None
 
-    Returns (harvested_urls, other_urls, barriers, path_log): barriers is a list of
-    (category, url) gates encountered; path_log is the human hunt trace for the coverage report."""
+
+def hunt_and_download_footage(seed_urls, *, cookies, downloaded, max_source_height, original,
+                              prior_by_source, budget, resources, corpus_parts, failures,
+                              channel_max_videos=3, spacing=0.0):
+    """Resolve WHERE the campaign's footage is, then download it — PREFERRING the campaign's OWN
+    specific links and never wandering (FIX 1/2/3):
+
+    - SPECIFIC footage in the seed (individual videos / Drive files/folders) → download ONLY those.
+      NO channel expansion, NO nested hunt for MORE footage — those 3 videos ARE the footage.
+      (Seed rules-docs are still READ for the corpus; their inner footage links are NOT chased.)
+    - CHANNEL-ONLY seed (a channel, no specific videos) → expand to at most `channel_max_videos`
+      recent videos (spaced) — never the whole channel.
+    - NO direct footage in the seed → NESTED hunt: follow docs → Drive and third-party sites
+      (Playwright) to DISCOVER footage. A channel DISCOVERED this way is NEVER expanded (so a
+      search-results page can't drag us into a stranger's whole channel).
+    - A YouTube 403 / bot-check latches a block that stops all further YouTube attempts.
+
+    Mutates `resources`/`corpus_parts`/`failures`. Returns (harvested, other_urls, barriers,
+    path_log)."""
     harvested, other_urls, barriers, path_log = [], [], [], []
     seen_docs, seen_sites, seen_all = set(), set(), set()
+    yt_block = {"blocked": False}
 
-    def _dl(urls, label):
-        """Download footage-class urls with the capped machinery; process any docs among the
+    def _dl(urls, label, channel_max):
+        """Download 'download'-class urls with the capped machinery; read any docs among the
         results and return the URLs harvested from those docs (to feed the next hop)."""
         if not urls:
             return []
         C.log(f"  [{label}] resolving {len(urls)} footage/source link(s)…")
         r2, f2 = download_links(urls, cookies, downloaded, max_source_height=max_source_height,
-                                original=original, prior_by_source=prior_by_source, budget=budget)
+                                original=original, prior_by_source=prior_by_source, budget=budget,
+                                channel_max=channel_max, spacing=spacing, yt_block=yt_block)
         failures.extend(f2)
         new_urls = []
         for r in r2:
@@ -551,6 +621,7 @@ def hunt_and_download_footage(seed_urls, *, cookies, downloaded, max_source_heig
                 corpus_parts.append(f"\n\n### {r['path']}\n{t}")
             new_urls += r.get("urls_found", [])
         resources.extend(r2)
+        harvested.extend(new_urls)         # record links found in docs (even if not followed)
         n_foot = sum(1 for r in r2 if r["kind"] == "footage")
         if r2 or f2:
             path_log.append(f"[{label}] downloaded {len(r2)} file(s) ({n_foot} footage"
@@ -558,14 +629,117 @@ def hunt_and_download_footage(seed_urls, *, cookies, downloaded, max_source_heig
                             f"link(s) from docs")
         return new_urls
 
-    frontier = list(dict.fromkeys(seed_urls))
+    def _read_gdoc(u, label):
+        """Fetch a Google Doc/Sheet into the corpus. Returns its inner links (list), or None when
+        it's gated (login/signup/…) or unreadable."""
+        if u in seen_docs:
+            return []
+        seen_docs.add(u)
+        downloaded.add(u)
+        text, method = AN.fetch_gdoc_text(u)
+        if text and text.strip():
+            dest = C.DOCS / ("gdoc_" + re.sub(r"\W+", "_", u)[-40:] + ".txt")
+            dest.write_text(text, encoding="utf-8")
+            inner = AN.harvest_urls(text)
+            resources.append({
+                "path": os.path.relpath(dest, C.ROOT), "kind": "doc", "source": u,
+                "usage": [f"fetched linked Google file text ({len(text)} chars via {method})"],
+                "notes": [], "urls_found": inner})
+            corpus_parts.append(f"\n\n### {u}\n{text}")
+            harvested.extend(inner)        # record links found in the doc (even if not followed)
+            C.log(f"  [{label}] Google Doc → read ({len(text)} chars) → {len(inner)} link(s): {u[:60]}")
+            path_log.append(f"[{label}] Google Doc {u[:55]} → read → found {len(inner)} link(s)")
+            return inner
+        b = HUNT.detect_barrier(method)
+        if b or "login" in method.lower():
+            b = b or "login"
+            barriers.append((b, u))
+            C.warn(f"  [{label}] Google Doc requires {b} ({method}) — not following: {u}")
+            path_log.append(f"[{label}] Google Doc {u[:55]} → {b} wall ({method})")
+        else:
+            other_urls.append(u)
+            path_log.append(f"[{label}] Google Doc {u[:55]} → unreadable ({method})")
+        return None
+
+    def _visit_site(u, label):
+        """Tier 2: resolve a third-party site to footage/doc links (simple fetch → Playwright).
+        Returns the discovered links (list, possibly empty)."""
+        if u in seen_sites:
+            return []
+        seen_sites.add(u)
+        other_urls.append(u)
+        res = HUNT.extract_footage_links_from_site(u, cookies=cookies)
+        links = res.get("links") or []
+        if links:
+            how = "simple fetch" if res.get("tier") == "fetch" else "Playwright loaded"
+            C.log(f"  [{label}] third-party site → {how} → found {len(links)} footage/doc "
+                  f"link(s): {u[:60]}")
+            path_log.append(f"[{label}] site {u[:55]} → {how} → {len(links)} link(s) found")
+            harvested.extend(links)        # record links discovered on the site
+            return links
+        if res.get("barrier"):
+            barriers.append((res["barrier"], u))
+            C.warn(f"  [{label}] site requires {res['barrier']} — skipping this route: {u}")
+            path_log.append(f"[{label}] site {u[:55]} → {res['barrier']} wall — skipped")
+        else:
+            note = res.get("note") or "no footage links found"
+            C.warn(f"  [{label}] site yielded no footage ({note}): {u}")
+            path_log.append(f"[{label}] site {u[:55]} → {note}")
+        return []
+
+    def _finish():
+        return (list(dict.fromkeys(harvested)), list(dict.fromkeys(other_urls)), barriers, path_log)
+
+    # --- Partition the SEED. Specific footage the campaign named wins; we never wander for more. --
+    seed = list(dict.fromkeys(seed_urls))
+    for u in seed:
+        seen_all.add(u)
+        harvested.append(u)
+    downloads = [u for u in seed if _classify_hop(u) == "download"]
+    specifics = [u for u in downloads if _footage_link_kind(u) in ("video", "drive")]
+    channels = [u for u in seed if _footage_link_kind(u) == "channel"]
+    seed_assets = [u for u in downloads if _footage_link_kind(u) is None]   # watermark/doc files
+    seed_gdocs = [u for u in seed if _classify_hop(u) == "gdoc"]
+    seed_sites = [u for u in seed if _classify_hop(u) == "site"]
+    other_urls += [u for u in seed if _classify_hop(u) == "other"]
+
+    # FIX 1 — the campaign gave SPECIFIC footage → use ONLY that. No channels, no nested hunt.
+    if specifics:
+        if channels:
+            C.log(f"  [seed] {len(channels)} channel link(s) IGNORED — campaign provided "
+                  f"{len(specifics)} specific video/Drive link(s); using ONLY those (no wander).")
+            path_log.append(f"[seed] {len(specifics)} specific footage link(s) provided — ignored "
+                            f"{len(channels)} channel link(s) (no channel wander)")
+            other_urls.extend(channels)
+        _dl(specifics + seed_assets, "seed", channel_max=0)
+        for u in seed_gdocs:            # read rules-docs for the corpus; DON'T chase their footage
+            _read_gdoc(u, "seed")
+        other_urls.extend(seed_sites)   # a site is not a footage route when specifics exist
+        return _finish()
+
+    # FIX 2 — channel-only campaign (no specific videos) → expand each channel, HARD-CAPPED + spaced.
+    if channels:
+        C.log(f"  [seed] no specific videos — campaign points at {len(channels)} channel(s); "
+              f"expanding to at most {channel_max_videos} recent video(s) each (spaced).")
+        path_log.append(f"[seed] channel-only campaign → expand ≤{channel_max_videos} recent "
+                        f"video(s) per channel (never the whole channel)")
+        _dl(channels + seed_assets, "seed", channel_max=channel_max_videos)
+        for u in seed_gdocs:
+            _read_gdoc(u, "seed")
+        other_urls.extend(seed_sites)
+        return _finish()
+
+    # NESTED MODE — no direct footage in the seed. Hunt docs → Drive, sites → Playwright to
+    # DISCOVER footage. Discovered channels are NEVER expanded (channel_max=0 everywhere here).
+    frontier = seed
     hop = 0
     while frontier and hop <= HUNT.MAX_HOPS:
         label = "seed" if hop == 0 else f"hop{hop}"
         media, gdocs, sites = [], [], []
         for u in frontier:
-            seen_all.add(u)
-            harvested.append(u)
+            if u not in seen_all:
+                seen_all.add(u)
+                harvested.append(u)
             k = _classify_hop(u)
             if k == "download":
                 media.append(u)
@@ -576,71 +750,19 @@ def hunt_and_download_footage(seed_urls, *, cookies, downloaded, max_source_heig
             else:
                 other_urls.append(u)
         next_frontier = []
-
-        # 1) DOWNLOAD & ROUTE (Tier 1) — footage/asset/doc. Docs pulled from a Drive folder or a
-        #    direct doc URL harvest more links to follow.
-        next_frontier += _dl(media, label)
-
-        # 2) GOOGLE DOCS (Tier 1) — fetch text, follow the footage links inside.
+        next_frontier += _dl(media, label, channel_max=0)
         for u in gdocs:
-            if u in seen_docs:
-                continue
-            seen_docs.add(u)
-            downloaded.add(u)
-            text, method = AN.fetch_gdoc_text(u)
-            if text and text.strip():
-                dest = C.DOCS / ("gdoc_" + re.sub(r"\W+", "_", u)[-40:] + ".txt")
-                dest.write_text(text, encoding="utf-8")
-                inner = AN.harvest_urls(text)
-                resources.append({
-                    "path": os.path.relpath(dest, C.ROOT), "kind": "doc", "source": u,
-                    "usage": [f"fetched linked Google file text ({len(text)} chars via {method})"],
-                    "notes": [], "urls_found": inner})
-                corpus_parts.append(f"\n\n### {u}\n{text}")
+            inner = _read_gdoc(u, label)
+            if inner:
                 next_frontier += inner
-                C.log(f"  [{label}] Google Doc → read ({len(text)} chars) → {len(inner)} link(s): {u[:60]}")
-                path_log.append(f"[{label}] Google Doc {u[:55]} → read → found {len(inner)} link(s)")
-            else:
-                b = HUNT.detect_barrier(method)
-                if b or "login" in method.lower():
-                    b = b or "login"
-                    barriers.append((b, u))
-                    C.warn(f"  [{label}] Google Doc requires {b} ({method}) — not following: {u}")
-                    path_log.append(f"[{label}] Google Doc {u[:55]} → {b} wall ({method})")
-                else:
-                    other_urls.append(u)
-                    path_log.append(f"[{label}] Google Doc {u[:55]} → unreadable ({method})")
-
-        # 3) THIRD-PARTY SITES (Tier 2) — simple fetch, then Playwright only if needed.
         for u in sites:
-            if u in seen_sites:
-                continue
-            seen_sites.add(u)
-            other_urls.append(u)
-            res = HUNT.extract_footage_links_from_site(u, cookies=cookies)
-            links = res.get("links") or []
-            if links:
-                how = "simple fetch" if res.get("tier") == "fetch" else "Playwright loaded"
-                C.log(f"  [{label}] third-party site → {how} → found {len(links)} footage/doc "
-                      f"link(s): {u[:60]}")
-                path_log.append(f"[{label}] site {u[:55]} → {how} → {len(links)} link(s) found")
-                next_frontier += links
-            elif res.get("barrier"):
-                barriers.append((res["barrier"], u))
-                C.warn(f"  [{label}] site requires {res['barrier']} — skipping this route: {u}")
-                path_log.append(f"[{label}] site {u[:55]} → {res['barrier']} wall — skipped")
-            else:
-                note = res.get("note") or "no footage links found"
-                C.warn(f"  [{label}] site yielded no footage ({note}): {u}")
-                path_log.append(f"[{label}] site {u[:55]} → {note}")
-
-        # Advance: only follow links we haven't already handled/downloaded.
+            next_frontier += _visit_site(u, label)
         frontier = [u for u in dict.fromkeys(next_frontier)
                     if u not in downloaded and u not in seen_docs and u not in seen_sites
                     and u not in seen_all]
         hop += 1
 
-    return (list(dict.fromkeys(harvested)), list(dict.fromkeys(other_urls)), barriers, path_log)
+    return _finish()
 
 
 # --- outputs -------------------------------------------------------------------
@@ -1049,11 +1171,16 @@ def main():
 
     # FOOTAGE CAP (VOD-by-VOD): resolve hours from CLI > state config > default 10, and thread a
     # shared budget through the whole footage hunt so the running total spans every hop.
-    cfg_cap = (C.load_json(C.STATE_PATH, default={}) or {}).get("config", {}).get("footage_cap_hours")
+    _cfg = (C.load_json(C.STATE_PATH, default={}) or {}).get("config", {})
+    cfg_cap = _cfg.get("footage_cap_hours")
     cap_hours = args.footage_cap_hours if args.footage_cap_hours is not None else float(cfg_cap or 10)
     budget = {"seconds": 0.0, "cap": (cap_hours * 3600.0 if cap_hours and cap_hours > 0 else None)}
     if budget["cap"]:
         C.log(f"footage cap: downloading VODs one at a time up to ~{cap_hours:g}h cumulative.")
+    # CHANNEL EXPANSION CAP (FIX 2) + anti-throttle spacing between channel-expanded downloads —
+    # both from config (run.py DEFAULT_CONFIG), so `python scout.bat`-driven runs pick them up.
+    channel_max_videos = int(_cfg.get("channel_max_videos", 3) or 3)
+    channel_spacing = float(_cfg.get("walk_spacing_seconds", 20) or 0)
 
     # TIERED FOOTAGE HUNT: expand the seed links (+ URLs in the brief) into all freely-reachable
     # footage — following docs/gdocs/drive/sites up to hunt.MAX_HOPS hops (Playwright only for
@@ -1067,7 +1194,8 @@ def main():
         seed_frontier, cookies=args.cookies_from_browser, downloaded=downloaded,
         max_source_height=args.max_source_height, original=args.original,
         prior_by_source=prior_by_source, budget=budget,
-        resources=resources, corpus_parts=corpus_parts, failures=failures)
+        resources=resources, corpus_parts=corpus_parts, failures=failures,
+        channel_max_videos=channel_max_videos, spacing=channel_spacing)
 
     if hunt_path:
         C.log("footage hunt path:")

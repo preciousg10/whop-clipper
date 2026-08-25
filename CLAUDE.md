@@ -93,8 +93,20 @@ never removes). It writes `knowledge.md` (per-campaign digest) and ends with a c
 report; unused/ambiguous items are flagged, never guessed.
 
 **TIERED FOOTAGE HUNT** (`intake.hunt_and_download_footage` + `hunt.py`): scout hands over
-links; intake resolves WHERE the real footage actually is before giving up, simplest-method-first
-via a bounded frontier loop (`hunt.MAX_HOPS`=3 hops: resource → doc → drive/link). **TIER 1 (no
+links; intake resolves WHERE the real footage actually is before giving up, simplest-method-first.
+**PREFER THE CAMPAIGN'S OWN SPECIFIC LINKS — never wander for MORE footage.** The seed is
+partitioned (`_footage_link_kind`): if it names SPECIFIC footage (individual videos / Drive
+files/folders) those ARE the footage — download ONLY them, do NOT expand channels, do NOT run the
+nested hunt (seed rules-docs are still read for the corpus, but their inner footage links are not
+chased). The nested frontier loop (`hunt.MAX_HOPS`=3 hops: resource → doc → drive/link) runs ONLY
+when the seed has NO direct footage — to DISCOVER where it is. **Channel expansion is hard-capped
+at `channel_max_videos` (config, default 3) and ONLY for a SEED channel** (a campaign that literally
+points at a channel, no specific videos); a channel merely DISCOVERED while hunting (e.g. surfaced by
+a whop search page) is NEVER expanded — that 28-video burst-download is what got the IP bot-flagged.
+Expanded downloads are spaced by `walk_spacing_seconds`. **YouTube bot-block backoff (FIX 3):** a
+YouTube pull that 403s / trips a bot-check (`DL.looks_like_youtube_block`) latches a per-campaign
+block — no further YouTube source is started (skip to non-YT footage or let the campaign advance),
+so we never burn through dozens of 403s and deepen the block. **TIER 1 (no
 browser):** direct footage (YouTube/Drive/Kick/direct video URL), Google Docs (fetch text + follow
 the footage links inside), Drive folders (list/route — if only docs inside, a doc one level deeper
 is followed); `_classify_hop` routes each URL — **a Drive *file* link is `download`, NOT a gdoc**
