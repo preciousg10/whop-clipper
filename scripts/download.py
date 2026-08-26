@@ -23,9 +23,13 @@ Per-source download errors raise DownloadError (catchable) so a failed OPTIONAL 
 (e.g. a Kick VOD behind a 403) can be logged and skipped without aborting intake.
 Environment errors (missing yt-dlp/gdown) still fail loud.
 """
+import datetime
 import os
+import random
 import re
 import shutil
+import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -116,6 +120,245 @@ def looks_like_youtube_block(text):
     JS-challenge / 429. Distinct from a single unavailable video (a private/deleted VOD)."""
     low = (text or "").lower()
     return any(m in low for m in _YT_BLOCK_MARKERS)
+
+
+# ============================================================================
+# BUILD A — PO-token server + BUILD B — human-like download behavior.
+# YouTube's SABR/PO-token system 403-blocks plain yt-dlp; the bgutil PO-token HTTP server mints
+# the "gvs PO Token"s that make downloads work (yt-dlp auto-discovers it at 127.0.0.1:4416). We
+# auto-manage that server, then download like a human (rate limit + random sleeps + per-video
+# spacing + a daily volume cap + occasional longer breaks) so a burst never re-flags the IP.
+# All of it is CONFIG-DRIVEN (run.py DEFAULT_CONFIG) with sane defaults; DL.configure(cfg) at
+# process start overrides the defaults from state config. Nothing here touches Drive footage.
+# ============================================================================
+YOUTUBE_FORMAT_DEFAULT = ("bestvideo[height<=720][vcodec^=avc1]+bestaudio/"
+                          "bestvideo[height<=720]+bestaudio/best[height<=720]")
+
+_CFG = {
+    # BUILD A — PO-token server
+    "token_server_url": "http://127.0.0.1:4416",
+    "token_server_dir": r"C:\Users\knigh\bgutil-ytdlp-pot-provider\server",
+    "token_server_cmd": ["node", "build/main.js"],
+    "token_server_autostart": True,
+    "token_server_wait_seconds": 20,      # how long to wait for the server to come up
+    # BUILD B — human-like behavior (YouTube only)
+    "youtube_format": YOUTUBE_FORMAT_DEFAULT,
+    "download_rate_limit": "5M",          # yt-dlp --limit-rate (bytes/s; "" = unlimited)
+    "download_sleep_requests": 1.0,       # --sleep-requests (pause between HTTP requests)
+    "download_sleep_interval": 2.0,       # --sleep-interval (min random pause before each video)
+    "download_max_sleep_interval": 5.0,   # --max-sleep-interval (max of that random pause)
+    "download_spacing_seconds": 20.0,     # explicit delay BETWEEN successive YT video downloads
+    "youtube_daily_cap": 30,              # STOP downloading YouTube for the day past this many
+    "youtube_human_break_every": 8,       # after every N YT videos, take a longer break…
+    "youtube_human_break_seconds": 120.0,  # …of ~this long (randomized 0.5×–1.5×)
+}
+
+_TOKEN_SERVER = {"proc": None, "checked": False, "reachable": False}
+_YT_RUN_COUNT = 0                          # YouTube videos downloaded in THIS process (spacing/break)
+
+
+def configure(cfg):
+    """Override the download defaults from state config (run.py DEFAULT_CONFIG). Call ONCE at
+    process start (intake.main / run.main). Unknown keys are ignored; missing keys keep defaults."""
+    if not cfg:
+        return
+    for k in list(_CFG):
+        if k in cfg and cfg[k] is not None:
+            _CFG[k] = cfg[k]
+
+
+def _cfg(key):
+    return _CFG.get(key)
+
+
+# --- BUILD A: PO-token server (auto-detect + auto-start) ------------------------
+def _server_host_port(url=None):
+    p = urlparse(url or _CFG["token_server_url"])
+    return (p.hostname or "127.0.0.1"), (p.port or 4416)
+
+
+def ping_token_server(url=None, timeout=1.5):
+    """True if something is listening on the token server's host:port (a fast TCP connect —
+    route-agnostic, so it works whatever path the bgutil server exposes)."""
+    host, port = _server_host_port(url)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_token_server(cfg=None):
+    """BUILD A: make sure the bgutil PO-token server is reachable BEFORE downloading.
+      - already up            → use it, do nothing;
+      - down + autostart on   → launch `node build/main.js` in token_server_dir as a background
+                                process, wait until the port answers, then proceed;
+      - node missing / no dir / never comes up → LOUD warning (YouTube may 403 — start it
+                                manually) and CONTINUE (Drive etc. still works). NEVER crashes.
+    Started ONCE per process and left running for the whole run. Returns True if reachable."""
+    if cfg:
+        configure(cfg)
+    if _TOKEN_SERVER["checked"]:
+        return _TOKEN_SERVER["reachable"]
+    _TOKEN_SERVER["checked"] = True
+    url = _CFG["token_server_url"]
+    if ping_token_server(url):
+        C.log(f"PO-token server: reachable at {url} (yt-dlp will mint gvs PO tokens).")
+        _TOKEN_SERVER["reachable"] = True
+        return True
+    if not _CFG.get("token_server_autostart", True):
+        C.warn(f"PO-token server not running at {url} and autostart is off — YouTube downloads "
+               f"may 403. Start it manually: cd {_CFG['token_server_dir']} && node build/main.js")
+        return False
+    server_dir = _CFG["token_server_dir"]
+    if not os.path.isdir(server_dir):
+        C.warn(f"PO-token server dir not found ({server_dir}) — can't auto-start. YouTube "
+               f"downloads may 403; start the bgutil server manually. Set config token_server_dir.")
+        return False
+    cmd = list(_CFG.get("token_server_cmd") or ["node", "build/main.js"])
+    C.log(f"PO-token server not up — auto-starting: {' '.join(cmd)} (cwd={server_dir})")
+    try:
+        create_flags = 0
+        if os.name == "nt":                         # detach so it survives + doesn't grab our console
+            create_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) \
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+        _TOKEN_SERVER["proc"] = subprocess.Popen(
+            cmd, cwd=server_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, creationflags=create_flags) if os.name == "nt" else \
+            subprocess.Popen(cmd, cwd=server_dir, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        C.warn("PO-token server can't start — 'node' not found on PATH. Install Node.js or start "
+               "the bgutil server manually; YouTube downloads may 403. Continuing (Drive still ok).")
+        return False
+    except Exception as e:
+        C.warn(f"PO-token server failed to start ({e}) — YouTube downloads may 403; start it "
+               f"manually. Continuing.")
+        return False
+    deadline = time.time() + float(_CFG.get("token_server_wait_seconds", 20) or 20)
+    while time.time() < deadline:
+        if ping_token_server(url):
+            C.log(f"PO-token server: up at {url} — proceeding.")
+            _TOKEN_SERVER["reachable"] = True
+            return True
+        time.sleep(0.5)
+    C.warn(f"PO-token server did not become reachable at {url} within "
+           f"{_CFG.get('token_server_wait_seconds')}s — YouTube downloads may 403; check it "
+           f"manually. Continuing (Drive/local footage still works).")
+    return False
+
+
+# --- BUILD B: DAILY YouTube volume cap (persisted with the date) ---------------
+_YT_LOG = C.MEMORY / "yt_download_log.json"
+
+
+def _today_str():
+    return datetime.date.today().isoformat()
+
+
+def _load_yt_log():
+    d = C.load_json(_YT_LOG, default={}) or {}
+    if d.get("date") != _today_str():           # a new day resets the counter
+        return {"date": _today_str(), "count": 0}
+    return {"date": d["date"], "count": int(d.get("count", 0))}
+
+
+def youtube_downloads_today():
+    return _load_yt_log()["count"]
+
+
+def youtube_daily_cap():
+    try:
+        return int(_CFG.get("youtube_daily_cap") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def youtube_cap_reached():
+    """True once today's YouTube-download count has hit the configured daily cap (0 = no cap)."""
+    cap = youtube_daily_cap()
+    return cap > 0 and youtube_downloads_today() >= cap
+
+
+def _record_youtube_download():
+    """Increment today's persisted YouTube-download counter (date-scoped) and return the new count."""
+    d = _load_yt_log()
+    d["count"] += 1
+    try:
+        C.save_json(_YT_LOG, d)
+    except Exception as e:
+        C.warn(f"could not persist YouTube daily counter (continuing): {e}")
+    return d["count"]
+
+
+class YouTubeDailyCapError(DownloadError):
+    """Today's YouTube download volume cap is reached — STOP pulling YouTube (Drive still allowed).
+    A DownloadError subclass so existing per-source skip logic handles it; its own type lets the
+    caller latch a block so it doesn't re-attempt every remaining YouTube URL."""
+
+
+# --- BUILD B: human-like pacing + rate-limit application -----------------------
+def _rate_limit_bytes():
+    """Parse download_rate_limit ('5M', '500K', '' ) → bytes/sec int, or None for unlimited."""
+    s = str(_CFG.get("download_rate_limit") or "").strip()
+    if not s:
+        return None
+    m = re.match(r"^([\d.]+)\s*([KMG]?)B?/?s?$", s, re.I)
+    if not m:
+        return None
+    mult = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3}[m.group(2).upper()]
+    return int(float(m.group(1)) * mult)
+
+
+def _apply_ytdlp_pacing(opts):
+    """Attach human-like rate-limit + random inter-request/inter-video sleeps to a yt-dlp opts
+    dict (BUILD B). Harmless on Drive; keeps every pull gentle. Logged ONCE per process."""
+    rl = _rate_limit_bytes()
+    if rl:
+        opts["ratelimit"] = rl
+    sr = _CFG.get("download_sleep_requests")
+    if sr:
+        opts["sleep_interval_requests"] = float(sr)
+    si = _CFG.get("download_sleep_interval")
+    mi = _CFG.get("download_max_sleep_interval")
+    if si:
+        opts["sleep_interval"] = float(si)                       # yt-dlp: min random pre-video sleep
+        opts["max_sleep_interval"] = float(mi if mi else si)     # …max (random between the two)
+    global _PACING_LOGGED
+    if not _PACING_LOGGED:
+        C.log(f"yt-dlp pacing: rate-limit={_CFG.get('download_rate_limit') or 'unlimited'}, "
+              f"sleep-requests={sr}s, sleep-interval={si}-{mi}s (human-like, anti-flag).")
+        _PACING_LOGGED = True
+
+
+_PACING_LOGGED = False
+
+
+def _youtube_predownload_pacing(url):
+    """BUILD B: called right before a YouTube video download. Enforces the daily cap (raises
+    YouTubeDailyCapError past it), then spaces this pull from the previous one (download_spacing_
+    seconds) and takes a longer randomized 'human break' every youtube_human_break_every videos."""
+    global _YT_RUN_COUNT
+    if youtube_cap_reached():
+        cap = youtube_daily_cap()
+        raise YouTubeDailyCapError(
+            f"YouTube daily volume cap reached ({youtube_downloads_today()}/{cap} today) — not "
+            f"downloading more YouTube today (resets tomorrow; Drive footage still allowed).")
+    if _YT_RUN_COUNT > 0:
+        every = int(_CFG.get("youtube_human_break_every") or 0)
+        if every > 0 and _YT_RUN_COUNT % every == 0:
+            base = float(_CFG.get("youtube_human_break_seconds") or 0)
+            if base > 0:
+                brk = random.uniform(base * 0.5, base * 1.5)
+                C.log(f"  human break: {_YT_RUN_COUNT} YouTube videos pulled — pausing "
+                      f"{brk:.0f}s (longer, randomized) before the next.")
+                time.sleep(brk)
+        else:
+            gap = float(_CFG.get("download_spacing_seconds") or 0)
+            if gap > 0:
+                jitter = random.uniform(gap * 0.8, gap * 1.2)
+                C.log(f"  spacing {jitter:.0f}s before the next YouTube download (anti-throttle).")
+                time.sleep(jitter)
 
 
 def _channel_videos_url(url):
@@ -517,6 +760,7 @@ def _fetch_ytdlp(url, staging, cookies_from_browser=None, format_id=None,
         opts["cookiesfrombrowser"] = (cookies_from_browser,)
         C.log(f"yt-dlp using cookies from browser: {cookies_from_browser}")
     cookies_applied = _apply_cookies(opts)   # cookies.txt file (Kick/YouTube auth) on EVERY fetch
+    _apply_ytdlp_pacing(opts)                # BUILD B: rate limit + random sleeps (human-like)
     C.log(f"yt-dlp: {url}")
 
     def _download(o, log):
@@ -734,10 +978,28 @@ def download_source(url, cookies_from_browser=None, max_source_height=720, origi
             raw = _fetch_drive_file(url, staging, max_source_height=max_source_height,
                                     original=original,
                                     cookies_from_browser=cookies_from_browser)
+        elif is_youtube_url(url):
+            # YOUTUBE: BUILD B — daily cap + per-video spacing/human-break BEFORE the pull, and the
+            # PROVEN working format (720p h264 + m4a, muxed) that the PO-token server enables.
+            # Falls back to a height-capped ladder so a video lacking the exact avc1 combo still
+            # downloads. Counter is bumped only AFTER a successful footage pull.
+            _youtube_predownload_pacing(url)
+            h = int(max_source_height or 720)
+            yt_fmt = _CFG.get("youtube_format") or YOUTUBE_FORMAT_DEFAULT
+            fmt = f"{yt_fmt}/bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
+            raw = _fetch_ytdlp(url, staging, cookies_from_browser=cookies_from_browser,
+                               format_id=fmt)
+            if any(classify_file(p) == "footage" for p in raw):
+                n = _record_youtube_download()
+                global _YT_RUN_COUNT
+                _YT_RUN_COUNT += 1
+                cap = youtube_daily_cap()
+                C.log(f"  YouTube downloads today: {n}{f'/{cap} cap' if cap else ''} "
+                      f"({_YT_RUN_COUNT} this run).")
         else:
-            # VOD (YouTube/Kick/Twitch) / direct http. Prefer <= max_source_height so yt-dlp never
-            # pulls 4K, but FALL BACK GRACEFULLY — never hard-fail just because the exact muxed
-            # <=720 combo is missing. Ladder: (1) best video<=h + best audio (ffmpeg-muxed),
+            # Non-YouTube VOD (Kick/Twitch) / direct http. Prefer <= max_source_height so yt-dlp
+            # never pulls 4K, but FALL BACK GRACEFULLY — never hard-fail just because the exact
+            # muxed <=720 combo is missing. Ladder: (1) best video<=h + best audio (ffmpeg-muxed),
             # (2) best pre-muxed stream <=h, (3) best video + best audio at ANY height (muxed),
             # (4) absolute best. The cut stage downscales anyway, so a >720 fallback is fine.
             h = int(max_source_height or 720)

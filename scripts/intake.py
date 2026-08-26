@@ -422,19 +422,28 @@ def download_links(links, cookies, downloaded, max_source_height=720, original=F
         return cap is not None and budget["seconds"] >= cap
 
     def _note_yt_block(err):
-        """FIX 3: if a YouTube error looks like a 403/bot-check, latch the block + log once."""
-        if DL.looks_like_youtube_block(str(err)):
+        """FIX 3: latch a YouTube back-off (+ log once) when a pull looks like a 403/bot-check, OR
+        the DAILY VOLUME CAP is hit (BUILD B) — either way, stop trying more YouTube this campaign."""
+        if isinstance(err, DL.YouTubeDailyCapError):
+            if not yt_block["blocked"]:
+                C.warn(f"YouTube daily volume cap reached — backing off (no more YouTube this "
+                       f"campaign; Drive still allowed). {err}")
+            yt_block["blocked"] = True
+            yt_block["reason"] = "daily-cap"
+        elif DL.looks_like_youtube_block(str(err)):
             if not yt_block["blocked"]:
                 C.warn("YouTube appears to be blocking downloads (403/bot-check) — backing off "
                        "(no more YouTube sources will be tried for this campaign).")
             yt_block["blocked"] = True
+            yt_block["reason"] = "block"
 
     def _yt_blocked_skip(url):
-        """True (+ logs/records) when `url` is YouTube and the IP is already blocked → skip it."""
+        """True (+ logs/records) when `url` is YouTube and we've backed off (403 or daily cap)."""
         if yt_block["blocked"] and DL.is_youtube_url(url):
-            C.log(f"YouTube blocked (403/bot-check already seen) — skipping: {url}")
-            failures.append({"source": url,
-                             "error": "skipped — YouTube blocking downloads (403/bot-check)"})
+            why = "daily cap reached" if yt_block.get("reason") == "daily-cap" \
+                else "403/bot-check already seen"
+            C.log(f"YouTube backed off ({why}) — skipping: {url}")
+            failures.append({"source": url, "error": f"skipped — YouTube backed off ({why})"})
             return True
         return False
 
@@ -1332,6 +1341,11 @@ def main():
     # FOOTAGE CAP (VOD-by-VOD): resolve hours from CLI > state config > default 10, and thread a
     # shared budget through the whole footage hunt so the running total spans every hop.
     _cfg = (C.load_json(C.STATE_PATH, default={}) or {}).get("config", {})
+    # BUILD A/B: apply download config (rate limit / sleeps / spacing / daily cap / YT format) and
+    # make sure the PO-token server is up BEFORE any YouTube pull (auto-start it if needed; a
+    # failure warns + continues so Drive footage still works).
+    DL.configure(_cfg)
+    DL.ensure_token_server(_cfg)
     cfg_cap = _cfg.get("footage_cap_hours")
     cap_hours = args.footage_cap_hours if args.footage_cap_hours is not None else float(cfg_cap or 10)
     budget = {"seconds": 0.0, "cap": (cap_hours * 3600.0 if cap_hours and cap_hours > 0 else None)}

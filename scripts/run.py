@@ -76,6 +76,32 @@ DEFAULT_CONFIG = {
     # channels expand; a channel merely DISCOVERED while hunting (e.g. surfaced by a search page)
     # is never expanded. Downloads are spaced by walk_spacing_seconds so even 3 aren't hammered.
     "channel_max_videos": 3,
+    # ── BUILD A: PO-TOKEN SERVER (makes YouTube downloads work; auto-managed) ────────────────
+    # YouTube's SABR/PO-token system 403-blocks plain yt-dlp. The bgutil PO-token HTTP server
+    # mints the "gvs PO Token"s that fix it (yt-dlp auto-discovers it at 127.0.0.1:4416). Intake/
+    # download PING the server before pulling and AUTO-START it (node build/main.js) if it's down,
+    # leaving it running for the whole run. If node/dir is missing it warns + continues (Drive ok).
+    "token_server_url": "http://127.0.0.1:4416",
+    "token_server_dir": r"C:\Users\knigh\bgutil-ytdlp-pot-provider\server",
+    "token_server_cmd": ["node", "build/main.js"],
+    "token_server_autostart": True,
+    "token_server_wait_seconds": 20,
+    # ── BUILD B: HUMAN-LIKE YOUTUBE DOWNLOADING (avoid IP flags) ─────────────────────────────
+    # A 28-video burst with no spacing got the IP bot-flagged. So: cap the bitrate, sleep randomly
+    # between requests/videos, SPACE each video pull, take a longer break every N videos, and stop
+    # for the day past a volume cap (persisted per date in memory/yt_download_log.json). The proven
+    # working format (720p h264 + m4a) is the default. Channel-cap-3 / 403-backoff / cookies / the
+    # footage cap all stay in force alongside these.
+    "youtube_format": ("bestvideo[height<=720][vcodec^=avc1]+bestaudio/"
+                       "bestvideo[height<=720]+bestaudio/best[height<=720]"),
+    "download_rate_limit": "5M",          # yt-dlp --limit-rate (bytes/s; "" = unlimited)
+    "download_sleep_requests": 1.0,       # --sleep-requests (pause between HTTP requests)
+    "download_sleep_interval": 2.0,       # --sleep-interval (min random pre-video pause)
+    "download_max_sleep_interval": 5.0,   # --max-sleep-interval (max of that random pause)
+    "download_spacing_seconds": 20.0,     # explicit delay BETWEEN successive YT video downloads
+    "youtube_daily_cap": 30,              # STOP pulling YouTube for the day past this many videos
+    "youtube_human_break_every": 8,       # after every N YT videos, take a longer randomized break
+    "youtube_human_break_seconds": 120.0,  # ~length of that break (randomized 0.5×–1.5×)
     # BATCH FLOOR (auto-advance walk). Accumulate clips ACROSS campaigns until the running total
     # reaches this many — a MINIMUM, not a cap: the current campaign always finishes and ALL its
     # clips are kept, so the final batch may exceed it (20 + 8 → keep all 28). The walk stops when
@@ -233,6 +259,10 @@ def stage_download(state):
     if not manifest:
         C.fail("campaign/manifest.json missing — run intake.py first.")
     cfg = state.get("config", {})
+    # BUILD A/B: same download config + PO-token server for the re-fetch path (a re-download is a
+    # YouTube pull too), so repairs are paced and token-backed just like intake's first fetch.
+    DL.configure(cfg)
+    DL.ensure_token_server(cfg)
     repaired = DL.ensure_downloaded(
         manifest, cookies_from_browser=_COOKIES,
         max_source_height=cfg.get("max_source_height", 720), original=_ORIGINAL)
