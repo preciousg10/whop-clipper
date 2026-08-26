@@ -19,7 +19,8 @@ skip list — better than churning through 400. Live re-scraping of Whop belongs
 owns the browser); this module only READS scout's campaigns.json, never writes to it.
 
     python scripts/pickcampaign.py                     # walk from #1, pick first clippable
-    python scripts/pickcampaign.py --streamer-only      # rank + pick STREAMER/IRL campaigns only
+    python scripts/pickcampaign.py --category podcast   # rank + pick only Podcast/Talking campaigns
+    python scripts/pickcampaign.py --streamer-only      # alias for --category streamer
     python scripts/pickcampaign.py --max-walk 20        # look deeper before giving up
     python scripts/pickcampaign.py --rank 3            # manual override: force a specific rank
     python scripts/pickcampaign.py --scout-dir D:/whop/scout
@@ -63,14 +64,17 @@ def _pre_score(c):
     return c.get("pre_score") or 0
 
 
-def rank_campaigns(campaigns, *, streamer_only=False):
+def rank_campaigns(campaigns, *, category=None):
     """Rankable = a scraped/refreshed, non-disqualified campaign that rests on at least one
     real signal (not UNKNOWN-only). Sorted by scout's composite, tie-broken toward the
     better-understood campaign then pre_score — identical to scout's own report ordering.
 
-    streamer_only: narrow to the STREAMER/IRL handoff set (see `streamer_mode_class`) and
-    order by the penalty-adjusted composite. Scout's full board (campaigns.json) is only READ
-    here — never modified — so this changes ONLY what gets ranked + handed to the clipper."""
+    category: narrow to a single scout category tag (see resolve_category). `streamer_irl`
+    uses the ENRICHED streamer handoff ranking (sports-with-signal rescued at x0.6, ordered by
+    the penalty-adjusted composite — see `streamer_mode_class`); any other tag is a plain
+    primary-or-secondary membership filter ordered by the normal composite. None = full board.
+    Scout's full board (campaigns.json) is only READ here — never modified — so this changes
+    ONLY what gets ranked + handed to the clipper."""
     rankable = [
         c for c in campaigns
         if c.get("status") in RANKABLE_STATUSES
@@ -80,13 +84,17 @@ def rank_campaigns(campaigns, *, streamer_only=False):
         and _composite(c) > 0
         and _core_known(c) > 0              # skip UNKNOWN-only (ranked on neutrals alone)
     ]
-    if streamer_only:
+    if category == "streamer_irl":
         rankable = [c for c in rankable if streamer_mode_class(c)[0]]
         # Order by the penalty-adjusted composite (sports-with-signal is demoted x0.6), then
         # the same tie-breaks. streamer_effective never mutates the stored composite.
         rankable.sort(key=lambda c: (streamer_effective(c), _core_known(c), _pre_score(c)),
                       reverse=True)
         return rankable
+    if category:
+        # Plain membership filter: keep campaigns scout tagged with this category (primary OR
+        # secondary — same `_cats` view streamer mode uses). Normal composite ordering.
+        rankable = [c for c in rankable if category in _cats(c)]
     rankable.sort(key=lambda c: (_composite(c), _core_known(c), _pre_score(c)), reverse=True)
     return rankable
 
@@ -155,6 +163,45 @@ def streamer_effective(c):
     """Composite used to ORDER campaigns within streamer-only mode (stored composite x the
     tier factor). Pure — never mutates the record."""
     return _composite(c) * streamer_mode_class(c)[2]
+
+
+# --- category filter (--category / --streamer-only) ---------------------------
+# Narrows the ranked/handed-off set to ONE of scout's categories, WITHOUT touching scout's
+# full board (campaigns.json is read-only here). Membership reuses the category tags scout
+# already assigned (its Groq categorizer) — deliberately NO LLM call and NO re-categorization.
+# `streamer_irl` keeps the ENRICHED streamer handoff behaviour (sports-with-signal rescued at
+# x0.6 — see streamer_mode_class); every other tag is a plain primary-or-secondary membership
+# filter ordered by the normal composite. --streamer-only is exactly --category streamer.
+SCOUT_CATEGORIES = (
+    "sports", "streamer_irl", "podcast_talking", "gaming", "music",
+    "brand_product", "meme", "news", "movie_tv", "other",
+)
+# Convenience short forms -> the exact scout tag. The exact tags themselves are always accepted.
+CATEGORY_ALIASES = {
+    "podcast": "podcast_talking", "talking": "podcast_talking", "podcast_talking": "podcast_talking",
+    "streamer": "streamer_irl", "irl": "streamer_irl", "streamer_irl": "streamer_irl",
+    "gaming": "gaming", "game": "gaming", "games": "gaming",
+    "sports": "sports", "sport": "sports",
+    "music": "music",
+    "brand": "brand_product", "product": "brand_product", "brand_product": "brand_product",
+    "meme": "meme", "memes": "meme",
+    "news": "news",
+    "movie": "movie_tv", "tv": "movie_tv", "movie_tv": "movie_tv",
+    "other": "other",
+}
+
+
+def resolve_category(value):
+    """Map a --category value (short form or exact tag) to scout's exact category tag string.
+    Fail loud on an unknown value (never silently narrow to the wrong set)."""
+    key = (value or "").strip().lower()
+    tag = CATEGORY_ALIASES.get(key)
+    if not tag:
+        C.fail(f"--category {value!r} is not a known category. Choose one of: "
+               + ", ".join(SCOUT_CATEGORIES)
+               + " (short forms: podcast, streamer, gaming, sports, music, brand, meme, "
+                 "news, movie).")
+    return tag
 
 
 # --- locator resolution --------------------------------------------------------
@@ -622,14 +669,15 @@ def warn_if_stale_board(scout_json, max_hours):
         C.log(f"scout board age: {age:.1f}h (fresh, < {max_hours}h).")
 
 
-def _commit_pick(pick, rank, scout_json, streamer_only=False):
+def _commit_pick(pick, rank, scout_json, category=None):
     """Write the intake inputs (brief.txt, links.txt, pick.json) for the chosen campaign and
     print the summary + next steps. Only called AFTER `clippable` passed, so links is non-empty."""
     name = pick.get("name") or "(unnamed campaign)"
     locator, how = resolve_locator(pick)
     resources = _resource_links(pick)
     links = footage_links(pick)
-    sm_tier = streamer_mode_class(pick)[1] if streamer_only else None
+    is_streamer = category == "streamer_irl"
+    sm_tier = streamer_mode_class(pick)[1] if is_streamer else None
 
     INPUTS_DIR.mkdir(parents=True, exist_ok=True)
     BRIEF_TXT.write_text(build_brief(pick, locator, how, resources), encoding="utf-8")
@@ -643,7 +691,11 @@ def _commit_pick(pick, rank, scout_json, streamer_only=False):
         "locator_how": how,
         "locator_missing": bool(pick.get("locator_missing")),
         "rank": rank,
-        "rank_mode": "streamer_only" if streamer_only else "full_board",
+        # rank_mode stays "streamer_only" for the streamer set (back-compat: run.py reads it);
+        # any other narrowed set is "category", full board is "full_board". `category` carries
+        # the exact tag so run.py can thread --category back on auto-advance.
+        "rank_mode": "streamer_only" if is_streamer else ("category" if category else "full_board"),
+        "category": category,
         "streamer_tier": sm_tier,
         "composite_score": _composite(pick),
         "core_signals_known": _core_known(pick),
@@ -662,8 +714,10 @@ def _commit_pick(pick, rank, scout_json, streamer_only=False):
     print("\n" + "=" * 66)
     print(f"PICKED #{rank}: {name}")
     print("=" * 66)
-    if streamer_only:
+    if is_streamer:
         print(f"  mode          : STREAMER/IRL only  (tier: {sm_tier})")
+    elif category:
+        print(f"  mode          : category {category} only")
     print(f"  composite     : {_composite(pick):.4f}  ({_core_known(pick)}/5 core signals known)")
     print(f"  locator       : {locator}  ({how})")
     print(f"  rules source  : {pick.get('rules_source') or 'unknown'}")
@@ -701,12 +755,18 @@ def main():
                          "clippability preconditions, else fail loud). BYPASSES the pre-edited "
                          "footage filter, so you can force a campaign the walk would skip. "
                          "Default: walk from #1.")
+    ap.add_argument("--category", default=None, metavar="CAT",
+                    help="narrow the walk to ONE scout category (rank + pick only that category). "
+                         "Accepts short forms mapped to scout's exact tags: podcast->podcast_talking, "
+                         "streamer->streamer_irl, gaming, sports, music, brand->brand_product, meme, "
+                         "news, movie->movie_tv, other (or pass the exact tag). Reads scout's "
+                         "existing category tags — no re-categorization. 'streamer' keeps the "
+                         "enriched streamer/IRL handoff (sports-with-signal rescued at x0.6). The "
+                         "full board in campaigns.json is untouched; only what's ranked + handed to "
+                         "the clipper changes.")
     ap.add_argument("--streamer-only", action="store_true",
-                    help="STREAMER/IRL-only handoff: rank + pick only streamer_irl campaigns "
-                         "(plus sports campaigns that carry a streamer/IRL keyword signal, at "
-                         "x0.6 lower priority). Reads scout's existing category tags — no "
-                         "re-categorization. The full board in campaigns.json is untouched; "
-                         "only what's ranked + handed to the clipper changes.")
+                    help="alias for --category streamer (STREAMER/IRL-only handoff; kept for "
+                         "backward compat).")
     ap.add_argument("--preedited-min-seconds", type=int, default=DEFAULT_PREEDITED_MIN_SECONDS,
                     help=f"pre-edited filter: a footage file this long or longer counts as a "
                          f"real VOD (default {DEFAULT_PREEDITED_MIN_SECONDS}s). A campaign whose "
@@ -728,27 +788,40 @@ def main():
                          "scout scrape never picks from a stale board unnoticed.")
     args = ap.parse_args()
 
+    # Resolve the category narrow. --streamer-only is exactly --category streamer; if both are
+    # given they must agree (else fail loud rather than silently pick one).
+    category = resolve_category(args.category) if args.category else None
+    if args.streamer_only:
+        if category and category != "streamer_irl":
+            C.fail(f"--streamer-only conflicts with --category {args.category!r} "
+                   f"(resolved to {category}). Pass only one.")
+        category = "streamer_irl"
+
     scout_json = args.scout_json or os.path.join(args.scout_dir, "campaigns.json")
     scout_dir = os.path.dirname(scout_json) or "."
     campaigns = load_scout_campaigns(scout_json)
     warn_if_stale_board(scout_json, args.stale_board_hours)   # Unit 2d: never silent on a stale board
-    ranked = rank_campaigns(campaigns, streamer_only=args.streamer_only)
+    ranked = rank_campaigns(campaigns, category=category)
     if not ranked:
-        if args.streamer_only:
+        if category == "streamer_irl":
             C.fail("no STREAMER/IRL campaigns in scout's ranked output (no streamer_irl tags, "
                    "and no sports campaign carried a streamer/IRL keyword signal). Re-run scout, "
-                   "or drop --streamer-only to walk the full board.")
+                   "or drop --category/--streamer-only to walk the full board.")
+        if category:
+            C.fail(f"no {category!r} campaigns in scout's ranked output (no rankable campaign "
+                   f"carries that category tag). Re-run scout, or drop --category to walk the "
+                   f"full board.")
         C.fail("no rankable campaigns in scout's output (all disqualified, rules-unreadable, "
                "UNKNOWN-only, or zero composite). Nothing to clip — re-run scout.")
     done_ids = _load_done_ids(scout_dir)
 
     # Show the shortlist so the pick is transparent.
-    mode_txt = " [STREAMER/IRL only]" if args.streamer_only else ""
+    mode_txt = f" [{category} only]" if category else ""
     C.log(f"scout ranked {len(ranked)} candidate(s){mode_txt} (from {scout_json}); "
           f"walking the top {min(args.max_walk, len(ranked))} for the first clippable one:")
     for i, c in enumerate(ranked[:max(args.max_walk, 8)], 1):
         extra = ""
-        if args.streamer_only:
+        if category == "streamer_irl":
             _, tier, factor, _reason = streamer_mode_class(c)
             extra = f"  [{tier}{'' if factor == 1.0 else ' x%.2f' % factor}]"
         C.log(f"    #{i}  comp {_composite(c):.4f}{extra}  {_core_known(c)}/5 known  "
@@ -763,7 +836,7 @@ def main():
         if not ok:
             C.fail(f"--rank {args.rank} '{pick.get('name')}' is not clippable: {why}. "
                    "Drop --rank to walk to the first clippable campaign instead.")
-        _commit_pick(pick, args.rank, scout_json, streamer_only=args.streamer_only)
+        _commit_pick(pick, args.rank, scout_json, category=category)
         return
 
     # Walk the top N; take the FIRST that passes all preconditions, logging every skip + reason.
@@ -789,7 +862,7 @@ def main():
             for sr, sc, sw in skips:
                 C.log(f"  skip #{sr}  {sc.get('name')!r} — {sw}")
             C.log(f"  -> clippable at #{i}: {c.get('name')!r}")
-            _commit_pick(c, i, scout_json, streamer_only=args.streamer_only)
+            _commit_pick(c, i, scout_json, category=category)
             return
         skips.append((i, c, why))
 

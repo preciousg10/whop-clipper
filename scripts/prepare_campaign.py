@@ -15,7 +15,8 @@ campaign that already failed.
 Exit 0 = a campaign is picked + intaken and ready for run.py.
 Exit 1 = no campaign could be prepared (board exhausted or advance limit hit).
 
-    python scripts/prepare_campaign.py --streamer-only --max-advance 2
+    python scripts/prepare_campaign.py --category podcast --max-advance 2
+    python scripts/prepare_campaign.py --streamer-only --max-advance 2   # alias for --category streamer
 """
 import argparse
 import os
@@ -36,8 +37,12 @@ def _run(cmd):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--category", default=None, metavar="CAT",
+                    help="pass through to pickcampaign: narrow the walk to ONE scout category "
+                         "(e.g. podcast, streamer, gaming, sports, music, brand, meme, news, "
+                         "movie — or an exact scout tag).")
     ap.add_argument("--streamer-only", action="store_true",
-                    help="pass through to pickcampaign (STREAMER/IRL handoff set)")
+                    help="pass through to pickcampaign (alias for --category streamer)")
     ap.add_argument("--scout-json", help="explicit scout campaigns.json (pass-through)")
     ap.add_argument("--scout-dir", help="scout directory (pass-through)")
     ap.add_argument("--max-advance", type=int, default=2,
@@ -51,6 +56,8 @@ def main():
 
     def pick_cmd(excludes):
         cmd = [pickcampaign]
+        if args.category:
+            cmd += ["--category", args.category]
         if args.streamer_only:
             cmd.append("--streamer-only")
         if args.scout_json:

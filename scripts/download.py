@@ -126,8 +126,8 @@ def looks_like_youtube_block(text):
 # BUILD A — PO-token server + BUILD B — human-like download behavior.
 # YouTube's SABR/PO-token system 403-blocks plain yt-dlp; the bgutil PO-token HTTP server mints
 # the "gvs PO Token"s that make downloads work (yt-dlp auto-discovers it at 127.0.0.1:4416). We
-# auto-manage that server, then download like a human (rate limit + random sleeps + per-video
-# spacing + a daily volume cap + occasional longer breaks) so a burst never re-flags the IP.
+# auto-manage that server, then download like a human (rate limit + random sleeps + organic
+# AFK-style breaks between videos + a daily volume cap) so a burst never re-flags the IP.
 # All of it is CONFIG-DRIVEN (run.py DEFAULT_CONFIG) with sane defaults; DL.configure(cfg) at
 # process start overrides the defaults from state config. Nothing here touches Drive footage.
 # ============================================================================
@@ -147,14 +147,23 @@ _CFG = {
     "download_sleep_requests": 1.0,       # --sleep-requests (pause between HTTP requests)
     "download_sleep_interval": 2.0,       # --sleep-interval (min random pause before each video)
     "download_max_sleep_interval": 5.0,   # --max-sleep-interval (max of that random pause)
-    "download_spacing_seconds": 20.0,     # explicit delay BETWEEN successive YT video downloads
     "youtube_daily_cap": 30,              # STOP downloading YouTube for the day past this many
-    "youtube_human_break_every": 8,       # after every N YT videos, take a longer break…
-    "youtube_human_break_seconds": 120.0,  # …of ~this long (randomized 0.5×–1.5×)
+    # ORGANIC AFK-STYLE BREAKS BETWEEN VIDEOS (like Scout's scrape breaks). Between each YouTube
+    # video: a fresh RANDOM break in [break_min, break_max] (1–5 min). No pre-break on the first
+    # video of a run. If the video just downloaded was LONG (≥ long_video_minutes, ~1h), rest
+    # LONGER — a random break in [long_break_min, long_break_max] (5–10 min) — as a human who
+    # "watched" an hour would. Supersedes the old fixed download_spacing_seconds model.
+    "youtube_break_min_seconds": 60.0,        # normal between-video break, low bound (1 min)
+    "youtube_break_max_seconds": 300.0,       # normal between-video break, high bound (5 min)
+    "youtube_long_video_minutes": 60.0,       # a downloaded video ≥ this long triggers a long break
+    "youtube_long_break_min_seconds": 300.0,  # long (post-long-video) break, low bound (5 min)
+    "youtube_long_break_max_seconds": 600.0,  # long (post-long-video) break, high bound (10 min)
 }
 
 _TOKEN_SERVER = {"proc": None, "checked": False, "reachable": False}
-_YT_RUN_COUNT = 0                          # YouTube videos downloaded in THIS process (spacing/break)
+_YT_RUN_COUNT = 0                          # YouTube videos downloaded in THIS process (break gating)
+_YT_LAST_DURATION_MIN = None               # duration (min) of the LAST YT video pulled → scales the
+#                                            NEXT between-video break (long video → longer rest)
 
 
 def configure(cfg):
@@ -334,31 +343,61 @@ def _apply_ytdlp_pacing(opts):
 _PACING_LOGGED = False
 
 
+def _fmt_dur(seconds):
+    """Human 'm/s' rendering of a duration for the break logs (Scout-style): 192 → '3m12s'."""
+    s = int(round(seconds))
+    m, s = divmod(s, 60)
+    return f"{m}m{s:02d}s" if m else f"{s}s"
+
+
+def _measure_last_yt_duration(paths):
+    """Record the duration (minutes) of the just-downloaded YouTube video so the NEXT between-video
+    break can scale to it (long video → longer rest). ffprobes the footage file; None if unmeasurable
+    (→ next break defaults to the normal 1–5 min band). Never raises."""
+    global _YT_LAST_DURATION_MIN
+    _YT_LAST_DURATION_MIN = None
+    for p in paths:
+        if classify_file(p) != "footage":
+            continue
+        try:
+            dur = float(C.ffprobe_duration(p) or 0.0)
+        except Exception:
+            dur = 0.0
+        if dur > 0:
+            _YT_LAST_DURATION_MIN = dur / 60.0
+            return
+
+
 def _youtube_predownload_pacing(url):
-    """BUILD B: called right before a YouTube video download. Enforces the daily cap (raises
-    YouTubeDailyCapError past it), then spaces this pull from the previous one (download_spacing_
-    seconds) and takes a longer randomized 'human break' every youtube_human_break_every videos."""
-    global _YT_RUN_COUNT
+    """ORGANIC AFK-STYLE PACING (like Scout's scrape breaks): called right before a YouTube video
+    download. First enforces the daily cap (raises YouTubeDailyCapError past it). Then — except on
+    the FIRST video of the run — sleeps a FRESH RANDOM break:
+      • normal band [break_min, break_max] (1–5 min) between ordinary videos;
+      • long band  [long_break_min, long_break_max] (5–10 min) when the PREVIOUS video was LONG
+        (≥ long_video_minutes, ~1h) — a human who 'watched' an hour rests longer.
+    Every break is re-randomized each time (never a fixed/regular interval)."""
     if youtube_cap_reached():
         cap = youtube_daily_cap()
         raise YouTubeDailyCapError(
             f"YouTube daily volume cap reached ({youtube_downloads_today()}/{cap} today) — not "
             f"downloading more YouTube today (resets tomorrow; Drive footage still allowed).")
-    if _YT_RUN_COUNT > 0:
-        every = int(_CFG.get("youtube_human_break_every") or 0)
-        if every > 0 and _YT_RUN_COUNT % every == 0:
-            base = float(_CFG.get("youtube_human_break_seconds") or 0)
-            if base > 0:
-                brk = random.uniform(base * 0.5, base * 1.5)
-                C.log(f"  human break: {_YT_RUN_COUNT} YouTube videos pulled — pausing "
-                      f"{brk:.0f}s (longer, randomized) before the next.")
-                time.sleep(brk)
-        else:
-            gap = float(_CFG.get("download_spacing_seconds") or 0)
-            if gap > 0:
-                jitter = random.uniform(gap * 0.8, gap * 1.2)
-                C.log(f"  spacing {jitter:.0f}s before the next YouTube download (anti-throttle).")
-                time.sleep(jitter)
+    if _YT_RUN_COUNT <= 0:
+        return                                   # first video of the run — no pre-break
+    long_min = float(_CFG.get("youtube_long_video_minutes") or 0)
+    prev = _YT_LAST_DURATION_MIN
+    if long_min > 0 and prev is not None and prev >= long_min:
+        lo = float(_CFG.get("youtube_long_break_min_seconds") or 0)
+        hi = float(_CFG.get("youtube_long_break_max_seconds") or lo)
+        brk = random.uniform(min(lo, hi), max(lo, hi))
+        C.log(f"  long-video break ~{_fmt_dur(brk)} before next video… "
+              f"(previous video was ~{prev:.0f}m — resting longer, like Scout's AFK breaks).")
+    else:
+        lo = float(_CFG.get("youtube_break_min_seconds") or 0)
+        hi = float(_CFG.get("youtube_break_max_seconds") or lo)
+        brk = random.uniform(min(lo, hi), max(lo, hi))
+        C.log(f"  human break ~{_fmt_dur(brk)} before next video… (randomized, anti-flag).")
+    if brk > 0:
+        time.sleep(brk)
 
 
 def _channel_videos_url(url):
@@ -979,10 +1018,10 @@ def download_source(url, cookies_from_browser=None, max_source_height=720, origi
                                     original=original,
                                     cookies_from_browser=cookies_from_browser)
         elif is_youtube_url(url):
-            # YOUTUBE: BUILD B — daily cap + per-video spacing/human-break BEFORE the pull, and the
-            # PROVEN working format (720p h264 + m4a, muxed) that the PO-token server enables.
-            # Falls back to a height-capped ladder so a video lacking the exact avc1 combo still
-            # downloads. Counter is bumped only AFTER a successful footage pull.
+            # YOUTUBE: BUILD B — daily cap + organic AFK-style break BEFORE the pull (scaled to the
+            # PREVIOUS video's length), and the PROVEN working format (720p h264 + m4a, muxed) that
+            # the PO-token server enables. Falls back to a height-capped ladder so a video lacking
+            # the exact avc1 combo still downloads. Counter is bumped only AFTER a successful pull.
             _youtube_predownload_pacing(url)
             h = int(max_source_height or 720)
             yt_fmt = _CFG.get("youtube_format") or YOUTUBE_FORMAT_DEFAULT
@@ -993,9 +1032,12 @@ def download_source(url, cookies_from_browser=None, max_source_height=720, origi
                 n = _record_youtube_download()
                 global _YT_RUN_COUNT
                 _YT_RUN_COUNT += 1
+                _measure_last_yt_duration(raw)   # remember THIS video's length → scales NEXT break
                 cap = youtube_daily_cap()
+                dur_note = (f", ~{_YT_LAST_DURATION_MIN:.0f}m long"
+                            if _YT_LAST_DURATION_MIN else "")
                 C.log(f"  YouTube downloads today: {n}{f'/{cap} cap' if cap else ''} "
-                      f"({_YT_RUN_COUNT} this run).")
+                      f"({_YT_RUN_COUNT} this run{dur_note}).")
         else:
             # Non-YouTube VOD (Kick/Twitch) / direct http. Prefer <= max_source_height so yt-dlp
             # never pulls 4K, but FALL BACK GRACEFULLY — never hard-fail just because the exact

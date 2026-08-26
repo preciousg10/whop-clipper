@@ -88,20 +88,23 @@ DEFAULT_CONFIG = {
     "token_server_wait_seconds": 20,
     # ── BUILD B: HUMAN-LIKE YOUTUBE DOWNLOADING (avoid IP flags) ─────────────────────────────
     # A 28-video burst with no spacing got the IP bot-flagged. So: cap the bitrate, sleep randomly
-    # between requests/videos, SPACE each video pull, take a longer break every N videos, and stop
-    # for the day past a volume cap (persisted per date in memory/yt_download_log.json). The proven
-    # working format (720p h264 + m4a) is the default. Channel-cap-3 / 403-backoff / cookies / the
-    # footage cap all stay in force alongside these.
+    # between requests/videos on the yt-dlp call, take ORGANIC AFK-STYLE breaks BETWEEN videos
+    # (like Scout's scrape breaks), and stop for the day past a volume cap (persisted per date in
+    # memory/yt_download_log.json). The proven working format (720p h264 + m4a) is the default.
+    # Channel-cap-3 / 403-backoff / cookies / the footage cap all stay in force alongside these.
     "youtube_format": ("bestvideo[height<=720][vcodec^=avc1]+bestaudio/"
                        "bestvideo[height<=720]+bestaudio/best[height<=720]"),
     "download_rate_limit": "5M",          # yt-dlp --limit-rate (bytes/s; "" = unlimited)
     "download_sleep_requests": 1.0,       # --sleep-requests (pause between HTTP requests)
-    "download_sleep_interval": 2.0,       # --sleep-interval (min random pre-video pause)
+    "download_sleep_interval": 2.0,       # --sleep-interval (min random pre-video pause, on yt-dlp)
     "download_max_sleep_interval": 5.0,   # --max-sleep-interval (max of that random pause)
-    "download_spacing_seconds": 20.0,     # explicit delay BETWEEN successive YT video downloads
     "youtube_daily_cap": 30,              # STOP pulling YouTube for the day past this many videos
-    "youtube_human_break_every": 8,       # after every N YT videos, take a longer randomized break
-    "youtube_human_break_seconds": 120.0,  # ~length of that break (randomized 0.5×–1.5×)
+    # Organic AFK-style breaks BETWEEN videos (randomized each time; no pre-break on the 1st video).
+    "youtube_break_min_seconds": 60.0,        # normal between-video break lower bound (1 min)
+    "youtube_break_max_seconds": 300.0,       # normal between-video break upper bound (5 min)
+    "youtube_long_video_minutes": 60.0,       # a downloaded video ≥ this long → take a LONG break
+    "youtube_long_break_min_seconds": 300.0,  # long break lower bound (5 min) after a long video
+    "youtube_long_break_max_seconds": 600.0,  # long break upper bound (10 min) after a long video
     # BATCH FLOOR (auto-advance walk). Accumulate clips ACROSS campaigns until the running total
     # reaches this many — a MINIMUM, not a cap: the current campaign always finishes and ALL its
     # clips are kept, so the final batch may exceed it (20 + 8 → keep all 28). The walk stops when
@@ -438,7 +441,11 @@ def _pick_and_intake_next(excluded, args):
     pc = [sys.executable, os.path.join(scripts, "pickcampaign.py")]
     if pick.get("scout_json"):
         pc += ["--scout-json", pick["scout_json"]]
-    if pick.get("rank_mode") == "streamer_only":
+    # Preserve the pick's narrow on advance. `category` carries the exact tag for any narrowed
+    # walk (streamer_irl included); rank_mode is the back-compat path for older pick.json files.
+    if pick.get("category"):
+        pc += ["--category", pick["category"]]
+    elif pick.get("rank_mode") == "streamer_only":
         pc.append("--streamer-only")
     for eid in excluded:
         if eid:
