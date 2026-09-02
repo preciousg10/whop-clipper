@@ -834,6 +834,30 @@ def platform_text(caption, rules, banned):
     return out
 
 
+# Shipped output fields that carry human-visible caption TEXT — must be 100% free of any banned/
+# restriction term. (reels_hashtags is already screened inside platform_text.)
+_TEXT_OUTPUT_FIELDS = ("caption", "tiktok_caption", "shorts_title")
+
+
+def scrub_clip_compliance(clip, banned, moment_id=""):
+    """AIRTIGHT kill-set sweep over ONE clip's output (BUG 2). Runs EVERY variant through the full
+    augmented kill-set (banned words + topics + restriction inflections):
+      - candidate lines containing a restricted term are DROPPED ENTIRELY (not just deprioritized),
+      - a non-compliant `variant` is dropped,
+      - any restricted term surviving in a SHIPPED text field (caption / tiktok_caption /
+        shorts_title) is a hard failure (C.fail) — we never ship a non-compliant caption.
+    Mutates and returns `clip`."""
+    clip["candidates"] = [c for c in clip.get("candidates", []) if not banned_hit(c, banned)]
+    if clip.get("variant") and banned_hit(clip["variant"], banned):
+        clip["variant"] = None
+    for f in _TEXT_OUTPUT_FIELDS:
+        h = banned_hit(clip.get(f, ""), banned)
+        if h:
+            C.fail(f"captions: clip {moment_id} field {f!r} still contains restricted term {h!r} "
+                   f"({clip.get(f)!r}) — refusing to ship a non-compliant caption.")
+    return clip
+
+
 def _strip_symbols(text):
     """Drop every non-ASCII char (all emoji/symbols) and collapse the gaps — the
     guaranteed no-emoji gate on the caption text itself (cut.py also strips at render)."""
@@ -1109,7 +1133,7 @@ def run(state):
             if hook_moment is not None:
                 C.log(f"captions: cold-open hook moment for {m['id']} @ {hook_moment:.1f}s "
                       f"(LLM-chosen from {len(hook_lines)} line(s)).")
-        clips.append({
+        clip = {
             "moment_id": m["id"], "source": m["source"],
             "start": m["start"], "end": m["end"], "type": m["type"],
             "peak": m.get("peak"),                # audio-peak cold-open anchor (fallback)
@@ -1118,7 +1142,12 @@ def run(state):
             "candidates": cands, "killed": killed,
             "caption": best, "variant": variant, "sound_fx": sound_fx,
             **platform_text(best, rules, banned),
-        })
+        }
+        # BUG 2 — AIRTIGHT KILL-SET SWEEP: drop every candidate/variant that carries a restricted
+        # term and fail loud if one survives in a shipped text field. The kill-set (banned_words +
+        # topics + restriction inflections) is applied to EVERY variant, not just the chosen line.
+        scrub_clip_compliance(clip, banned, m["id"])
+        clips.append(clip)
         # Checkpoint after EVERY clip so a daily-cap stop (or crash) resumes here, not from #1.
         C.save_json(C.CAPTIONS_PARTIAL, {"campaign": campaign, "clips": clips})
 
