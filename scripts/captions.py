@@ -235,10 +235,20 @@ OFFLINE_TEMPLATES = [
 
 # --- banned-word gauntlet (the load-bearing rules gate) ------------------------
 def banned_hit(text, banned):
-    """Return the first banned word/phrase present in text, or None."""
+    """Return the first banned term present in `text`, or None. Robust matching: the text is
+    lowercased and single words are matched on WORD BOUNDARIES, so case, trailing punctuation
+    ('cures?'), em-dash joins ('everything—no') and surrounding words never hide a hit — and
+    'stake' still never trips 'stakeholder'. A term may be a plain string (word or multi-word
+    phrase) OR a compiled regex rule (e.g. the disease-causation medical-claim pattern), which is
+    `.search`ed against the lowercased text."""
     low = (text or "").lower()
     for term in banned:
-        t = term.lower().strip()
+        if hasattr(term, "search"):                 # compiled regex rule (medical-claim pattern)
+            mm = term.search(low)
+            if mm:
+                return (mm.group(0).strip() or "restricted phrase")
+            continue
+        t = str(term).lower().strip()
         if not t:
             continue
         if " " in t:            # multi-word phrase: substring match
@@ -318,6 +328,37 @@ def restriction_terms(rules):
         for q in _QUOTED_RE.findall(e.get("detail") or ""):
             terms |= _term_variants(q)
     return sorted(terms)
+
+
+# --- disease-causation / efficacy medical claims (regex kill-rules) ------------
+# A "No medical claims" restriction must ALSO catch disease-causation / efficacy claims whose exact
+# wording isn't a quoted term — "sleep causes dementia", "cures cancer", "reverses diabetes",
+# "dementia is caused by sleep". We detect a claim VERB within a few words of a medical CONDITION
+# in EITHER order and return it as a compiled regex rule (banned_hit understands regex rules).
+_MED_CLAIM_TRIGGER_RE = re.compile(r"medical claim", re.I)
+_CLAIM_VERB_RE = (r"cause[sd]?|causing|cure[sd]?|curing|prevent(?:s|ed|ing)?|"
+                  r"revers(?:e|es|ed|ing)|treat(?:s|ed|ing)?|heal(?:s|ed|ing)?|"
+                  r"fix(?:es|ed|ing)?|eliminat(?:e|es|ed|ing)|trigger(?:s|ed|ing)?")
+_CONDITION_RE = (r"dementia|alzheimer\w*|cancers?|diabetes|depression|anxiety|adhd|autism|"
+                 r"insomnia|obesity|strokes?|arthritis|parkinson\w*|asthma|migraines?|ptsd|"
+                 r"diseases?|illnesses?|disorders?|inflammation|hypertension")
+
+
+def medical_claim_patterns(rules):
+    """Compiled regex kill-rules for disease-causation / efficacy claims, active ONLY when a
+    'No medical claims' restriction is present. Match a claim VERB within ~3 words of a medical
+    CONDITION in EITHER order ('cause dementia', 'could actually cause dementia', 'dementia is
+    caused by sleep'). Fed into the same banned set as the quoted-term kill-list, so these lines
+    are killed in the gauntlet BEFORE selection and can never be chosen."""
+    for e in (rules or {}).get("required_elements", []):
+        if (isinstance(e, dict) and str(e.get("type", "")).lower() == "restriction"
+                and _MED_CLAIM_TRIGGER_RE.search(e.get("detail") or "")):
+            v, c = _CLAIM_VERB_RE, _CONDITION_RE
+            return [
+                re.compile(rf"\b(?:{v})\b(?:\W+\w+){{0,3}}\W+\b(?:{c})\b", re.I),
+                re.compile(rf"\b(?:{c})\b(?:\W+\w+){{0,3}}\W+\b(?:{v})\b", re.I),
+            ]
+    return []
 
 
 # --- quality gate + style scoring (flzsh) --------------------------------------
@@ -840,22 +881,24 @@ _TEXT_OUTPUT_FIELDS = ("caption", "tiktok_caption", "shorts_title")
 
 
 def scrub_clip_compliance(clip, banned, moment_id=""):
-    """AIRTIGHT kill-set sweep over ONE clip's output (BUG 2). Runs EVERY variant through the full
-    augmented kill-set (banned words + topics + restriction inflections):
+    """AIRTIGHT kill-set sweep over ONE clip's output. Runs EVERY variant through the full
+    augmented kill-set (banned words + topics + restriction inflections + medical-claim regex):
       - candidate lines containing a restricted term are DROPPED ENTIRELY (not just deprioritized),
       - a non-compliant `variant` is dropped,
-      - any restricted term surviving in a SHIPPED text field (caption / tiktok_caption /
-        shorts_title) is a hard failure (C.fail) — we never ship a non-compliant caption.
-    Mutates and returns `clip`."""
+      - if any restricted term survives in a SHIPPED text field (caption / tiktok_caption /
+        shorts_title) the clip is NOT shippable.
+    Mutates `clip` in place and returns True if it is compliant to ship, False if it must be
+    SKIPPED (fail loud, never ship a non-compliant caption)."""
     clip["candidates"] = [c for c in clip.get("candidates", []) if not banned_hit(c, banned)]
     if clip.get("variant") and banned_hit(clip["variant"], banned):
         clip["variant"] = None
     for f in _TEXT_OUTPUT_FIELDS:
         h = banned_hit(clip.get(f, ""), banned)
         if h:
-            C.fail(f"captions: clip {moment_id} field {f!r} still contains restricted term {h!r} "
-                   f"({clip.get(f)!r}) — refusing to ship a non-compliant caption.")
-    return clip
+            C.warn(f"captions: clip {moment_id} field {f!r} still carries restricted term {h!r} "
+                   f"({clip.get(f)!r}) — SKIPPING this clip (never ship a non-compliant caption).")
+            return False
+    return True
 
 
 def _strip_symbols(text):
@@ -990,11 +1033,12 @@ def run(state):
     # required_elements (FIX B: e.g. "No medical claims (no 'cure', 'will fix', ...)" → cure/cures/
     # will fix/fixes/... become caption kill-terms, so a non-compliant caption is never shipped).
     restrictions = restriction_terms(rules)
+    med_patterns = medical_claim_patterns(rules)     # disease-causation / efficacy regex rules
     banned = (list(rules.get("banned_words", C.DEFAULT_BANNED_WORDS))
-              + list(rules.get("banned_topics", [])) + restrictions)
-    if restrictions:
-        C.log(f"captions: enforcing {len(restrictions)} restriction kill-term(s) from "
-              f"required_elements: {restrictions}")
+              + list(rules.get("banned_topics", [])) + restrictions + med_patterns)
+    if restrictions or med_patterns:
+        C.log(f"captions: enforcing {len(restrictions)} restriction kill-term(s) + "
+              f"{len(med_patterns)} medical-claim pattern(s) from required_elements: {restrictions}")
     campaign = rules.get("campaign", state.get("campaign") or "campaign")
     cfg = state.get("config", {})
     emoji_in_caption = bool(cfg.get("emoji_in_caption", True))   # flzsh: emoji as punctuation
@@ -1040,6 +1084,16 @@ def run(state):
                f"re-ran with new picks; discarding the partial and regenerating from scratch.")
         clips = []
         C.CAPTIONS_PARTIAL.unlink(missing_ok=True)
+    # Re-verify any RESUMED clips against the CURRENT kill-set (the partial may predate a rule
+    # change or an earlier filter bug). Drop non-compliant candidates/variants; drop the whole clip
+    # if a shipped field is non-compliant so it regenerates compliantly — a leaked line from a prior
+    # run can never survive on resume.
+    resumed_clean = [cl for cl in clips
+                     if scrub_clip_compliance(cl, banned, cl.get("moment_id", "?"))]
+    if len(resumed_clean) != len(clips):
+        C.warn(f"captions: dropped {len(clips) - len(resumed_clean)} resumed clip(s) that no "
+               f"longer pass the kill-set — they will regenerate compliantly.")
+    clips = resumed_clean
     done_ids = {c.get("moment_id") for c in clips}
     total = len(selected["selected"])
     # FIX 6 — batch-wide hook-structure ledger (seeded from any resumed clips so diversity
@@ -1087,15 +1141,15 @@ def run(state):
             C.warn(f"captions: SKIPPING clip {m['id']} — no clean grammatical caption could be "
                    f"produced (preferring to skip over shipping broken text).")
             continue
-        # COMPLIANCE GATE (FIX B): the gauntlet screens candidates, but a fallback/synth path could
-        # still surface a restricted term. Re-verify the CHOSEN caption and FAIL LOUD if this clip
-        # cannot produce a compliant caption (submission would be rejected). Drop a bad variant.
+        # COMPLIANCE GATE (point 3): the gauntlet screens candidates BEFORE selection, but a
+        # fallback/synth path could still surface a restricted term. If the CHOSEN caption itself
+        # carries one, SKIP this clip now (fail loud, never ship a non-compliant caption; also
+        # avoids wasting sound_fx / hook_moment Groq calls on a clip we won't ship).
         hit = banned_hit(best, banned)
         if hit:
-            C.fail(f"captions: clip {m['id']} cannot produce a COMPLIANT caption — every option "
-                   f"still contains the restricted/banned term {hit!r} (best: {best!r}). "
-                   f"Restriction kill-terms in force: {restrictions}. Fix the rules or the clip; "
-                   f"refusing to ship a non-compliant caption.")
+            C.warn(f"captions: SKIPPING clip {m['id']} — chosen caption {best!r} contains "
+                   f"restricted term {hit!r}; refusing to ship a non-compliant caption.")
+            continue
         if variant and banned_hit(variant, banned):
             variant = None
         # Non-speech sound labels for the karaoke (accurate, or nothing). Only fires when the
@@ -1143,10 +1197,12 @@ def run(state):
             "caption": best, "variant": variant, "sound_fx": sound_fx,
             **platform_text(best, rules, banned),
         }
-        # BUG 2 — AIRTIGHT KILL-SET SWEEP: drop every candidate/variant that carries a restricted
-        # term and fail loud if one survives in a shipped text field. The kill-set (banned_words +
-        # topics + restriction inflections) is applied to EVERY variant, not just the chosen line.
-        scrub_clip_compliance(clip, banned, m["id"])
+        # AIRTIGHT KILL-SET SWEEP (points 2/3): apply the FULL kill-set (banned_words + topics +
+        # restriction inflections + medical-claim regex) to EVERY stored field — drop every
+        # candidate/variant that carries a restricted term, and SKIP the whole clip if one survives
+        # in a shipped field (caption / tiktok_caption / shorts_title). A killed line can never ship.
+        if not scrub_clip_compliance(clip, banned, m["id"]):
+            continue
         clips.append(clip)
         # Checkpoint after EVERY clip so a daily-cap stop (or crash) resumes here, not from #1.
         C.save_json(C.CAPTIONS_PARTIAL, {"campaign": campaign, "clips": clips})

@@ -271,6 +271,40 @@ def t7_intake_analyst(footage, watermark, brief):
            any("telemetry.bin" in a for a in amb) and any("LLM extraction did NOT run" in a for a in amb))
 
 
+def t8_restriction_kill_set():
+    """The restriction/medical-claim kill-set must remove the EXACT strings that leaked in prod —
+    'sleep cures dementia', 'cause dementia', 'fixes everything' — from candidates AND shipped
+    fields, while leaving benign lines alone."""
+    rules = {"required_elements": [
+        {"type": "restriction",
+         "detail": 'No medical claims (no "cure", "will fix", "miracle", "100% effective")'}]}
+    banned = captions_stage.restriction_terms(rules) + captions_stage.medical_claim_patterns(rules)
+
+    must_kill = ["sleep cures dementia", "cause dementia", "fixes everything",
+                 "sleep cures sleepiness", "did i just discover sleep cures dementia?",
+                 "Sleep Problems Could Actually Cause Dementia?", "dementia is caused by sleep"]
+    must_keep = ["why melatonin only cues night", "the truth about dementia",
+                 "the cause of the noise", "because i said so"]
+    kill_ok = all(captions_stage.banned_hit(s, banned) is not None for s in must_kill)
+    keep_ok = all(captions_stage.banned_hit(s, banned) is None for s in must_keep)
+    leaked = [s for s in must_kill if captions_stage.banned_hit(s, banned) is None]
+    record("T8 restriction kill-set kills cure/cause/fixes claims", kill_ok,
+           f"leaked={leaked}" if leaked else "all killed")
+    record("T8 benign medical mentions survive", keep_ok,
+           f"survivors={[s for s in must_keep if captions_stage.banned_hit(s, banned) is None]}")
+
+    # scrub_clip_compliance must DROP a restricted candidate and REFUSE (return False) a clip whose
+    # chosen caption is a disease-causation claim.
+    clip = {"candidates": ["sleep cures dementia", "why melatonin only cues night"],
+            "variant": "fixes everything", "caption": "sleep problems cause dementia",
+            "tiktok_caption": "sleep problems cause dementia", "shorts_title": "sleep problems cause dementia"}
+    shippable = captions_stage.scrub_clip_compliance(clip, banned, "t8")
+    record("T8 scrub drops restricted candidates + refuses a claim caption",
+           (not shippable) and clip["candidates"] == ["why melatonin only cues night"]
+           and clip["variant"] is None,
+           f"shippable={shippable}, candidates={clip['candidates']}, variant={clip['variant']}")
+
+
 def t4_full_pipeline(synth, watermark_path, brief_path):
     reset_campaign()
     run_intake(brief_path, [synth, watermark_path], "WTF Leagues Selftest")
@@ -320,6 +354,7 @@ def main():
     t5_watermark_selection()
     t6_routing()
     t7_intake_analyst(footage_for_t1, watermark, brief)
+    t8_restriction_kill_set()
 
     if synth is not None:
         t4_full_pipeline(synth, watermark, brief)
