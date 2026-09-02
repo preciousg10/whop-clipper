@@ -520,6 +520,10 @@ def _pick_and_intake_next(excluded, args):
         pc += ["--category", pick["category"]]
     elif pick.get("rank_mode") == "streamer_only":
         pc.append("--streamer-only")
+    # FIX 1: thread the language gate through so the pre-download skip matches run.py's setting —
+    # --allow-any-language disables BOTH the pickcampaign pre-download gate and index.py's gate.
+    if getattr(args, "allow_any_language", False):
+        pc.append("--allow-any-language")
     for eid in excluded:
         if eid:
             pc += ["--exclude-id", str(eid)]

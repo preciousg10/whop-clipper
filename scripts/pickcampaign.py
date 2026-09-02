@@ -376,6 +376,37 @@ def clippable(c, done_ids):
     return True, None
 
 
+# --- pre-download LANGUAGE gate (FIX 1) ----------------------------------------
+# Scout already detects each campaign's language from its brief/rules/description and flags a
+# CLEARLY non-English one (language.nonenglish + language_code + confidence, plus a 0.05
+# penalty_factor). We use that to skip a clearly-non-English campaign HERE — before intake
+# downloads GBs of footage that the post-transcribe language gate (index.py) would only catch
+# AFTER the wasted download (e.g. Jerith's 9GB German pull). The index.py gate stays as the
+# fallback for footage whose spoken language differs from the brief.
+def campaign_language_skip(c, gate_lang="en"):
+    """(skip, reason) — True only when scout is CONFIDENT the campaign's language is not
+    `gate_lang`. Reads scout's per-campaign `language` flag (dict) or the top-level
+    `language_code`. FAILS OPEN (never skips) when the language is unknown, matches the gate, or
+    scout's confidence is low — so we never wrongly drop a campaign on a weak signal."""
+    gate_lang = (gate_lang or "en").lower()
+    lang = c.get("language")
+    code = confidence = ""
+    nonenglish = False
+    if isinstance(lang, dict):
+        code = str(lang.get("language") or lang.get("language_code") or "").lower()
+        confidence = str(lang.get("confidence") or "").lower()
+        nonenglish = bool(lang.get("nonenglish"))
+    code = code or str(c.get("language_code") or "").lower()
+    if not code or code == gate_lang:
+        return False, None                     # unknown or already the target language → keep
+    # code != gate_lang: only skip when scout flagged it as CONFIDENTLY non-target.
+    if nonenglish and confidence != "low":
+        return True, (f"scout-detected language {code!r} != {gate_lang!r} "
+                      f"(confidence {confidence or 'n/a'}) — skipping before download "
+                      f"(avoids a wasted non-{gate_lang} footage pull)")
+    return False, None
+
+
 # --- pre-edited footage filter (Unit 1) ----------------------------------------
 # Some campaigns' "footage" is a Drive folder of already-edited short vertical clips
 # (15-45s each), not raw VODs — you can't clip moments out of an edited clip. We SKIP a
@@ -776,6 +807,13 @@ def main():
                          f"{DEFAULT_PREEDITED_MAX_PROBE}).")
     ap.add_argument("--no-preedited-filter", action="store_true",
                     help="disable the pre-edited-footage skip (walk exactly as before).")
+    ap.add_argument("--gate-language", default="en", metavar="LANG",
+                    help="pre-download language gate: skip a campaign scout flags as CONFIDENTLY "
+                         "not this language (default 'en') BEFORE downloading its footage. The "
+                         "post-transcribe gate in index.py stays as the fallback.")
+    ap.add_argument("--allow-any-language", action="store_true", dest="allow_any_language",
+                    help="disable the pre-download language gate — walk clearly-non-English "
+                         "campaigns anyway (matches run.py --allow-any-language).")
     ap.add_argument("--preedited-refresh", action="store_true",
                     help="ignore the cached footage-length verdicts and re-measure from scratch "
                          "(otherwise a measured campaign reuses its sticky verdict).")
@@ -848,6 +886,14 @@ def main():
         if c.get("id") in exclude:
             skips.append((i, c, "excluded (--exclude-id; auto-advance skip)"))
             continue
+        # FIX 1: LANGUAGE gate BEFORE download. Skip a campaign scout flags as clearly non-target
+        # here, so intake never downloads GBs of non-English footage the index.py gate would only
+        # reject AFTER the pull. Cheapest possible check (reads scout data) — runs before preedited.
+        if not args.allow_any_language:
+            lskip, lwhy = campaign_language_skip(c, gate_lang=args.gate_language)
+            if lskip:
+                skips.append((i, c, lwhy))
+                continue
         ok, why = clippable(c, done_ids)
         # Pre-edited footage filter (Unit 1): only AFTER the cheap checks pass (it probes the
         # network for durations, so we never run it on a campaign that already failed).
