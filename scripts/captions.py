@@ -138,9 +138,23 @@ def _ungrounded_terms(caption, tvocab):
     return out
 
 
+def _has_specific_term(caption, tvocab):
+    """True if the caption carries at least ONE clip-specific content word — a transcript word that
+    isn't generic hook vocabulary. FIX A: a caption with NONE is a generic anchor template ('nah
+    this is actually crazy', 'no way that just happened') and must never win over a real hook when
+    we have a transcript to be specific about."""
+    for w in _GROUND_WORD_RE.findall((caption or "").lower()):
+        w = w.strip("'")
+        if len(w) <= 2 or w in GENERIC_HOOK_VOCAB:
+            continue
+        if _word_grounded(w, tvocab):
+            return True
+    return False
+
+
 # Neutral hooks that assert NOTHING specific — every word is generic hook vocabulary, so
-# they are always grounded. Used only when no grounded Groq caption survives (better a
-# plain accurate hook than a catchy invented one).
+# they are always grounded. Last-resort ONLY: used when the clip has no transcript to build a
+# specific hook from (a text-less audio spike) — a specific hook (below) is always preferred.
 GROUNDED_FALLBACKS = [
     "wait for the end 👀",
     "you have to see this 😳",
@@ -151,6 +165,35 @@ GROUNDED_FALLBACKS = [
     "no shot this just happened 😳",
     "how is this even real 😭",
 ]
+
+
+def _specific_fallbacks(event, banned=()):
+    """CLIP-SPECIFIC last-resort hooks built from THIS clip's transcript (FIX A) — used instead of
+    the generic GROUNDED_FALLBACKS whenever no Groq caption survives but we DO have transcript, so
+    a campaign that doesn't require a template never ships a generic anchor. Pulls the clip's first
+    few salient content words and wraps each in a short hook that still hits a hook pattern.
+    Screened against banned/restriction terms (FIX B). Returns [] when there's no transcript."""
+    seen, terms = set(), []
+    for w in _GROUND_WORD_RE.findall((event or "").lower()):
+        w = w.strip("'")
+        if len(w) < 4 or w in GENERIC_HOOK_VOCAB or w in seen:
+            continue
+        seen.add(w)
+        terms.append(w)
+        if len(terms) >= 4:
+            break
+    if not terms:
+        return []
+    a = terms[0]
+    b = terms[1] if len(terms) > 1 else a
+    cands = [
+        f"wait till you hear about {a} 👀",
+        f"why {a} changes everything 😳",
+        f"no way this is about {a} 😭",
+        f"how {a} actually works 👀",
+        f"tell me why {b} matters 😭",
+    ]
+    return [c for c in cands if not banned_hit(c, banned)]
 
 OFFLINE_TEMPLATES = [
     "how did this even happen 😭",
@@ -503,12 +546,18 @@ def _groq_candidates(client, campaign, moment, style_notes, event="", emoji_in_c
         "about money, hook on that specific thing. The campaign knowledge is for RULES/banned-word "
         "compliance only — do NOT let it turn the caption into a description of the show. "
         "RULES: ONE line, MAX 8 words, casual grammar, " + emoji_rule +
-        "NO hashtags. Every caption MUST use one of these five proven hook patterns:\n"
-        "  1) open question — 'how did this even happen'\n"
-        "  2) stakes — '$10k on the line and then THIS'\n"
-        "  3) disbelief — 'no way that just happened'\n"
-        "  4) controversy — 'this should NOT have counted'\n"
-        "  5) direct address — 'wait for the very last second'\n"
+        "NO hashtags. Use ONE of these hook TECHNIQUES, but write it ENTIRELY in THIS clip's own "
+        "words/subject — do NOT paste a template prefix:\n"
+        "  1) an open QUESTION about the specific claim/thing in the clip\n"
+        "  2) the STAKES, or a bold curiosity-gap statement of the actual claim\n"
+        "  3) DISBELIEF aimed at the specific thing said\n"
+        "  4) CONTROVERSY over the specific claim\n"
+        "  5) DIRECT ADDRESS to watch the specific payoff\n"
+        "BANNED BOILERPLATE (FIX A): NEVER open with an empty generic prefix like 'how did this "
+        "even happen', 'no way that just happened', 'wait for the very last second', 'this should "
+        "not have counted', 'nah this is actually crazy', or '$10k on the line'. Those waste the "
+        "word budget and say nothing about the clip. Every hook MUST name the clip's real subject "
+        "in <= 8 words (e.g. if the clip is about melatonin, the hook says melatonin).\n"
         "GROUNDING (CRITICAL): use ONLY the names, people, brands, places, and objects that "
         "appear in the transcript below. NEVER invent, guess, or borrow a name from these "
         "instructions — if the transcript doesn't name it, don't name it (say 'this', "
@@ -550,9 +599,14 @@ def _groq_candidates(client, campaign, moment, style_notes, event="", emoji_in_c
 # (required_onscreen_text_pattern), the caption stage must MAKE the hook follow it, filled from the
 # clip's real content — the generic five-hook style is bypassed for that campaign.
 def _required_onscreen(rules):
-    """The campaign's required onscreen-text pattern as {description, templates}, or None."""
+    """The campaign's required onscreen-text pattern as {description, templates}, or None.
+
+    FIX A: templates are used ONLY when required_onscreen_text_pattern.required is literally True.
+    When required is false/absent (most campaigns) this returns None and captions are generated as
+    PURE clip-specific hooks (no generic anchor template). Derived fresh from the passed-in rules
+    every call — nothing is cached, so a prior campaign's format can never leak into this one."""
     p = (rules or {}).get("required_onscreen_text_pattern") or {}
-    if isinstance(p, dict) and p.get("required"):
+    if isinstance(p, dict) and p.get("required") is True:
         tmpls = list(p.get("templates") or p.get("examples") or [])
         if tmpls:
             return {"description": p.get("description", ""), "templates": tmpls}
@@ -763,17 +817,32 @@ def _generic_caption(cands, banned, event, m, hook_prefix_use, hook_prefix_cap, 
             return list(cs)
         return [c for c in cs if not _ungrounded_terms(c, tvocab)]
 
+    def _specific_only(cs):
+        # FIX A: require POSITIVE clip specificity (a transcript content word), so a pure generic
+        # template is never chosen over a real hook when we have a transcript to be specific about.
+        if not enforce_ground:
+            return list(cs)
+        return [c for c in cs if _has_specific_term(c, tvocab)]
+
     kept_g, clean_g = _grounded_only(kept), _grounded_only(banned_clean)
-    if kept_g:
-        pool = kept_g
-    elif clean_g:
-        C.warn(f"moment {m['id']}: no grounded hook-passing caption — using best grounded "
-               f"Groq line (plain + accurate over catchy nonsense).")
-        pool = clean_g
+    kept_gs, clean_gs = _specific_only(kept_g), _specific_only(clean_g)
+    # FIX A: when the campaign requires NO onscreen template, the last resort is a hook built from
+    # THIS clip's transcript — never a generic anchor. Generic templates only when there is no
+    # transcript at all (a text-less audio spike). All fallbacks are banned-screened (FIX B).
+    specific_fb = _specific_fallbacks(event, banned)
+    fallbacks = specific_fb or [f for f in GROUNDED_FALLBACKS if not banned_hit(f, banned)]
+    if kept_gs:
+        pool = kept_gs                                   # grounded + hook-passing + specific (best)
+    elif clean_gs:
+        C.warn(f"moment {m['id']}: no hook-passing caption — using best grounded, clip-specific "
+               f"Groq line (specific + accurate over a template).")
+        pool = clean_gs
+    elif kept_g:
+        pool = kept_g                                    # grounded + hook-passing (no explicit term)
     elif enforce_ground:
-        C.warn(f"moment {m['id']}: every candidate named something not in the transcript "
-               f"(invented/mis-transcribed) — falling back to a neutral grounded hook.")
-        pool = GROUNDED_FALLBACKS
+        C.warn(f"moment {m['id']}: no clip-specific caption survived — synthesizing a hook from "
+               f"the transcript ({'clip-specific' if specific_fb else 'no transcript terms'}).")
+        pool = fallbacks
     elif kept:
         pool = kept
     elif banned_clean:
@@ -781,19 +850,19 @@ def _generic_caption(cands, banned, event, m, hook_prefix_use, hook_prefix_cap, 
                f"Groq caption (specific to the clip) over a generic template.")
         pool = banned_clean
     else:
-        C.warn(f"moment {m['id']}: no usable Groq caption — generic curiosity fallback.")
-        pool = GROUNDED_FALLBACKS
+        C.warn(f"moment {m['id']}: no usable Groq caption — curiosity fallback.")
+        pool = fallbacks
     ranked = sorted(pool, key=score_caption, reverse=True)
     # FIX 6 — HOOK VARIETY: prefer the best specific hook whose structure is still under the batch
-    # cap; once every specific structure is capped, fall to the least-used neutral grounded hook.
+    # cap; once every specific structure is capped, fall to the least-used fallback hook.
     best_raw = next((cap for cap in ranked
                      if hook_prefix_use[_hook_prefix(cap)] < hook_prefix_cap), None)
     if best_raw is None:
-        best_raw = min(GROUNDED_FALLBACKS,
+        best_raw = min(fallbacks or ranked,
                        key=lambda cap: (hook_prefix_use[_hook_prefix(cap)], -score_caption(cap)))
     hook_prefix_use[_hook_prefix(best_raw)] += 1
     alt = ([cap for cap in ranked if _hook_prefix(cap) != _hook_prefix(best_raw)]
-           or [cap for cap in GROUNDED_FALLBACKS if _hook_prefix(cap) != _hook_prefix(best_raw)])
+           or [cap for cap in fallbacks if _hook_prefix(cap) != _hook_prefix(best_raw)])
     best = finalize_caption(best_raw, emoji_in_caption)
     variant = finalize_caption(alt[0], emoji_in_caption) if alt else None
     return best, variant, killed
@@ -815,6 +884,9 @@ def run(state):
     if onscreen:
         C.log(f"captions: campaign REQUIRES onscreen-text format — hooks will follow it "
               f"({len(onscreen['templates'])} template(s): {onscreen['templates'][:3]}…).")
+    else:
+        C.log("captions: no required onscreen-text format — generating PURE clip-specific hooks "
+              "from each clip's transcript (no generic anchor template).")
     # Per-source transcript, so a text-less audio_spike can borrow the caster's nearby
     # reaction and get a SPECIFIC caption instead of a generic template.
     moments_doc = C.load_json(C.MOMENTS_JSON) or {}
