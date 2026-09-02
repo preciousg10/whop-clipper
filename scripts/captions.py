@@ -239,6 +239,65 @@ def gauntlet(candidates, banned):
     return survivors, killed
 
 
+# --- restriction-type required_elements → caption kill terms (FIX B, compliance) -------------
+# rules.json required_elements can carry RESTRICTIONS, e.g.
+#   {"type": "restriction", "detail": 'No medical claims (no "cure", "will fix", "miracle",
+#    "100% effective")'}
+# The quoted phrases are concrete terms the caption must NEVER contain. We parse them out and feed
+# them into the SAME banned-word gauntlet as banned_words — generalized, so any restriction's
+# quoted terms become caption kill-rules (not just the fixed banned_words list). We also add close
+# morphological variants (cure -> cures/cured/curing; will fix -> fix/fixes/fixed/fixing) so an
+# inflected form ("sleep cures dementia", "sleep fixes everything") is caught too.
+_QUOTED_RE = re.compile(r"""["“”'‘’]([^"“”'‘’]{2,40}?)["“”'‘’]""")
+
+
+def _word_inflections(w):
+    """A word + its common inflections for kill-matching (cure -> cures/cured/curing; fix ->
+    fixes/fixed/fixing). Keeps % so '100%' survives. Spurious forms are harmless (they just never
+    match real text)."""
+    w = re.sub(r"[^a-z0-9%]", "", (w or "").lower())
+    if not w:
+        return set()
+    out = {w}
+    if w.endswith("e"):
+        out |= {w + "s", w + "d", w[:-1] + "ing"}
+    elif re.search(r"(s|x|z|ch|sh)$", w):
+        out |= {w + "es", w + "ed", w + "ing"}
+    elif w.isalpha():
+        out |= {w + "s", w + "ed", w + "ing"}
+    return out
+
+
+def _term_variants(term):
+    """Kill-terms for one restriction phrase: the phrase itself PLUS inflections of its content
+    words (for a multiword phrase, the final word usually carries the claim — 'will fix' -> also
+    fix/fixes/fixed/fixing)."""
+    t = " ".join((term or "").lower().split())
+    if not t:
+        return set()
+    out = {t}
+    words = t.split()
+    if len(words) > 1:
+        out |= _word_inflections(words[-1])          # inflect the claim-carrying final word
+    else:
+        out |= _word_inflections(words[0])
+    return {v for v in out if v}
+
+
+def restriction_terms(rules):
+    """All caption kill-terms derived from restriction-type required_elements in rules.json — the
+    quoted phrases in each restriction's detail, plus close inflections. Fed into the caption
+    gauntlet exactly like banned_words (FIX B). Empty when there are no restrictions with quoted
+    terms (a restriction like 'No deceptive editing' has no caption-text term to enforce)."""
+    terms = set()
+    for e in (rules or {}).get("required_elements", []):
+        if not isinstance(e, dict) or str(e.get("type", "")).lower() != "restriction":
+            continue
+        for q in _QUOTED_RE.findall(e.get("detail") or ""):
+            terms |= _term_variants(q)
+    return sorted(terms)
+
+
 # --- quality gate + style scoring (flzsh) --------------------------------------
 def _word_count(text):
     """Words for the length cap — emoji/punctuation tokens don't count (they're
@@ -873,8 +932,15 @@ def run(state):
     if not selected:
         C.fail("campaign/selected.json missing — run the select stage first.")
     rules = C.load_json(C.RULES_JSON) or {}
-    # Gauntlet screens both banned words AND banned topics from intake's analysis.
-    banned = list(rules.get("banned_words", C.DEFAULT_BANNED_WORDS)) + list(rules.get("banned_topics", []))
+    # Gauntlet screens banned words AND banned topics from intake's analysis AND restriction-type
+    # required_elements (FIX B: e.g. "No medical claims (no 'cure', 'will fix', ...)" → cure/cures/
+    # will fix/fixes/... become caption kill-terms, so a non-compliant caption is never shipped).
+    restrictions = restriction_terms(rules)
+    banned = (list(rules.get("banned_words", C.DEFAULT_BANNED_WORDS))
+              + list(rules.get("banned_topics", [])) + restrictions)
+    if restrictions:
+        C.log(f"captions: enforcing {len(restrictions)} restriction kill-term(s) from "
+              f"required_elements: {restrictions}")
     campaign = rules.get("campaign", state.get("campaign") or "campaign")
     cfg = state.get("config", {})
     emoji_in_caption = bool(cfg.get("emoji_in_caption", True))   # flzsh: emoji as punctuation
@@ -961,6 +1027,17 @@ def run(state):
             cands = [" ".join(c.split()).lower() for c in cands if c and c.strip()]
             best, variant, killed = _generic_caption(
                 cands, banned, event, m, hook_prefix_use, hook_prefix_cap, emoji_in_caption)
+        # COMPLIANCE GATE (FIX B): the gauntlet screens candidates, but a fallback/synth path could
+        # still surface a restricted term. Re-verify the CHOSEN caption and FAIL LOUD if this clip
+        # cannot produce a compliant caption (submission would be rejected). Drop a bad variant.
+        hit = banned_hit(best, banned)
+        if hit:
+            C.fail(f"captions: clip {m['id']} cannot produce a COMPLIANT caption — every option "
+                   f"still contains the restricted/banned term {hit!r} (best: {best!r}). "
+                   f"Restriction kill-terms in force: {restrictions}. Fix the rules or the clip; "
+                   f"refusing to ship a non-compliant caption.")
+        if variant and banned_hit(variant, banned):
+            variant = None
         # Non-speech sound labels for the karaoke (accurate, or nothing). Only fires when the
         # clip actually has a loud non-speech beat, and only adds ONE extra Groq call then.
         sound_fx = []

@@ -1390,7 +1390,12 @@ def run(state):
     if not caps:
         C.fail("campaign/captions.json missing — run the captions stage first.")
     rules = C.load_json(C.RULES_JSON) or {}
-    banned = list(rules.get("banned_words", C.DEFAULT_BANNED_WORDS)) + list(rules.get("banned_topics", []))
+    # Defense-in-depth (FIX B): the same banned set the captions gauntlet used — banned words +
+    # topics + restriction-type required_elements (e.g. medical-claim terms) — so the final rules
+    # gate below re-checks compliance, not just the fixed banned_words list.
+    from captions import restriction_terms
+    banned = (list(rules.get("banned_words", C.DEFAULT_BANNED_WORDS))
+              + list(rules.get("banned_topics", [])) + restriction_terms(rules))
     if C.load_knowledge():
         C.log("loaded campaign/knowledge.md for campaign context.")
     moments = C.load_json(C.MOMENTS_JSON) or {"sources": []}
