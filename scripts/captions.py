@@ -167,31 +167,53 @@ GROUNDED_FALLBACKS = [
 ]
 
 
-def _specific_fallbacks(event, banned=()):
-    """CLIP-SPECIFIC last-resort hooks built from THIS clip's transcript (FIX A) — used instead of
-    the generic GROUNDED_FALLBACKS whenever no Groq caption survives but we DO have transcript, so
-    a campaign that doesn't require a template never ships a generic anchor. Pulls the clip's first
-    few salient content words and wraps each in a short hook that still hits a hook pattern.
-    Screened against banned/restriction terms (FIX B). Returns [] when there's no transcript."""
-    seen, terms = set(), []
+# Words that must NEVER fill the noun slot of a synthesized fallback hook — common verbs/adverbs
+# that turn a template into word salad ('why became changes everything', 'why crash changes
+# everything'). We only fill the slot with a clean NOUN; anything ambiguous is skipped.
+_NON_NOUN_FALLBACK = frozenset("""
+became become becomes becoming crash crashed crashes said says say went gone goes going got get
+gets getting made make makes making came come comes coming took take takes taking gave give gives
+given saw see sees seen looked look looks looking felt feel feels knew know knows knowing thought
+think thinks turned turns happen happens happened start starts started stop stops stopped want
+wants wanted need needs needed used use uses try tries tried told tell tells ask asks asked keep
+keeps kept put puts running run runs ran walk walks talked talk talks working work works worked
+doing does done being been was were are is has have had will would could should might must
+forget forgot remember remembers mean means meant matter matters cause causes caused help helps
+believe believes call calls calling found find finds bring brings brought move moves moved
+whole actual entire total main only other same such certain various several different similar
+sure able likely ready full half single double every each any some many much few little
+""".split())
+_VERBISH_SUFFIX = re.compile(r"(ed|ing|ly)$")
+
+
+def _fallback_noun(event):
+    """Pick a clean NOUN-like word from the transcript to fill a synthesized fallback hook, or
+    None. Rejects generic hook vocabulary, common verbs/adverbs (blocklist), -ed/-ing/-ly forms,
+    and short/non-alphabetic tokens — so the fallback reads as real English ('the truth about
+    melatonin'), never word salad ('why became changes everything'). None → caller SKIPS the clip
+    rather than fabricate broken text (BUG 1)."""
     for w in _GROUND_WORD_RE.findall((event or "").lower()):
         w = w.strip("'")
-        if len(w) < 4 or w in GENERIC_HOOK_VOCAB or w in seen:
+        if (len(w) < 4 or not w.isalpha() or w in GENERIC_HOOK_VOCAB
+                or w in _NON_NOUN_FALLBACK or _VERBISH_SUFFIX.search(w)):
             continue
-        seen.add(w)
-        terms.append(w)
-        if len(terms) >= 4:
-            break
-    if not terms:
+        return w
+    return None
+
+
+def _specific_fallbacks(event, banned=()):
+    """CLIP-SPECIFIC, GRAMMATICAL last-resort hooks built around ONE clean transcript NOUN (BUG 1).
+    Every template reads as correct English with any noun, so we never ship word salad. Screened
+    against banned/restriction terms (FIX B). Returns [] when no clean noun is available — the
+    caller then SKIPS the clip rather than fabricate broken text or fall back to a generic anchor."""
+    noun = _fallback_noun(event)
+    if not noun:
         return []
-    a = terms[0]
-    b = terms[1] if len(terms) > 1 else a
     cands = [
-        f"wait till you hear about {a} 👀",
-        f"why {a} changes everything 😳",
-        f"no way this is about {a} 😭",
-        f"how {a} actually works 👀",
-        f"tell me why {b} matters 😭",
+        f"wait till you hear about {noun} 👀",
+        f"the truth about {noun} 😳",
+        f"nobody talks about {noun} enough 😭",
+        f"what they said about {noun} 💀",
     ]
     return [c for c in cands if not banned_hit(c, banned)]
 
@@ -885,11 +907,11 @@ def _generic_caption(cands, banned, event, m, hook_prefix_use, hook_prefix_cap, 
 
     kept_g, clean_g = _grounded_only(kept), _grounded_only(banned_clean)
     kept_gs, clean_gs = _specific_only(kept_g), _specific_only(clean_g)
-    # FIX A: when the campaign requires NO onscreen template, the last resort is a hook built from
-    # THIS clip's transcript — never a generic anchor. Generic templates only when there is no
+    # FIX A / BUG 1: the last resort is a GRAMMATICAL hook built from THIS clip's transcript noun
+    # (never a generic anchor, never word salad). Generic templates are used ONLY when there is no
     # transcript at all (a text-less audio spike). All fallbacks are banned-screened (FIX B).
     specific_fb = _specific_fallbacks(event, banned)
-    fallbacks = specific_fb or [f for f in GROUNDED_FALLBACKS if not banned_hit(f, banned)]
+    generic_fb = [f for f in GROUNDED_FALLBACKS if not banned_hit(f, banned)]
     if kept_gs:
         pool = kept_gs                                   # grounded + hook-passing + specific (best)
     elif clean_gs:
@@ -898,30 +920,38 @@ def _generic_caption(cands, banned, event, m, hook_prefix_use, hook_prefix_cap, 
         pool = clean_gs
     elif kept_g:
         pool = kept_g                                    # grounded + hook-passing (no explicit term)
-    elif enforce_ground:
-        C.warn(f"moment {m['id']}: no clip-specific caption survived — synthesizing a hook from "
-               f"the transcript ({'clip-specific' if specific_fb else 'no transcript terms'}).")
-        pool = fallbacks
     elif kept:
-        pool = kept
+        pool = kept                                      # real Groq lines (grammatical), ungrounded
     elif banned_clean:
         C.warn(f"moment {m['id']}: no candidate hit a hook pattern — keeping best raw "
                f"Groq caption (specific to the clip) over a generic template.")
         pool = banned_clean
+    elif specific_fb:
+        # Every real Groq candidate was killed → synthesize a GRAMMATICAL hook from a clean
+        # transcript noun (real lines are preferred above; this only fires when there are none).
+        C.warn(f"moment {m['id']}: all Groq candidates killed — synthesizing a grammatical hook "
+               f"from a transcript noun.")
+        pool = specific_fb
+    elif not enforce_ground and generic_fb:
+        # no transcript to be specific about (text-less audio spike) → a GRAMMATICAL generic hook.
+        C.warn(f"moment {m['id']}: no transcript to build a specific hook — generic curiosity hook.")
+        pool = generic_fb
     else:
-        C.warn(f"moment {m['id']}: no usable Groq caption — curiosity fallback.")
-        pool = fallbacks
+        # Nothing compliant AND grammatical to say about this clip → SKIP it (BUG 1: prefer
+        # skipping over shipping word salad or a generic anchor). run() drops the clip loudly.
+        C.warn(f"moment {m['id']}: no compliant, grammatical caption could be built — SKIPPING "
+               f"this clip rather than shipping broken/generic text.")
+        return None, None, killed
     ranked = sorted(pool, key=score_caption, reverse=True)
     # FIX 6 — HOOK VARIETY: prefer the best specific hook whose structure is still under the batch
-    # cap; once every specific structure is capped, fall to the least-used fallback hook.
+    # cap; once every specific structure is capped, fall to the least-used hook in the pool.
     best_raw = next((cap for cap in ranked
                      if hook_prefix_use[_hook_prefix(cap)] < hook_prefix_cap), None)
     if best_raw is None:
-        best_raw = min(fallbacks or ranked,
+        best_raw = min(ranked,
                        key=lambda cap: (hook_prefix_use[_hook_prefix(cap)], -score_caption(cap)))
     hook_prefix_use[_hook_prefix(best_raw)] += 1
-    alt = ([cap for cap in ranked if _hook_prefix(cap) != _hook_prefix(best_raw)]
-           or [cap for cap in fallbacks if _hook_prefix(cap) != _hook_prefix(best_raw)])
+    alt = [cap for cap in ranked if _hook_prefix(cap) != _hook_prefix(best_raw)]
     best = finalize_caption(best_raw, emoji_in_caption)
     variant = finalize_caption(alt[0], emoji_in_caption) if alt else None
     return best, variant, killed
@@ -1027,6 +1057,12 @@ def run(state):
             cands = [" ".join(c.split()).lower() for c in cands if c and c.strip()]
             best, variant, killed = _generic_caption(
                 cands, banned, event, m, hook_prefix_use, hook_prefix_cap, emoji_in_caption)
+        # BUG 1: the generic path returns best=None when it cannot build a clean, GRAMMATICAL,
+        # compliant caption — SKIP the clip rather than ship word salad or a generic anchor.
+        if best is None:
+            C.warn(f"captions: SKIPPING clip {m['id']} — no clean grammatical caption could be "
+                   f"produced (preferring to skip over shipping broken text).")
+            continue
         # COMPLIANCE GATE (FIX B): the gauntlet screens candidates, but a fallback/synth path could
         # still surface a restricted term. Re-verify the CHOSEN caption and FAIL LOUD if this clip
         # cannot produce a compliant caption (submission would be rejected). Drop a bad variant.
