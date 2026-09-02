@@ -766,8 +766,20 @@ def run(state):
     # prior DAILY-cap stop doesn't re-spend Groq on completed clips. We skip done moment ids,
     # checkpoint after every clip, and let a GroqDailyCapError propagate to run.py, which stops
     # resumably — the checkpoint below is already current when it fires.
+    # DEFENSIVE (stale-captions guard): the resume checkpoint must match the CURRENT picks. If any
+    # checkpointed clip references a moment id that is NOT in selected.json, select re-ran with new
+    # picks and this partial is STALE — reusing it would caption the wrong moment (the m0290-vs-m0860
+    # bug). Fail loud and regenerate from scratch rather than silently shipping stale captions.
+    sel_ids = {m["id"] for m in selected["selected"]}
     partial = C.load_json(C.CAPTIONS_PARTIAL) or {}
     clips = list(partial.get("clips", []))
+    stale = [c.get("moment_id") for c in clips if c.get("moment_id") not in sel_ids]
+    if stale:
+        C.warn(f"captions: checkpoint is STALE — {len(stale)} clip(s) reference moment id(s) "
+               f"{stale} that are NOT in the current selected.json ({sorted(sel_ids)}). Select "
+               f"re-ran with new picks; discarding the partial and regenerating from scratch.")
+        clips = []
+        C.CAPTIONS_PARTIAL.unlink(missing_ok=True)
     done_ids = {c.get("moment_id") for c in clips}
     total = len(selected["selected"])
     # FIX 6 — batch-wide hook-structure ledger (seeded from any resumed clips so diversity

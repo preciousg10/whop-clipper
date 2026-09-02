@@ -524,6 +524,16 @@ def run(state):
 
     C.save_json(C.SELECTED_JSON, {"campaign": campaign, "selected": selected})
     C.SELECT_PARTIAL.unlink(missing_ok=True)         # stage complete — drop the checkpoint
+    # STAGE INVALIDATION: fresh picks make every DOWNSTREAM output stale — captions.json + the cut
+    # drafts described the PRIOR run's moments. Drop their checkpoints + delete the stale captions
+    # output so they REGENERATE against THESE picks. Without this, a run.py 'skip captions (already
+    # done)' would reuse a captions.json whose moment ids no longer match selected.json — captions
+    # describing the wrong moment. (Same stage-invalidation discipline as index→moments.)
+    ids = [m["id"] for m in selected]
+    cleared = C.invalidate_stages(state, "captions", "cut")
+    if cleared:
+        C.log(f"select: invalidated downstream stage(s) {cleared} — they will regenerate against "
+              f"the new picks {ids}.")
     C.mark_stage(state, "select", selected=len(selected))
     C.log(f"select done: {len(selected)} moment(s) chosen.")
 

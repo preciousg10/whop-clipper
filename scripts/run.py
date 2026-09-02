@@ -383,18 +383,39 @@ def _stage_output_present(name):
     return p is None or p.exists()
 
 
+def _stage_output_fresh(name):
+    """Beyond mere EXISTENCE (_stage_output_present), is the output CONSISTENT with its upstream
+    input? A 'done' marker + present output can still be STALE: if select re-ran and changed its
+    picks, a leftover captions.json describes the PRIOR run's moments (the m0290-vs-m0860 bug).
+    Verify captions.json's moment ids match selected.json's; a mismatch means it must regenerate.
+    Fresh (True) for any stage without a cross-stage id contract to check."""
+    if name != "captions":
+        return True
+    caps = C.load_json(C.CAPTIONS_JSON) or {}
+    sel = C.load_json(C.SELECTED_JSON)
+    if sel is None:
+        return True                       # no picks to compare against — leave existence check in charge
+    cap_ids = {c.get("moment_id") for c in caps.get("clips", [])}
+    sel_ids = {m.get("id") for m in sel.get("selected", [])}
+    return cap_ids == sel_ids
+
+
 def _run_stages(state, args):
     """Run the pipeline stages in order. A GroqDailyCapError stops resumably; a NothingUsable
     propagates to the caller (which may auto-advance)."""
     for name, fn in STAGES:
         if C.stage_done(state, name) and not args.force:
-            if _stage_output_present(name):
+            if _stage_output_present(name) and _stage_output_fresh(name):
                 C.log(f"skip {name} (already done)")
                 continue
-            # Loud, non-silent: a 'done' marker with no output is a stale checkpoint — never skip on
-            # it (that's the "0 clips after a campaign switch" bug). Drop the marker and re-run.
-            C.warn(f"{name} is marked done but its expected output is MISSING on disk — the "
-                   f"checkpoint is stale (campaign switch / deleted output). Re-running {name}.")
+            # Loud, non-silent: a 'done' marker whose output is MISSING (campaign switch / deleted
+            # output — the "0 clips" bug) OR STALE (present but its moment ids no longer match the
+            # upstream picks — the stale-captions bug) is not really done. Drop the marker + re-run.
+            why = ("its expected output is MISSING on disk (campaign switch / deleted output)"
+                   if not _stage_output_present(name)
+                   else "its output is STALE — moment ids don't match the current selected.json "
+                        "(select re-ran with new picks)")
+            C.warn(f"{name} is marked done but {why}. Re-running {name}.")
             state.get("stages", {}).pop(name, None)
             C.save_state(state)
         C.log(f"== stage: {name} ==")

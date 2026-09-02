@@ -226,6 +226,37 @@ def stage_meta(state, name):
     return state.get("stages", {}).get(name, {})
 
 
+# Which on-disk outputs belong to each stage — removed when the stage is invalidated so a
+# stale one can never be reused (the select→captions stale-captions bug).
+_STAGE_OUTPUTS = {
+    "captions": (CAPTIONS_JSON, CAPTIONS_PARTIAL),
+}
+
+
+def invalidate_stages(state, *names):
+    """Drop the 'done' checkpoint(s) for the given DOWNSTREAM stages AND delete their stale
+    on-disk output(s), so they REGENERATE instead of a later run reusing an output that no longer
+    matches its (now-changed) upstream input. Called when a stage rewrites its output and thus
+    invalidates everything after it — e.g. select producing new picks makes captions.json + the
+    cut drafts stale (they describe the PRIOR run's moments). Returns the stage names that were
+    actually cleared (had a marker or an output on disk)."""
+    cleared = []
+    for name in names:
+        had = name in state.get("stages", {})
+        state.get("stages", {}).pop(name, None)
+        for p in _STAGE_OUTPUTS.get(name, ()):  # only captions has JSON to delete; cut re-renders
+            if Path(p).exists():
+                had = True
+                try:
+                    Path(p).unlink()
+                except Exception as e:
+                    warn(f"could not remove stale {Path(p).name}: {e}")
+        if had:
+            cleared.append(name)
+    save_state(state)
+    return cleared
+
+
 def _archive_drafts(label):
     """Move everything under drafts/ into drafts_archive/<label>-<timestamp>/ so a new
     campaign never mixes its clips with the previous one's. Never deletes — always moves."""
