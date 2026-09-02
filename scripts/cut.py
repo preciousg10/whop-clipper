@@ -997,6 +997,40 @@ def cap_segments(segments, cap):
     return out or segments[:1]
 
 
+# Sentence-final punctuation at the end of a transcript segment → a clean place to end a clip.
+_SENTENCE_END_RE = re.compile(r"""[.!?]["')\]]?\s*$""")
+
+
+def snap_end_to_sentence(transcript, start, end, cmax, duration, grace=4.0, tol=0.35):
+    """Move the clip END onto a natural speech boundary so it never cuts mid-sentence (FIX 4).
+
+    Prefer EXTENDING forward to the end of the segment in progress at `end` (a natural pause,
+    preferring one that ends a sentence '. ! ?'), up to `grace` seconds and never past
+    start+cmax+grace or the source end — so we respect clip_max but finish the thought. If nothing
+    is reachable forward, snap BACK to the last segment end before `end` (still a pause) as long as
+    that keeps most of the clip. Returns the (possibly unchanged) end; no transcript → unchanged."""
+    if not transcript or grace <= 0:
+        return end
+    segs = sorted(((float(s["start"]), float(s["end"]), (s.get("text") or ""))
+                   for s in transcript
+                   if s.get("start") is not None and s.get("end") is not None
+                   and float(s["end"]) > start),
+                  key=lambda t: t[1])
+    if not segs:
+        return end
+    if any(abs(end - e2) <= tol for _, e2, _ in segs):
+        return end                                        # already on a boundary
+    hard = min(duration, start + cmax + grace)
+    fwd = [(st, e2, txt) for st, e2, txt in segs if e2 > end and e2 <= min(end + grace, hard)]
+    if fwd:
+        sent = [c for c in fwd if _SENTENCE_END_RE.search(c[2])]
+        return round((sent[0] if sent else fwd[0])[1], 2)  # earliest sentence-end, else 1st pause
+    back = [e2 for _, e2, _ in segs if e2 < end - tol]
+    if back and (back[-1] - start) >= 0.6 * (end - start):
+        return round(back[-1], 2)                         # end on the last pause before `end`
+    return end
+
+
 def peak_motion_time(source, peak, start, end, radius=MOTION_RADIUS):
     """Scan ±radius seconds around the audio peak and return the absolute source time
     of the highest-motion frame (max ffmpeg scene score) — so the cold-open opens on
@@ -1364,10 +1398,14 @@ def run(state):
     # clip's segment reorder to drive the karaoke subtitles. Absent on a moments.json built
     # before this feature — subtitles then no-op (re-run index to populate them).
     words_by_source = {s["source"]: s.get("words", []) for s in moments.get("sources", [])}
+    # Per-source transcript segments (whisper) — used to end each clip on a sentence/speech
+    # boundary instead of a hard time cap mid-word (FIX 4).
+    transcript_by_source = {s["source"]: s.get("transcript", []) for s in moments.get("sources", [])}
 
     cfg = state.get("config", {})
     cmin = float(cfg.get("clip_min_seconds", 15))
     cmax = float(cfg.get("clip_max_seconds", 45))
+    sentence_grace = float(cfg.get("clip_sentence_grace_seconds", 4))
     pre = float(cfg.get("story_pre_seconds", 20))
     post = float(cfg.get("story_post_seconds", 15))
     layout = str(cfg.get("layout", "auto")).lower()   # auto | track | blur_fill | crop_fill
@@ -1430,6 +1468,10 @@ def run(state):
     for c in ranked_clips:
         duration = durations.get(c["source"]) or C.ffprobe_duration(C.ROOT / c["source"])
         s, e = clip_bounds(c, duration, cmin, cmax, pre, post)
+        # FIX 4: extend the END slightly to the next natural pause so the clip finishes the
+        # sentence instead of cutting mid-word at the time cap.
+        e = snap_end_to_sentence(transcript_by_source.get(c["source"], []), s, e, cmax, duration,
+                                 grace=sentence_grace)
         dup = next((w for w in kept_windows
                     if w[0] == c["source"] and not (e <= w[1] or s >= w[2])), None)
         if dup:
@@ -1465,7 +1507,12 @@ def run(state):
         cold_open = cold_rel is not None
         C.log(f"cold-open [{c['moment_id']}]: {reason}")
         segments = ([cold_rel] if cold_open else []) + keeps
-        segments = cap_segments(segments, cmax)      # total playtime <= clip_max_seconds
+        # FIX 4: the window END was snapped to a sentence boundary (it may sit a few seconds past
+        # cmax to finish the thought). Cap combined playtime to that bounded window + teaser so the
+        # finished sentence isn't re-truncated here, while still never padding past what we sized.
+        teaser0 = (segments[0][1] - segments[0][0]) if cold_open else 0.0
+        eff_cap = max(cmax, (end - start) + teaser0)
+        segments = cap_segments(segments, eff_cap)   # playtime <= sized window (>= clip_max only to finish a sentence)
 
         # MIN-LENGTH GATE (1c): require >= clip_min_seconds of ACTUAL content, EXCLUDING the
         # cold-open teaser. dead-air trims and source-edge clamping can shrink a nominal window

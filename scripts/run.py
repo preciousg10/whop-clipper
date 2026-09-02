@@ -146,6 +146,9 @@ DEFAULT_CONFIG = {
     "track_max_none_frac": 0.5,    # auto: above this share of subject-less frames → GENERAL (landscape)
     "clip_min_seconds": 15,        # allow tight action clips (don't over-pad)
     "clip_max_seconds": 30,        # hard cap — a tight 20-25s clip beats a padded 45s one
+    "clip_sentence_grace_seconds": 4,  # FIX 4: how far past clip_max the END may extend to finish
+                                   # the sentence in progress (land on a speech boundary, not a
+                                   # hard time cap mid-word). 0 disables the sentence-snap.
     "min_separation_seconds": 60,  # min gap between two selected moments (same source)
     "merge_gap_seconds": 7,        # merge moments closer than this into one (was 15 —
                                    # chained non-stop commentary into 400-550s blobs)
