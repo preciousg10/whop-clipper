@@ -53,12 +53,13 @@ SUBTITLE_CENTER_Y = 1440      # ~75% down: in the lower black band, off the vide
 # within good bounds, not chaos.
 DEFAULT_STYLE_SET = {
     "name": "flzsh_default",
-    # Curated accent palette (RGB hex; converted to ASS &HBBGGRR at use). Punchy, high-contrast,
-    # video-readable against the black outline/plate — no low-contrast or muddy colors.
-    "accent_palette": ["FFFF00", "00BFFF", "39FF14", "FF2D95", "FF8C00"],
-    #                   yellow    sky-blue  lime      hot-pink  orange
-    # (was bright cyan 00E5FF — too washy on light footage; deep-sky-blue 00BFFF is punchier
-    #  and holds contrast against a light background even with the outline behind it.)
+    # Active-word accent palette (RGB hex; converted to ASS &HBBGGRR at use). Deliberately CLEAN
+    # and readable, NOT garish: WHITE is the default (relies on the strong black outline to pop),
+    # bright YELLOW is the one bolder accent that clearly reads on any footage. Cyan / deep-sky-blue
+    # / neon lime / hot-pink / orange were REMOVED (FIX 6): cyan looked bad on light footage and the
+    # neons read as garish. White + yellow only.
+    "accent_palette": ["FFFFFF", "FFFF00"],
+    #                   white     yellow
     # Active-word emphasis: "color" = accent FILL (current look); "box" = accent HIGHLIGHT behind
     # the word (a THIN accent border/halo reads as a clean highlight around it — not a heavy box).
     "emphasis_modes": ["color", "box"],
@@ -78,10 +79,10 @@ def _style_hash(seed):
 
 
 def _rgb_to_ass(rgb):
-    """'FFFF00' (RRGGBB) -> ASS '&H00FFFF&' (&HBBGGRR, reversed byte order)."""
+    """'FFFF00' (RRGGBB) -> ASS '&H00FFFF&' (&HBBGGRR, reversed byte order). Bad input -> white."""
     s = str(rgb).lstrip("#")
     if len(s) != 6:
-        return "&H00FFFF&"
+        return "&HFFFFFF&"                              # FIX 6: fall back to WHITE, never cyan
     r, g, b = s[0:2], s[2:4], s[4:6]
     return f"&H{b}{g}{r}&".upper().replace("&HX", "&H")
 
@@ -857,7 +858,7 @@ def build_ass(events, cfg, banned, out_path, top_y, fx_events=None, style=None):
         return None
     from captions import banned_hit
     style = style or {}
-    accent = str(style.get("accent_ass") or cfg.get("subtitle_accent_color", "&H00FFFF&"))
+    accent = str(style.get("accent_ass") or cfg.get("subtitle_accent_color", "&H00FFFFFF&"))
     emphasis = str(style.get("emphasis", "color"))               # "color" (fill) | "box" (highlight)
     box_border = int(style.get("box_border", 12))
     scale = int(cfg.get("subtitle_active_scale", 110))            # % upscale of the active word

@@ -174,7 +174,9 @@ DEFAULT_CONFIG = {
     # from the named STYLE-SET in cut.py (DEFAULT_STYLE_SET, resolve_clip_style), rotated
     # deterministically per clip. Override the whole set per account/category via config
     # "style_set": {...}. subtitle_accent_color below is only the FALLBACK when no style-set applies.
-    "subtitle_accent_color": "&H00FFFF&",  # active-word colour (ASS &HBBGGRR); yellow
+    "subtitle_accent_color": "&H00FFFFFF&",  # FALLBACK active-word colour when no style-set applies:
+                                   # WHITE (ASS &HAABBGGRR) + the strong black outline. Cyan removed
+                                   # (FIX 6). The per-clip palette (cut.DEFAULT_STYLE_SET) is white/yellow.
     "subtitle_active_scale": 110,  # % upscale applied to the active word (the "pop")
     "subtitle_ass_fontsize": 54,   # subtitle font size at 1080x1920 output res
     "subtitle_pause_gap": 0.1,    # sec of silence between words that starts a NEW karaoke line
