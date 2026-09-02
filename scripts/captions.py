@@ -597,12 +597,26 @@ _SYNTH_STOP = {"that", "this", "them", "they", "just", "like", "really", "actual
                "about", "because", "would", "could", "should", "their", "then", "than", "into"}
 
 
+def _completion_terms(caption, anchor):
+    """Content words in the caption BEYOND the required opener/anchor — the part that must carry
+    THIS clip's specifics (not just the fixed template). Drops the anchor words, short tokens, and
+    generic stopwords, so an anchor-only line ('Santa Cruz explains') yields []."""
+    aw = {a.lower() for a in (anchor or [])}
+    return [w for w in re.findall(r"[a-z0-9']+", (caption or "").lower())
+            if w not in aw and len(w) > 2 and w not in _SYNTH_STOP]
+
+
 def _synth_required(templates, event):
     """Guaranteed-valid onscreen text when the LLM output can't be used: the first template's
-    opener + a couple of grounded content words from the clip ('Santa Cruz explains lab results')."""
+    opener + a couple of grounded content words from the clip ('Santa Cruz explains lab results').
+    Warns (FIX 5) when the clip transcript yields NO specific word — the format is still emitted
+    for compliance, but with only a minimal filler that should be checked manually."""
     opener = re.split(r"_{2,}|\[|\{|<|\.\.\.|…", templates[0])[0].strip().rstrip(":—-").strip()
     words = [w for w in re.findall(r"[A-Za-z]+", event or "") if len(w) > 3
              and w.lower() not in _SYNTH_STOP]
+    if not words:
+        C.warn("required-format hook: no clip-specific word in the transcript to complete the "
+               "template — emitting the opener with minimal filler (verify manually).")
     tail = " ".join(words[:2]) if words else "this"
     return f"{opener} {tail}".strip()
 
@@ -623,12 +637,30 @@ def _required_format_clip(client, campaign, m, event, onscreen, banned):
             killed.append({"caption": c, "reason": "does not follow required onscreen-text format"})
     # grounding on the FILLED part (don't let the completion invent a subject)
     tvocab = _transcript_vocab(event)
-    anchor = set(_required_anchor(tmpls))
+    anchor_words = _required_anchor(tmpls)
+    anchor = set(anchor_words)
     if len(tvocab) >= 3:
         grounded = [c for c in conforming
                     if not _ungrounded_terms(" ".join(w for w in c.split()
                                                        if w.lower() not in anchor), tvocab)]
         conforming = grounded or conforming
+    # FIX 5 — COMBINE FORMAT + CLIP CONTENT, never ship the bare template. Require the completion
+    # to carry a real clip-specific term (a grounded one when we have transcript to ground on).
+    def _is_specific(c):
+        terms = _completion_terms(c, anchor_words)
+        if not terms:
+            return False                               # anchor-only → just the generic template
+        if len(tvocab) >= 3:
+            return any(_word_grounded(t, tvocab) for t in terms)
+        return True
+    specific = [c for c in conforming if _is_specific(c)]
+    if specific:
+        conforming = specific
+    else:
+        if conforming:
+            C.warn(f"moment {m.get('id')}: required-format hooks had no clip-specific completion "
+                   f"(template-only) — synthesizing one grounded in the transcript.")
+        conforming = []                                # force the grounded synth fill below
     pool = conforming or [_synth_required(tmpls, event)]
     # prefer the punchiest conforming line (short, not a bare opener)
     pool.sort(key=lambda c: (len(c.split()) >= 4, -len(c.split())), reverse=True)
