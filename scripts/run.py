@@ -435,6 +435,9 @@ _THROTTLE_MARKERS = (
     "http error 429", "429: too many requests", "too many requests", "429 too many",
     "temporarily blocked", "rate-limited", "rate limited", "verify you're human",
     "unusual traffic", "this content isn't available",
+    # Drive-folder throttle (download.py _fetch_drive) — retryable, NOT a permanent fail (FIX 3).
+    "drive folder throttled", "throttled (temporary)", "retryable on a later run",
+    "have had many accesses", "many accesses", "quota exceeded", "try again later",
 )
 
 
@@ -448,6 +451,8 @@ def _looks_like_throttle(text):
 def _reason_tag(msg):
     """Short label for a NothingUsable reason, for the overnight walk log."""
     low = (msg or "").lower()
+    if _looks_like_throttle(low) or "throttl" in low:
+        return "retryable throttle (not a permanent fail)"
     if "language" in low:
         return "language-gate"
     if "dead-floor" in low or "dead floor" in low:
@@ -539,6 +544,15 @@ def _pick_and_intake_next(excluded, args):
         nid = newpick.get("scout_id")
         if nid and nid not in excluded:
             excluded.append(nid)
+        # FIX 3: a Drive/YouTube THROTTLE during intake is RETRYABLE, not a permanent failure.
+        # Log it plainly and advance — the batch never aborts on it, and the campaign is only
+        # excluded IN-MEMORY for THIS walk (to avoid an immediate re-pick loop); a later run
+        # retries it. The harder back-off is applied by advance_fn (throttled flag) before the
+        # next attempt.
+        if _looks_like_throttle(text):
+            C.warn(f"  intake hit a RETRYABLE throttle (Drive/YouTube rate-limit) on "
+                   f"{newpick.get('campaign')!r} — advancing to the next campaign; NOT a permanent "
+                   f"fail (retry on a later run).")
         return "intake_failed", text
     newpick = C.load_json(C.ROOT / "campaign_inputs" / "pick.json") or {}
     C.log(f"auto-advance: now on {newpick.get('campaign')!r} — running the pipeline for it.")
@@ -792,7 +806,14 @@ def main():
               f"(batch target: {target_batch_min})")
         C.log("=" * 70)
         C.log(f"config: {state['config']}")
-        _run_stages(state, args)               # raises C.NothingUsable on a dead campaign
+        try:
+            _run_stages(state, args)           # raises C.NothingUsable on a dead campaign
+        except DL.DownloadError as e:
+            # FIX 3: a throttle / transient download failure MID-PIPELINE (e.g. a Drive folder that
+            # 429s during the download stage) must NOT abort the whole batch. Convert it to a
+            # retryable NothingUsable so the walk logs it (retryable throttle) and advances to the
+            # next campaign, exactly like a dead one — the campaign stays eligible on a later run.
+            raise C.NothingUsable(f"retryable throttle/download failure — advancing: {e}")
         # Cut finished for this campaign → harvest its drafts into the batch so the NEXT
         # campaign's activate_campaign can't archive them away. Returns this campaign's count.
         return _harvest_batch(campaign)
