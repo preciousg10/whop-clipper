@@ -295,6 +295,16 @@ def _nearby_transcript(tr_segs, start, end, pad_pre=10.0, pad_post=4.0, limit=40
     return " ".join(parts).strip()[:limit]
 
 
+def _clip_window_transcript(tr_segs, start, end, limit=600):
+    """The transcript spoken strictly WITHIN this clip's own window [start, end] — nothing from
+    the rest of the episode. FIX 2: the caption must hook on what actually happens IN this span, so
+    the LLM is fed ONLY the words inside the clip, never padded surrounding context or the whole
+    show. Empty for a text-less audio-spike moment (caller then falls back to nearby speech)."""
+    parts = [s["text"] for s in tr_segs
+             if s.get("text") and s.get("end", 0) > start and s.get("start", 0) < end]
+    return " ".join(parts).strip()[:limit]
+
+
 # --- non-speech sound labels (karaoke *scream* / *laughing* fills) --------------
 # Whisper only transcribes SPEECH, so a scream / laugh / crash leaves a silent gap in the
 # word-level karaoke. We fill that gap with a SHORT accurate descriptor ("*scream*"), but
@@ -472,7 +482,14 @@ def _groq_candidates(client, campaign, moment, style_notes, event="", emoji_in_c
         "You write TOP captions for viral vertical short-form clips. The "
         "caption's ONLY job is to make the payoff feel MANDATORY to watch, and it MUST "
         "reference the ACTUAL event in THIS clip (use the transcript / what happens), "
-        "NOT a generic phrase. RULES: ONE line, MAX 8 words, casual grammar, " + emoji_rule +
+        "NOT a generic phrase. "
+        "THIS CLIP ONLY (CRITICAL): the transcript below is the ENTIRE clip — caption what "
+        "happens IN it, and NOTHING about the wider episode, show, or format. NEVER use a generic "
+        "episode/segment/format label ('rapidfire round', 'Q&A', 'the podcast', 'this interview', "
+        "'story time'). If the clip is about houses, the caption is about houses; if it's a story "
+        "about money, hook on that specific thing. The campaign knowledge is for RULES/banned-word "
+        "compliance only — do NOT let it turn the caption into a description of the show. "
+        "RULES: ONE line, MAX 8 words, casual grammar, " + emoji_rule +
         "NO hashtags. Every caption MUST use one of these five proven hook patterns:\n"
         "  1) open question — 'how did this even happen'\n"
         "  2) stakes — '$10k on the line and then THIS'\n"
@@ -800,8 +817,13 @@ def run(state):
                 time.sleep(CAPTION_DELAY_SECONDS)   # respect free-tier rate limits (between calls)
             C.log(f"captions: clip {idx + 1}/{total} (moment {m['id']}).")
             made_call = True
-        event = (m.get("text") or "").strip() or _nearby_transcript(
-            tr_by_source.get(m["source"], []), float(m["start"]), float(m["end"]))
+        # FIX 2: hook on THIS CLIP only. Prefer the transcript strictly inside the clip window
+        # (nothing from the rest of the episode); fall back to the moment text, then — for a
+        # text-less audio spike — the nearby reaction.
+        tr_segs = tr_by_source.get(m["source"], [])
+        event = (_clip_window_transcript(tr_segs, float(m["start"]), float(m["end"]))
+                 or (m.get("text") or "").strip()
+                 or _nearby_transcript(tr_segs, float(m["start"]), float(m["end"])))
         # REQUIRED-FORMAT PATH (FIX 2): campaign mandates a hook wording pattern → build a
         # pattern-conforming hook (own generator + acceptance) and skip the generic five-hook style.
         # Everything downstream (sound_fx, cold-open, platform text) is shared with the generic path.
