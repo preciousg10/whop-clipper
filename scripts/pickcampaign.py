@@ -535,6 +535,23 @@ def _load_preedited_cache():
         return {}
 
 
+def cached_preedited_skip(c):
+    """(skip, reason) read from the STICKY cache ONLY — no measurement, no network. True when a
+    prior run already measured THIS campaign (same footage-links fingerprint) as pre-edited. Lets
+    the walk skip a known-pre-edited campaign INSTANTLY (FIX 2) instead of re-entering the
+    measurement path every run. Returns (False, None) on a cache miss / changed links / a cached
+    'pass' — those fall through to the normal filter (which itself reuses a cached pass verdict)."""
+    links = footage_links(c)
+    if not links:
+        return False, None
+    fp = _links_fingerprint(links)
+    cid = str(c.get("id") or c.get("name") or fp)
+    cached = _load_preedited_cache().get(cid)
+    if cached and cached.get("fingerprint") == fp and cached.get("verdict") == "skip":
+        return True, cached.get("reason")
+    return False, None
+
+
 def _cache_put(cache, cid, fp, verdict, reason, name):
     cache[cid] = {"fingerprint": fp, "verdict": verdict, "reason": reason,
                   "name": name, "measured_at": C.now_iso()}
@@ -898,12 +915,19 @@ def main():
         # Pre-edited footage filter (Unit 1): only AFTER the cheap checks pass (it probes the
         # network for durations, so we never run it on a campaign that already failed).
         if ok and not args.no_preedited_filter:
-            C.log(f"    #{i} {c.get('name')!r}: checking footage length (no download)…")
-            skip_pe, why_pe = preedited_footage_skip(
-                c, min_seconds=args.preedited_min_seconds, max_probe=args.preedited_max_probe,
-                use_cache=not args.preedited_refresh)
-            if skip_pe:
-                ok, why = False, why_pe
+            # FIX 2: skip a KNOWN pre-edited campaign INSTANTLY from the sticky cache (same footage
+            # links) — no re-measure, no network probe. --preedited-refresh forces a fresh measure.
+            cskip, cwhy = (False, None) if args.preedited_refresh else cached_preedited_skip(c)
+            if cskip:
+                C.log(f"    #{i} {c.get('name')!r}: [CACHED SKIP — pre-edited, not re-measured] {cwhy}")
+                ok, why = False, cwhy
+            else:
+                C.log(f"    #{i} {c.get('name')!r}: checking footage length (no download)…")
+                skip_pe, why_pe = preedited_footage_skip(
+                    c, min_seconds=args.preedited_min_seconds, max_probe=args.preedited_max_probe,
+                    use_cache=not args.preedited_refresh)
+                if skip_pe:
+                    ok, why = False, why_pe
         if ok:
             for sr, sc, sw in skips:
                 C.log(f"  skip #{sr}  {sc.get('name')!r} — {sw}")
