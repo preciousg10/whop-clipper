@@ -254,25 +254,26 @@ def decide_track(video_path, cfg, detectors, n_samples=14, window=None):
 
 
 def _measure_subject(cap, detectors, n=14):
-    """Sample the clip and return the MEDIAN subject bbox (cx, cy, h) — used to size the crop
-    ONCE per clip so the zoom stays fixed (no per-frame pulsing). None if no subject sampled.
-    Rewinds the capture to the start when done."""
+    """Sample the clip and return the MEDIAN subject bbox (cx, cy, h, w) — used to size the crop
+    ONCE per clip so the zoom stays fixed (no per-frame pulsing). The WIDTH is carried so the crop
+    can guarantee horizontal padding (FIX 1: never clip a wide subject at the edges). None if no
+    subject sampled. Rewinds the capture to the start when done."""
     import cv2
     import numpy as np
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-    hs, cxs, cys = [], [], []
+    hs, ws, cxs, cys = [], [], [], []
     for i in range(n):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * (i + 0.5) / n))
         ok, fr = cap.read()
         if not ok:
             continue
-        b = detectors.subject_box(fr)
+        b = detectors.subject_box(fr)               # (cx, cy, w, h)
         if b:
-            cxs.append(b[0]); cys.append(b[1]); hs.append(b[3])
+            cxs.append(b[0]); cys.append(b[1]); ws.append(b[2]); hs.append(b[3])
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     if not hs:
         return None
-    return float(np.median(cxs)), float(np.median(cys)), float(np.median(hs))
+    return float(np.median(cxs)), float(np.median(cys)), float(np.median(hs)), float(np.median(ws))
 
 
 def _plan_crop(cfg, fw, fh, subj):
@@ -286,11 +287,21 @@ def _plan_crop(cfg, fw, fh, subj):
     DOWN and letterbox it on a blurred background — giving the looser framing the crop alone can't.
 
     Returns dict: {letterbox, crop_w, crop_h, y0, fg_h}."""
-    target = min(0.95, max(0.30, float(cfg.get("track_subject_scale", 0.60))))
-    _, cy, bbox_h = subj
+    target = min(0.95, max(0.30, float(cfg.get("track_subject_scale", 0.48))))
+    _, cy, bbox_h, bbox_w = subj
     scale = target * H / max(1.0, bbox_h)              # output px per source px
     crop_w_want = int(round(W / scale))                # 9:16 source window that hits the target
     crop_h_want = int(round(H / scale))
+    # FIX 1 — HORIZONTAL PADDING GUARD: the height-driven window can still be narrower than a WIDE
+    # subject (arms out / turned / broad shoulders), clipping them at the left/right edge. Ensure
+    # the subject width fills at most `track_max_subject_width` of the crop; if not, widen the crop
+    # (and its height, to hold 9:16) so the person keeps side padding and is never cut off.
+    max_w_frac = min(0.95, max(0.40, float(cfg.get("track_max_subject_width", 0.80))))
+    min_crop_w = bbox_w / max_w_frac
+    if bbox_w > 0 and crop_w_want < min_crop_w:
+        grow = min_crop_w / crop_w_want
+        crop_w_want = int(round(crop_w_want * grow))
+        crop_h_want = int(round(crop_h_want * grow))
     if crop_h_want <= fh and crop_w_want <= fw:
         # fits: crop the window directly, positioned on the subject with a little headroom.
         crop_h, crop_w = crop_h_want, crop_w_want
@@ -322,7 +333,8 @@ def track_reframe(content_mp4, out_mp4, cfg, detectors, fps=30):
         return False
     subj = _measure_subject(cap, detectors)
     if subj is None:                                   # no subject found — nothing to track
-        subj = (fw / 2.0, fh / 2.0, fh * TARGET_AR / 0.6)   # neutral: ~full-height framing
+        # neutral: ~full-height framing, mid-width subject (cx, cy, h, w)
+        subj = (fw / 2.0, fh / 2.0, fh * 0.90, fw * 0.50)
     plan = _plan_crop(cfg, fw, fh, subj)
     crop_w, crop_h, y0, letterbox, fg_h = (
         plan["crop_w"], plan["crop_h"], plan["y0"], plan["letterbox"], plan["fg_h"])

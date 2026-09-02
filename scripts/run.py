@@ -125,12 +125,19 @@ DEFAULT_CONFIG = {
                                    # letterbox; >1 trims only far L/R edges to fill more
                                    # vertical space (never crops top/bottom or subjects)
     # TRACK mode (OpenShorts-style face/person reframe; needs mediapipe+ultralytics+opencv).
-    "track_subject_scale": 0.60,   # ZOOM knob: fraction of the OUTPUT HEIGHT the subject fills.
-                                   # ~0.6 = head+shoulders+room (looser); LOWER = looser/more room,
-                                   # HIGHER = tighter head crop. THIS controls zoom (not track_safe_zone).
-    "track_safe_zone": 0.35,       # PAN trigger only (NOT zoom): center dead-zone as a fraction of
+    "track_subject_scale": 0.48,   # ZOOM knob: fraction of the OUTPUT HEIGHT the subject fills.
+                                   # ~0.48 = head+shoulders+GENEROUS room (loose so a person is never
+                                   # cropped at the edges); LOWER = looser/more room, HIGHER = tighter
+                                   # head crop. THIS controls zoom (not track_safe_zone). Was 0.60 —
+                                   # too tight, clipping heads/shoulders/bodies at the frame edge (FIX 1).
+    "track_max_subject_width": 0.80,  # FIX 1: the subject bbox may fill at most this fraction of the
+                                   # crop WIDTH — if it would exceed it, widen the crop so the person
+                                   # keeps side padding and is never cut off horizontally.
+    "track_safe_zone": 0.45,       # PAN trigger only (NOT zoom): center dead-zone as a fraction of
                                    # the crop width — the crop HOLDS while the subject stays inside
-                                   # it and only pans when they leave it (anti-jitter)
+                                   # it and only pans when they leave it (anti-jitter). Widened 0.35→0.45
+                                   # so a subject can drift within the padded frame without the crop
+                                   # chasing them toward an edge (FIX 1).
     "track_smooth": 0.12,          # pan easing when the subject leaves the safe zone (0-1; lower=slower)
     "track_max_pan": 12.0,         # max crop pan speed in source px/frame (caps fast whip-pans)
     "track_detect_every": 3,       # run detection every Nth frame (reuse between) — ~10fps at 30fps
