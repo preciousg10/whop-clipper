@@ -61,6 +61,17 @@ DESCRIPTIVE_RE = re.compile(
 GIVEAWAY_RE = re.compile(
     r"\b(he|she|they|it|the \w+)\s+(won|lost|crashed|died|scored|beat|smashed|flipped|"
     r"finished|ended|fell|missed|nailed|dropped|broke)\b", re.I)
+# LAZY CLICKBAIT (FIX 3): pure-bait phrasings that promise a reveal WITHOUT saying anything
+# concrete ("X just said WHAT", "you won't believe", "you'll never guess", "wait till you see
+# what", "the reason why"). These read as bait and carry zero clip specificity — killed so the
+# caption is forced to use a real detail from the transcript instead. Note the terminal "…said
+# WHAT" form is anchored to the END so a normal "said what he meant" is NOT caught.
+BAIT_RE = re.compile(
+    r"((^|\b)(just\s+)?(said|says|say|did|does|do|goes)\s+what\b[\s\W]*$)|"
+    r"\b(you'?ll never guess|you wo?n'?t believe|wo?n'?t believe (this|that|what|it|how|why)|"
+    r"will (shock|surprise|blow) (you|your mind|the world)|what happens? next|"
+    r"the reason (why|is why)|wait ?(til+|till) you (see|hear) what|"
+    r"number \w+ will (shock|surprise))\b", re.I)
 
 # --- hook GROUNDING (Task 2: no invented / mis-transcribed nouns) --------------
 # A hook must be about what THIS clip actually contains. A hook may freely use structural
@@ -200,6 +211,8 @@ def quality_kill(cap):
         return "multi-line"
     if DESCRIPTIVE_RE.search(cap):
         return "merely describes (no hook)"
+    if BAIT_RE.search(cap):
+        return "lazy clickbait (no clip specifics — use a real detail from the transcript)"
     if not HOOK_RE.search(cap):
         return "no hook pattern (question/stakes/disbelief/controversy/direct address)"
     if GIVEAWAY_RE.search(cap) and not HOOK_PATTERNS["question"].search(cap):
@@ -503,6 +516,12 @@ def _groq_candidates(client, campaign, moment, style_notes, event="", emoji_in_c
         "automatic reject. When in doubt, be PLAIN and ACCURATE, not catchy and wrong.\n"
         "BANNED: vague filler ('what just happened', bare 'wait for it'), descriptions, "
         "past-tense summaries, or GIVING AWAY the payoff. "
+        "NO LAZY CLICKBAIT (FIX 3): never use empty bait that promises a reveal without saying "
+        "anything concrete — 'X just said WHAT', 'you won't believe', 'you'll never guess', 'wait "
+        "till you see what', 'the reason why', 'this will shock you'. Those are an automatic "
+        "reject. Instead pull a CONCRETE specific from the clip (a number, an object, a name that "
+        "IS in the transcript, the actual claim) and hook on THAT — curiosity-driven but grounded "
+        "in what is really said. "
         "Be SPECIFIC to this clip. Respect the campaign banned words/topics in the "
         "knowledge below. "
         f"Return {N_CANDIDATES} captions, ONE PER LINE — no numbering, no quotes, no JSON.")
