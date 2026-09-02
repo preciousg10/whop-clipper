@@ -83,7 +83,8 @@ cause, not just the guard.
 → `index.py` → `campaign/moments.json` (whisper transcript + per-word timings + audio-spike moments)
 → `selectclips.py` → `campaign/selected.json`
 → `captions.py` → `campaign/captions.json`
-→ `cut.py` → `drafts/NN_score_slug.mp4` + `drafts/manifest.json`.
+→ `cut.py` → `drafts/<Campaign>_NN_score_slug.mp4` (campaign-prefixed, numbered
+per-campaign best-first; name sanitized to alphanumerics) + `drafts/manifest.json`.
 
 **Intake is an analyst** (`intake.py` + `analyze.py`): it routes every file by type
 (video/image/doc/other — nothing dropped), extracts text from every doc + link-shared

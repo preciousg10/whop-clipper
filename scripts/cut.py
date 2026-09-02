@@ -2,7 +2,8 @@
 
 Per selected clip: extract the moment, tighten dead air, render to vertical
 1080x1920, burn the flzsh caption at top (safe-zone aware), overlay the mandatory
-watermark, and write drafts/NN_score_slug.mp4 (best first) + drafts/manifest.json.
+watermark, and write drafts/<Campaign>_NN_score_slug.mp4 (per-campaign, best first)
++ drafts/manifest.json.
 
 The top HOOK caption is rendered to a transparent PNG with Pillow (bold white, black
 outline, top-center, <=2 lines, auto font-size) and overlaid by ffmpeg — this dodges
@@ -1416,6 +1417,7 @@ def run(state):
         C.log(f"watermark: {watermark.name}")
 
     C.DRAFTS.mkdir(parents=True, exist_ok=True)
+    camp_tag = C.campaign_tag(caps.get("campaign"))   # filename prefix so each clip names its campaign
     ranked_clips = sorted(caps["clips"], key=lambda c: (c.get("score") or 0), reverse=True)
     audio_cache = {}
     dim_cache = {}
@@ -1479,7 +1481,7 @@ def run(state):
         rank = len(manifest) + 1          # contiguous output rank (drops leave no numbering gaps)
 
         score_i = int(round(c.get("score") or 0))
-        name = f"{rank:02d}_{score_i:03d}_{slugify(c['caption'])}.mp4"
+        name = f"{camp_tag}_{rank:02d}_{score_i:03d}_{slugify(c['caption'])}.mp4"
         out_path = C.DRAFTS / name
         cap_png = C.DRAFTS / f".cap_{rank:02d}.png"
         # PER-CLIP KARAOKE STYLE (deterministic, seeded by moment id → stable on re-cut): accent

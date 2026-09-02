@@ -197,6 +197,13 @@ def now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def campaign_tag(name, n=32):
+    """Filesystem-safe campaign prefix for output clip names: strip spaces/slashes and
+    any other non-alphanumeric character (keeps original casing). Falls back to 'campaign'."""
+    s = re.sub(r"[^A-Za-z0-9]+", "", (name or ""))
+    return (s[:n] or "campaign")
+
+
 # --- state / checkpointing -----------------------------------------------------
 def load_state():
     return load_json(STATE_PATH, default={"campaign": None, "stages": {}, "config": {}})
@@ -315,6 +322,57 @@ def audio_stream_count(path):
          "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return len([ln for ln in (proc.stdout or "").splitlines() if ln.strip()])
+
+
+# --- yt-dlp import (guarded against the bgutil PO-token double-registration spam) ----------
+_YTDLP_GUARD_DONE = False
+
+
+def _guard_ytdlp_pot_registration():
+    """Make yt-dlp's PO-token provider registration IDEMPOTENT for the rest of this process.
+
+    The bgutil PO-token plugin registers its providers (BgUtilHTTP/BgUtilScriptNode/…) through
+    yt-dlp's plugin loader. yt-dlp can re-scan/re-execute plugin modules MORE THAN ONCE inside a
+    single long-lived process (e.g. run.py, which imports download in-process and constructs
+    several YoutubeDL instances); each re-scan re-runs the `@register_provider` decorator and hits
+    `assert PROVIDER_KEY not in registry` in yt_dlp…pot.provider.register_provider_generic — which
+    prints a non-fatal AssertionError traceback PER provider. Downloads still work (the provider
+    registered on the FIRST pass); it's pure log spam. The standalone yt-dlp CLI is clean because
+    it only loads plugins once. We wrap register_provider_generic so a duplicate PROVIDER_KEY is a
+    no-op instead of an assert. Patched ONCE per process; best-effort (a yt-dlp/bgutil layout change
+    just leaves the original behavior — never raises)."""
+    global _YTDLP_GUARD_DONE
+    if _YTDLP_GUARD_DONE:
+        return
+    _YTDLP_GUARD_DONE = True
+    try:
+        import functools
+        from yt_dlp.extractor.youtube.pot import provider as _pp
+    except Exception:
+        return          # older/newer yt-dlp without this module, or no PO-token plugin — nothing to guard
+    _orig = getattr(_pp, "register_provider_generic", None)
+    if _orig is None or getattr(_pp, "_clipper_reg_guarded", False):
+        return
+
+    @functools.wraps(_orig)
+    def _idempotent(provider, base_class, registry):
+        # register_provider() looks this up in the provider module's globals, so patching here
+        # covers every public register_* helper that delegates to it (providers + cache providers).
+        if getattr(provider, "PROVIDER_KEY", None) in registry:
+            return provider     # already registered this process — skip the duplicate (no assert spam)
+        return _orig(provider=provider, base_class=base_class, registry=registry)
+
+    _pp.register_provider_generic = _idempotent
+    _pp._clipper_reg_guarded = True
+
+
+def import_youtube_dl():
+    """Return yt_dlp's YoutubeDL with the bgutil double-registration guard installed FIRST, so a
+    later in-process plugin re-scan can't spam AssertionError tracebacks. Raises ImportError if
+    yt-dlp isn't installed (callers translate that into their own error message)."""
+    _guard_ytdlp_pot_registration()
+    from yt_dlp import YoutubeDL
+    return YoutubeDL
 
 
 # --- LLM failover chain: Groq(keys 1..N) -> Gemini -> Cerebras ---------------------

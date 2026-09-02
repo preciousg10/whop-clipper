@@ -32,17 +32,23 @@ DEFAULT_MAX_CANDIDATES = 400
 DEFAULT_MIN_CAND_SECONDS = 3.0   # drop true sub-clip fragments (silence/one-word) before ranking
 MIN_LIVE_SCORE = 1       # drop the model's flat-0 "dead" picks (countdown/hype/logistics)
 
-# SAFETY CEILING + QUALITY BAR (Task D). We hunt HIGHLIGHT-worthiness, not a fixed count.
-#   - HARD_CAP is a hard ceiling on how many clips one run can select, so a runaway can't
-#     burn the whole Groq free tier overnight (each selected clip costs a caption Groq call
+# SAFETY CEILING + QUALITY BAR. Selection ships DRAFTS for human review, so it feeds the funnel
+# ALL moments >= dead-floor best-first (not only the ones that clear the bar), bounded by two caps.
+#   - HARD_CAP is the absolute safety ceiling on how many clips one run can select, so a runaway
+#     can't burn the whole Groq free tier overnight (each selected clip costs a caption Groq call
 #     downstream). It is a CEILING, never a target — we do not pad up to it.
-#   - GOOD_SCORE is the "genuinely good" bar on Groq's 0-100 highlight score. Only moments a
-#     human would actually clip (funny / high-energy / chaotic / surprising peaks) clear it;
-#     within the ceiling we take exactly those and stop. If a stream has only 6 real
-#     highlights we ship 6, not 25. Both are overridable via config (select_hard_cap /
-#     select_min_quality) — see run.py DEFAULT_CONFIG.
+#   - GOOD_SCORE is the "genuinely good" bar on Groq's 0-100 score. Moments carrying a striking
+#     STANDALONE STATEMENT (a quotable, screenshot-worthy line) clear it and rank at the top;
+#     moments between the dead-floor and this bar are lower-confidence FILLER that still ships for
+#     review (rejected there, not pre-filtered to one). We LOG how many cleared the bar vs filler.
+#     Both are overridable via config (select_hard_cap / select_min_quality) — see run.py DEFAULT_CONFIG.
 DEFAULT_HARD_CAP = 50
 DEFAULT_GOOD_SCORE = 60
+# Per-campaign REVIEW cap: how many draft candidates one campaign feeds the review funnel. We ship
+# ALL moments >= dead-floor (best-first) up to this — these are DRAFTS a human approves before
+# posting, so a fuller funnel is good; weak ones get rejected at review, not pre-filtered to one.
+# Tighter than DEFAULT_HARD_CAP (the absolute safety ceiling) so one rich VOD can't dump 50 clips.
+DEFAULT_PER_CAMPAIGN_CAP = 10
 # LOW dead-floor (0-100). The score is LLM-judged from the TRANSCRIPT ONLY — it can't see the
 # video, so it undersells visually-funny content; the floor is therefore forgiving. If even the
 # BEST moment scores below this, the campaign is genuinely dead (flat/dead even in text) and we
@@ -296,47 +302,51 @@ def _score_batch(client, campaign, knowledge, batch, n):
     lines = [{"id": m["id"], "type": m["type"], "intensity": m.get("intensity"),
               "t": round(m["start"], 1), "peak": m.get("peak"),
               "text": (m.get("text") or "")[:160]} for m in batch]
-    system = ("You are an elite short-form clipper hunting HIGHLIGHTS in a livestream. Your "
-              "job: find the moments a person would actually clip if they watched the whole "
-              "stream — the FUNNY, HIGH-ENERGY, CHAOTIC, SURPRISING peaks. That includes a "
-              "hit/crash/overtake/knockout/win/wipeout, but EQUALLY a hilarious bit, a wild "
-              "or unhinged reaction, a clutch play, a brutal fail, a shocking take, a chaotic "
-              "meltdown — anything scroll-stopping and self-contained. "
-              "WHAT MAKES A MOMENT ELITE (reward these): a genuine high-energy REACTION (rage, "
-              "real shock, screaming, disbelief); a FUNNY bit or punchline that lands; a "
-              "SHOCKING or CONTROVERSIAL line / hot take / argument / beef / callout; SUSPENSE "
-              "or buildup that pays off ('wait… what is that', 'no way', 'watch this', opening "
-              "something, a dare) — tension that makes you NEED the next second; VISUAL-COMEDY "
-              "cues named in the transcript ('he just fell off', 'why is it doing that', 'bro "
-              "is stuck', 'it's on fire'); and STRONG EMOTIONAL beats (heartfelt, unhinged, "
-              "genuinely angry). Lines that quote what was SAID and are self-explanatory clip "
-              "better than vague noise. "
-              "ENERGY IS A SIGNAL, NOT THE ANSWER: each moment carries an audio 'intensity' "
-              "and a 'peak' second (the loudest/most chaotic instant). A spike means something "
-              "MIGHT be happening — your job is to confirm it's actually GOOD, not just loud. "
-              "Do NOT reward a spike that's only music, a hype sting, crowd noise, a countdown, "
-              "or an intro. "
+    system = ("You are an elite short-form clipper. Your ONE job: find the moment that contains "
+              "the most STRIKING STANDALONE STATEMENT — a sentence or two that is wild, "
+              "provocative, surprising, contrarian, or hooky ON ITS OWN, such that a stranger "
+              "reading or hearing JUST THAT LINE (with zero prior context) immediately wants "
+              "more. "
+              "SCORE HIGHEST (70-100) the moments containing a quotable, SCREENSHOT-WORTHY line: "
+              "a bold claim, a hot take, a shocking number/stat, a contrarian opinion, a 'wait, "
+              "WHAT?' statement, a confession, a brutal callout — a line that LANDS whether or "
+              "not the viewer has any context. The test: put this sentence on a screenshot with "
+              "NO setup — does it still hit and make a stranger stop? Reward SELF-CONTAINED PUNCH. "
+              "PENALIZE hard (push DOWN) moments that only make sense with prior episode/stream "
+              "context: inside references, 'as I said earlier', mid-argument callbacks, pronouns "
+              "with no antecedent, running bits, 'he/they' with no named subject — anything a "
+              "cold viewer can't follow. If a stranger would think 'I don't get it / who or what "
+              "are they talking about?', it is NOT a striking standalone statement, no matter how "
+              "animated the delivery. "
+              "LOUDNESS IS NOT REQUIRED: a CALM but INSANE claim beats a LOUD but boring one. Do "
+              "NOT reward a moment for energy, screaming, or an audio spike on its own — a quiet, "
+              "deadpan, jaw-dropping sentence should OUTSCORE hype noise. The 'intensity' and "
+              "'peak' audio signals are ONLY a faint tiebreak between two otherwise equally "
+              "striking lines — never a reason to raise a score by themselves. "
               "SCORE 0-15 (dead — reject): pre-stream/countdown, intros, 'we're live' / "
-              "'starting soon', outros / 'thanks for tuning in', pre-event BUILDUP before "
-              "anything happens, and logistics/ticket/promo/sponsor talk — dead even when loud. "
+              "'starting soon', outros / 'thanks for tuning in', logistics/ticket/promo/sponsor "
+              "talk — dead even when loud. "
               "SCORE 16-45 (flat/mundane — demote): ordinary conversation, neutral play-by-play, "
-              "mild chuckles, reading chat, repetitive grinding, filler and 'nothing really "
-              "happens' stretches — NOT postable even if audible; a normal moment is not a "
-              "highlight. Push these DOWN even when the audio is lively. "
-              "SCORE 70-100 (elite): only genuinely clip-worthy peaks a human would DEFINITELY "
-              "clip and a stranger would stop scrolling for. Be a HARSH grader — most moments "
-              "are mid; reserve high scores. "
-              "PRIMARY criterion: WOULD THE FIRST 2 SECONDS (opened on 'peak') STOP A SCROLL? "
-              "Secondary: is it funny/shocking/suspenseful/chaotic/emotional, self-contained, "
-              "and a fit for the campaign audience + rules below? "
+              "filler, 'nothing really happens' stretches, and ESPECIALLY context-dependent lines "
+              "a cold viewer can't follow — even if loud or lively. A normal sentence is not a "
+              "striking statement. "
+              "SCORE 70-100 (elite): ONLY moments with a genuinely quotable, self-contained, "
+              "scroll-stopping LINE. Be a HARSH grader — most moments are mid; reserve high scores. "
+              "For EVERY moment, also return `line`: the EXACT striking sentence, quoted verbatim "
+              "from that moment's transcript (<= ~200 chars), that earns the score — the one a "
+              "viewer would screenshot. If no such line exists, return an empty string for `line` "
+              "and score the moment low. "
               "Return ONLY a JSON array of objects "
-              '{"id","score","reason"} with score 0-100. No prose.')
+              '{"id","score","line","reason"} with score 0-100. No prose.')
     user = (f"Campaign: {campaign}\n"
             f"Audience: {C.AUDIENCE_CONTEXT}\n\n"
             + (f"Campaign knowledge (apply this):\n{knowledge}\n\n" if knowledge else "")
-            + f"Score EVERY moment on highlight-worthiness — would someone CLIP this? Judge "
-            f"the first-2-seconds scroll-stop (opened on 'peak') first, overall moment "
-            f"quality second. Confirm the audio spike is a real good moment, not just loud "
+            + f"For EVERY moment, find its most STRIKING STANDALONE STATEMENT and score how "
+            f"much a stranger with ZERO prior context would want more after JUST that line. "
+            f"Quotable/screenshot-worthy bold claim, hot take, shocking number, contrarian "
+            f"opinion, or 'wait what' statement = high. Needs prior context to make sense = "
+            f"low. Loudness does NOT matter (intensity/peak are only a faint tiebreak). Return "
+            f"`line` = the exact striking sentence you scored on "
             f"(id, type, intensity, start seconds t, peak second, transcript text):\n"
             f"{json.dumps(lines, ensure_ascii=False)}")
     raw = C.llm_chat(client, system, user, temperature=0.4, max_tokens=900)
@@ -348,6 +358,7 @@ def _score_batch(client, campaign, knowledge, batch, n):
 
 
 def _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap, dead_floor,
+                 per_campaign_cap=DEFAULT_PER_CAMPAIGN_CAP,
                  max_candidates=DEFAULT_MAX_CANDIDATES, min_cand_seconds=DEFAULT_MIN_CAND_SECONDS):
     # CANDIDATE POOL — content-ranked, NOT loudness-gated. Remove true junk (fragments/garbage/
     # exact-dupes), then rank by CONTENT (_content_rank: transcript richness, dialogue density,
@@ -387,6 +398,7 @@ def _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap, d
                 continue
             seen.add(m["id"])
             scored.append({**m, "score": float(item.get("score", 0)),
+                           "line": str(item.get("line", ""))[:200],
                            "reason": str(item.get("reason", ""))[:200]})
         C.save_json(C.SELECT_PARTIAL, {"scored": scored})   # checkpoint after each batch
 
@@ -420,23 +432,22 @@ def _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap, d
             f"usable moments, advancing to the next ranked campaign.")
     C.log(f"select: best {best:.0f} >= dead-floor {dead_floor:.0f} — proceeding.")
 
-    # HIGHLIGHT BAR + SAFETY CEILING. Prefer only the genuinely-good peaks (score >=
-    # min_quality) and take AS MANY as clear it, up to hard_cap — we do NOT pad to a target
-    # count. If a stream has 6 real highlights we ship 6; if it has 60 we still stop at the
-    # ceiling so downstream caption Groq calls can't run away. When NOTHING clears the 60 bar we
-    # don't fail (best already cleared the dead-floor) — we ship the best available AT OR ABOVE
-    # the dead-floor for human review, capped conservatively.
-    good = [m for m in alive if m["score"] >= min_quality]
-    if good:
-        pool, cap = good, hard_cap
-        C.log(f"select: {len(good)} moment(s) cleared the highlight bar "
-              f"(score >= {min_quality:g}); taking up to the {hard_cap} ceiling, no padding.")
-    else:
-        pool = [m for m in alive if m["score"] >= dead_floor]
-        cap = max(1, min(hard_cap, n))
-        C.warn(f"select: no moment cleared the highlight bar (score >= {min_quality:g}) — this "
-               f"stream has no standout peaks. Shipping the {min(cap, len(pool))} best "
-               f"moment(s) >= dead-floor {dead_floor:g} for review.")
+    # REVIEW FUNNEL. These are DRAFTS a human approves before posting, so we ship ALL moments at or
+    # above the dead-floor (best-first — `alive` is already sorted by score desc), NOT only the ones
+    # that clear the highlight bar. Moments >= min_quality naturally rank at the top; 40-59 moments
+    # are lower-confidence "filler" candidates that round out the batch and get accepted/rejected at
+    # review, not pre-filtered to one. Two ceilings bound the count: per_campaign_cap (default 10)
+    # keeps one rich VOD from dumping 50 clips into the funnel, and hard_cap is the absolute safety
+    # ceiling on caption Groq spend — the effective cap is the tighter of the two.
+    pool = [m for m in alive if m["score"] >= dead_floor]
+    cap = max(1, min(per_campaign_cap, hard_cap))
+    cleared = sum(1 for m in pool if m["score"] >= min_quality)
+    filler = len(pool) - cleared
+    C.log(f"select: {len(pool)} draft candidate(s) >= dead-floor {dead_floor:g} — "
+          f"{cleared} cleared the highlight bar (>= {min_quality:g}), "
+          f"{filler} are {dead_floor:g}-{min_quality - 1:g} filler. "
+          f"Shipping up to {cap} best-first (per-campaign cap {per_campaign_cap}, "
+          f"safety ceiling {hard_cap}).")
 
     picked, used = [], []
     for m in pool:
@@ -444,6 +455,11 @@ def _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap, d
             continue
         picked.append(m)
         used.append(m)
+        # Log the WINNING LINE (the striking sentence the model scored on) so it's obvious at a
+        # glance WHY each moment was picked. Falls back to the model's reason if no line came back.
+        line = (m.get("line") or "").strip()
+        why = f"“{line}”" if line else (m.get("reason") or "no line").strip()
+        C.log(f"select: PICK {m['id']} (score {m['score']:.0f}) — {why}")
         if len(picked) >= cap:
             break
     return picked
@@ -460,6 +476,8 @@ def run(state):
     hard_cap = int(cfg.get("select_hard_cap", DEFAULT_HARD_CAP))
     min_quality = float(cfg.get("select_min_quality", DEFAULT_GOOD_SCORE))
     dead_floor = float(cfg.get("select_dead_floor", DEFAULT_DEAD_FLOOR))
+    # Per-campaign review cap — how many draft candidates this campaign contributes best-first.
+    per_campaign_cap = int(cfg.get("select_per_campaign_cap", DEFAULT_PER_CAMPAIGN_CAP))
     # Candidate pool fed to the LLM scorer — content-ranked, generous (not the loudest few).
     max_candidates = int(cfg.get("select_max_candidates", DEFAULT_MAX_CANDIDATES))
     min_cand_seconds = float(cfg.get("select_min_candidate_seconds", DEFAULT_MIN_CAND_SECONDS))
@@ -494,7 +512,7 @@ def run(state):
     else:
         C.log(f"select: LLM provider = {client.status()}")
         selected = _groq_scores(client, campaign, moments, n, min_sep, min_quality, hard_cap,
-                                dead_floor, max_candidates, min_cand_seconds)
+                                dead_floor, per_campaign_cap, max_candidates, min_cand_seconds)
 
     if not selected:
         raise C.NothingUsable(

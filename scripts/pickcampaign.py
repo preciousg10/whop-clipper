@@ -433,7 +433,7 @@ def _probe_duration(url, timeout=20, attempts=3):
     (Drive 503s / timeouts) so a flaky request doesn't read as 'unknowable'. Returns None
     only when the metadata genuinely carries no duration, or every attempt failed."""
     try:
-        from yt_dlp import YoutubeDL
+        YoutubeDL = C.import_youtube_dl()      # guarded import (no bgutil double-registration spam)
     except ImportError:
         return None
     import time as _t

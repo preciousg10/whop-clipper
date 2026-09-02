@@ -38,6 +38,12 @@ DEFAULT_CONFIG = {
     # call downstream, so this stops a runaway from burning the free tier overnight).
     "select_hard_cap": 50,
     "select_min_quality": 60,
+    # Per-campaign REVIEW cap: how many draft candidates one campaign contributes to the review
+    # funnel. We ship ALL moments >= dead-floor (best-first) up to this — the human approves before
+    # posting, so more candidates is good; low-quality ones get rejected at review, not pre-filtered.
+    # Tighter than select_hard_cap (the absolute safety ceiling) so one rich VOD can't dump 50
+    # mediocre clips and burn the caption Groq tier.
+    "select_per_campaign_cap": 10,
     # LOW dead-floor: if even the BEST moment scores below this, the campaign is genuinely dead
     # (the score is text-blind, so keep this forgiving) → stop + auto-advance. 40+ ships.
     "select_dead_floor": 40,
@@ -320,8 +326,19 @@ def _prepare_state(args):
     # Defensive: if the campaign on disk (rules.json) differs from the state's active one, scope
     # stages to it so we never skip stages a PRIOR campaign left 'done'. This is ALSO how an
     # auto-advanced campaign gets its own fresh (empty) stage set.
+    prev_campaign = state.get("campaign")
     rules_campaign = (C.load_json(C.RULES_JSON) or {}).get("campaign")
     C.activate_campaign(state, rules_campaign)
+    # On a real campaign CHANGE, reset ALL stage checkpoints so every stage re-runs against the NEW
+    # footage. activate_campaign already gives a brand-new campaign an empty stage set, but a
+    # RE-VISITED campaign would restore its stashed 'done' markers — and those point at the prior
+    # run's outputs, not this footage. Belt-and-suspenders: clear them all on any switch. (No-op on a
+    # same-campaign re-run, so resume stays resumable.)
+    if rules_campaign and prev_campaign and prev_campaign != rules_campaign:
+        for name, _ in STAGES:
+            state.get("stages", {}).pop(name, None)
+        C.log(f"campaign changed ({prev_campaign!r} → {rules_campaign!r}) — reset all stage "
+              f"checkpoints so every stage re-runs against the new footage.")
     cfg = {**DEFAULT_CONFIG, **state.get("config", {})}
     if args.clips_per_batch:
         cfg["clips_per_batch"] = args.clips_per_batch
@@ -346,13 +363,40 @@ def _prepare_state(args):
     return state
 
 
+def _stage_output_present(name):
+    """Does the stage's on-disk OUTPUT actually exist? A 'done' marker alone is NOT enough to skip:
+    a campaign switch, a deleted/moved output, or a cleanup step can leave a stale 'done' marker
+    whose output is gone — skipping then silently yields 0 clips downstream. If the output is
+    missing the stage is NOT really done and must re-run regardless of the marker."""
+    if name == "download":
+        # download's 'output' is footage on disk; if the folder is empty (new campaign / cleanup)
+        # re-run it — ensure_downloaded is an idempotent repair, so re-running when files are
+        # already present is cheap.
+        return C.FOOTAGE.exists() and any(p.is_file() for p in C.FOOTAGE.glob("*"))
+    outputs = {
+        "index": C.MOMENTS_JSON,
+        "select": C.SELECTED_JSON,
+        "captions": C.CAPTIONS_JSON,
+        "cut": C.DRAFTS_MANIFEST,
+    }
+    p = outputs.get(name)
+    return p is None or p.exists()
+
+
 def _run_stages(state, args):
     """Run the pipeline stages in order. A GroqDailyCapError stops resumably; a NothingUsable
     propagates to the caller (which may auto-advance)."""
     for name, fn in STAGES:
         if C.stage_done(state, name) and not args.force:
-            C.log(f"skip {name} (already done)")
-            continue
+            if _stage_output_present(name):
+                C.log(f"skip {name} (already done)")
+                continue
+            # Loud, non-silent: a 'done' marker with no output is a stale checkpoint — never skip on
+            # it (that's the "0 clips after a campaign switch" bug). Drop the marker and re-run.
+            C.warn(f"{name} is marked done but its expected output is MISSING on disk — the "
+                   f"checkpoint is stale (campaign switch / deleted output). Re-running {name}.")
+            state.get("stages", {}).pop(name, None)
+            C.save_state(state)
         C.log(f"== stage: {name} ==")
         try:
             fn(state)
@@ -415,8 +459,16 @@ def _tee(cmd):
     """Run a subprocess, STREAM its output live (so the overnight log shows the whole walk) AND
     capture it, so the text can be scanned for a bot-check/throttle. Returns (returncode, text)."""
     import subprocess
+    # Decode the child's pipe as UTF-8 with errors="replace" — NOT the Windows locale default
+    # (cp1252), which chokes on accented filenames / smart quotes / transcript chars and would
+    # crash the whole overnight walk with a UnicodeDecodeError. errors="replace" guarantees no
+    # byte sequence can ever raise; the worst case is a lone U+FFFD in the streamed log.
+    # Also pin PYTHONIOENCODING so the child EMITS utf-8 from process start (covers an early
+    # traceback printed before common.py reconfigures its own streams).
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1)
+                            text=True, encoding="utf-8", errors="replace", bufsize=1,
+                            env=env)
     chunks = []
     for line in proc.stdout:
         sys.stdout.write(line)
@@ -492,10 +544,13 @@ def _harvest_batch(campaign):
         if not src.exists():
             C.warn(f"batch harvest: {c['filename']} missing from drafts/ — skipping.")
             continue
-        # Unique collision-safe staging name; keep the slug tail (NN_SSS_<slug>.mp4 → <slug>.mp4)
-        # so finalize can rebuild a clean best-first name without re-slugifying the caption.
-        parts = c["filename"].split("_", 2)
-        tail = parts[2] if len(parts) == 3 else c["filename"]
+        # Unique collision-safe staging name; keep the slug tail
+        # (<camp>_NN_SSS_<slug>.mp4 → <slug>.mp4) so finalize can rebuild a clean
+        # per-campaign best-first name without re-slugifying the caption. The camp tag,
+        # NN and SSS fields carry no '_' (tag is sanitized to alphanumerics), so a 3-way
+        # split cleanly peels them off the leading edge.
+        parts = c["filename"].split("_", 3)
+        tail = parts[3] if len(parts) == 4 else c["filename"]
         stage_name = f"b{base + i:03d}_{c['filename']}"
         shutil.move(str(src), str(C.DRAFTS_BATCH / stage_name))
         entry = dict(c)
@@ -528,20 +583,32 @@ def _finalize_batch():
         shutil.rmtree(C.DRAFTS_BATCH, ignore_errors=True)
         return 0
     C.DRAFTS.mkdir(parents=True, exist_ok=True)
-    clips = sorted(batch["clips"], key=lambda c: (c.get("score") or 0), reverse=True)
+    # Group by campaign and number sequentially PER CAMPAIGN (best-first), so each clip's
+    # name identifies its campaign: <camp>_NN_SSS_<slug>.mp4. Campaigns keep the order they
+    # were harvested in (batch["campaigns"]); any stray campaign not listed is appended.
+    by_camp = {}
+    for c in batch["clips"]:
+        by_camp.setdefault(c.get("batch_campaign") or "campaign", []).append(c)
+    camp_order = list(batch.get("campaigns") or [])
+    for camp in by_camp:
+        if camp not in camp_order:
+            camp_order.append(camp)
     final = []
-    for rank, c in enumerate(clips, 1):
-        src = C.DRAFTS_BATCH / c["filename"]
-        if not src.exists():
-            C.warn(f"batch finalize: {c['filename']} missing from drafts_batch/ — skipping.")
-            continue
-        score_i = int(round(c.get("score") or 0))
-        tail = c.get("_slug_tail") or c["filename"]
-        name = f"{rank:02d}_{score_i:03d}_{tail}"
-        shutil.move(str(src), str(C.DRAFTS / name))
-        entry = {k: v for k, v in c.items() if k != "_slug_tail"}
-        entry["filename"] = name
-        final.append(entry)
+    for camp in camp_order:
+        tag = C.campaign_tag(camp)
+        group = sorted(by_camp.get(camp, []), key=lambda c: (c.get("score") or 0), reverse=True)
+        for rank, c in enumerate(group, 1):
+            src = C.DRAFTS_BATCH / c["filename"]
+            if not src.exists():
+                C.warn(f"batch finalize: {c['filename']} missing from drafts_batch/ — skipping.")
+                continue
+            score_i = int(round(c.get("score") or 0))
+            tail = c.get("_slug_tail") or c["filename"]
+            name = f"{tag}_{rank:02d}_{score_i:03d}_{tail}"
+            shutil.move(str(src), str(C.DRAFTS / name))
+            entry = {k: v for k, v in c.items() if k != "_slug_tail"}
+            entry["filename"] = name
+            final.append(entry)
     C.save_json(C.DRAFTS_MANIFEST, {"batch": True, "campaigns": batch.get("campaigns", []),
                                     "created_at": C.now_iso(), "clips": final})
     shutil.rmtree(C.DRAFTS_BATCH, ignore_errors=True)

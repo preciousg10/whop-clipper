@@ -423,7 +423,7 @@ def list_channel_videos(url, limit=40, cookies_from_browser=None):
     Returns [] if none. Raises DownloadError only if the channel itself can't be listed — one
     bad video never blocks the rest (they're downloaded individually with per-video skip)."""
     try:
-        from yt_dlp import YoutubeDL
+        YoutubeDL = C.import_youtube_dl()      # guarded import (no bgutil double-registration spam)
     except ImportError:
         raise DownloadError("yt-dlp not installed (pip install -r requirements.txt)")
     opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist",
@@ -771,7 +771,7 @@ def _check_free_space(path, needed_bytes, what):
 def _fetch_ytdlp(url, staging, cookies_from_browser=None, format_id=None,
                  merge_output_format="mp4"):
     try:
-        from yt_dlp import YoutubeDL
+        YoutubeDL = C.import_youtube_dl()      # guarded import (no bgutil double-registration spam)
     except ImportError:
         raise DownloadError("yt-dlp not installed (pip install -r requirements.txt)")
     workdir = _ytdlp_workdir()
@@ -839,7 +839,7 @@ def _fetch_ytdlp(url, staging, cookies_from_browser=None, format_id=None,
 def _drive_file_info(url, cookies_from_browser=None):
     """Probe a Drive file with yt-dlp (the -F equivalent) and return its info dict."""
     try:
-        from yt_dlp import YoutubeDL
+        YoutubeDL = C.import_youtube_dl()      # guarded import (no bgutil double-registration spam)
     except ImportError:
         raise DownloadError("yt-dlp not installed (pip install -r requirements.txt)")
     opts = {"quiet": True, "no_warnings": True}

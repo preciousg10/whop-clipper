@@ -298,7 +298,24 @@ def index_source(entry, state, do_transcribe):
     duration = entry.get("duration_sec") or C.ffprobe_duration(source)
     chunks_total = max(1, int(np.ceil(duration / CHUNK_SEC)))
 
-    idx_state = state["stages"].setdefault("index", {"done": False, "sources": {}})
+    stages = state.setdefault("stages", {})
+    idx_state = stages.setdefault("index", {"done": False, "sources": {}})
+    # DEFENSIVE: a COMPLETED index calls mark_stage(), which REPLACES state['stages']['index'] with
+    # a summary dict (done/at/moments/n_sources/skipped) — its per-source chunk-checkpoint 'sources'
+    # dict is gone. If that stale 'done' marker survives into a re-run (a campaign switch that didn't
+    # reset checkpoints, a standalone `python index.py` re-run, or legacy state written before the
+    # kwarg was renamed off 'sources'), idx_state['sources'] is missing or an int COUNT, not the dict
+    # this stage needs. Reset to a clean working dict and warn, rather than crashing on
+    # `int.setdefault(...)` ("'int' object has no attribute 'setdefault'").
+    if not isinstance(idx_state, dict):
+        C.warn(f"index checkpoint was {type(idx_state).__name__}, not a dict — resetting to a clean "
+               f"checkpoint and re-indexing this campaign.")
+        idx_state = {"done": False, "sources": {}}
+        stages["index"] = idx_state
+    if not isinstance(idx_state.get("sources"), dict):
+        C.warn("index checkpoint 'sources' was not the per-source dict (stale completion marker) — "
+               "resetting per-source progress and re-indexing this campaign clean.")
+        idx_state["sources"] = {}
     ss = idx_state["sources"].setdefault(name, {"chunks_total": chunks_total, "chunks_done": 0})
     ss["chunks_total"] = chunks_total
 
@@ -496,7 +513,10 @@ def run(state):
     # Language gate: bail BEFORE select/captions (token spend) if the footage isn't English.
     # moments.json is already saved above, so the stop is inspectable + resumable/re-pickable.
     _language_gate(sources, state)
-    C.mark_stage(state, "index", moments=len(all_moments), sources=len(sources),
+    # NOTE: the summary key is n_sources, NOT 'sources' — 'sources' is the per-source chunk-
+    # checkpoint DICT index_source() writes/reads during the run. Writing an int count under the
+    # same key poisoned the checkpoint so a later index_source() did int.setdefault(...) and crashed.
+    C.mark_stage(state, "index", moments=len(all_moments), n_sources=len(sources),
                  skipped=len(skipped))
     if skipped:
         detail = ", ".join(f"{n} ({e})" for n, e in skipped)
