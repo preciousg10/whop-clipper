@@ -929,12 +929,13 @@ def build_ass(events, cfg, banned, out_path, top_y, fx_events=None, style=None):
     emphasis = str(style.get("emphasis", "color"))               # "color" (fill) | "box" (highlight)
     box_border = int(style.get("box_border", 12))
     scale = int(cfg.get("subtitle_active_scale", 102))            # % upscale of the active word (small)
-    spacing = int(cfg.get("subtitle_active_spacing", 4))          # px letter-spacing on the active word
+    spacing = int(cfg.get("subtitle_active_spacing", 0))          # px letter-spacing (0 = normal/default)
     hold = float(cfg.get("subtitle_hold", 0.25))                  # linger after the last word
     sp = f"\\fsp{spacing}" if spacing else ""
-    # The active-word override (FIX 1): a SMALL upscale + letter-spacing so the word spreads out and
-    # POPS gently instead of clumping/ballooning. color mode tints the FILL the muted per-clip accent
-    # (black outline KEPT); box mode gives an accent BORDER instead. \r resets to the style default.
+    # The active-word override (FIX 1): a SMALL upscale so the word POPS gently instead of ballooning.
+    # Letter-spacing defaults to normal (no \fsp) but stays config-tunable. color mode tints the FILL
+    # the muted per-clip accent (black outline KEPT); box mode gives an accent BORDER instead. \r
+    # resets to the style default.
     if emphasis == "box":
         active_open = f"{{\\3c{accent}\\bord{box_border}\\fscx{scale}\\fscy{scale}{sp}}}"
     else:

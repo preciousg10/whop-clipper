@@ -191,7 +191,7 @@ DEFAULT_CONFIG = {
     "subtitle_accent_max_value": 0.80,       # HSV value ceiling (never near-white)
     "subtitle_accent_color": "&H00FFFFFF&",  # legacy FALLBACK active-word colour when adaptive is off
     "subtitle_active_scale": 102,  # % upscale applied to the active word (SMALL — a gentle pop, not a balloon)
-    "subtitle_active_spacing": 4,  # px letter-spacing on the active word so it spreads out, not clumped
+    "subtitle_active_spacing": 0,  # px letter-spacing on the active word (0 = normal/default spacing)
     "subtitle_ass_fontsize": 54,   # subtitle font size at 1080x1920 output res
     "subtitle_pause_gap": 0.1,    # sec of silence between words that starts a NEW karaoke line
                                    # (breaks on the speaker's natural pauses, even mid-cap)
