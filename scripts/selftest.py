@@ -305,6 +305,58 @@ def t8_restriction_kill_set():
            f"shippable={shippable}, candidates={clip['candidates']}, variant={clip['variant']}")
 
 
+def t9_caption_text_fixes():
+    """Pure-function coverage for the caption-text fixes: punctuation joins (FIX 2), name Title
+    Case (FIX 4), generic-filler blocklist (FIX 5), restricted purge from candidates+killed (6)."""
+    import json
+    # FIX 2 — em-dash / curly apostrophe must NOT concatenate two words.
+    fin = captions_stage.finalize_caption("80% Oxygen Left—what’s Sucking It Away? \U0001f480",
+                                          emoji_in_caption=True)
+    record("T9 FIX2 dash never joins words (no 'Leftwhats')",
+           "Leftwhats" not in fin and "Left - " in fin, fin)
+    # FIX 4 — proper Title Case for names, across spaces AND hyphens.
+    record("T9 FIX4 Title Case names across hyphens",
+           captions_stage.titlecase("mr beast") == "Mr Beast"
+           and captions_stage.titlecase("night-and-day") == "Night-And-Day",
+           captions_stage.titlecase("mr beast / night-and-day"))
+    # FIX 5 — generic filler hooks blocklisted; clip-specific lines survive.
+    fillers = ["what is happening", "this is crazy", "nah this is wild", "no way"]
+    specific = ["no way melatonin does that", "melatonin only starts the sleep race"]
+    record("T9 FIX5 generic filler hooks blocklisted (clip-specific survive)",
+           all(captions_stage.GENERIC_FILLER_RE.match(f) for f in fillers)
+           and not any(captions_stage.GENERIC_FILLER_RE.match(s) for s in specific))
+    # FIX 6 — restricted terms purged from candidates AND the killed array (nothing persists).
+    banned = captions_stage.restriction_terms(
+        {"required_elements": [{"type": "restriction",
+                                "detail": 'No medical claims (no "cure", "will fix")'}]})
+    clip = {"candidates": ["why melatonin only cues night", "sleep cures sleepiness"],
+            "killed": [{"caption": "sleep cures sleepiness", "reason": "banned word: cures"},
+                       {"caption": "no way that happened", "reason": "no hook pattern"}],
+            "caption": "why melatonin only cues night",
+            "tiktok_caption": "why melatonin only cues night",
+            "shorts_title": "why melatonin only cues night"}
+    captions_stage.scrub_clip_compliance(clip, banned, "t9")
+    blob = json.dumps(clip)
+    record("T9 FIX6 restricted purged from candidates AND killed",
+           "cures" not in blob and clip["candidates"] == ["why melatonin only cues night"]
+           and len(clip["killed"]) == 1)
+
+
+def t10_reframe_and_palette():
+    """Pure-function coverage for the TRACK sharpness cap (FIX 1c) and white-only accent (FIX 3)."""
+    import reframe                                     # imports without cv2 (heavy deps load lazily)
+    cfg = {"track_subject_scale": 0.48, "track_max_upscale": 1.3}
+    small = (640.0, 360.0, 300.0, 200.0, 0.0)          # bbox_h 300 on 720p → scale ~3.07 (too soft)
+    big = (640.0, 360.0, 720.0, 300.0, 0.0)            # subject fills frame → scale ~1.28 (sharp ok)
+    record("T10 FIX1c small subject → blur_fill (plan None), large subject → crop",
+           reframe._plan_crop(cfg, 1280, 720, small) is None
+           and reframe._plan_crop(cfg, 1280, 720, big) is not None)
+    styles = [cut_stage.resolve_clip_style({}, cid) for cid in ("a", "b", "c", "d", "e", "f")]
+    record("T10 FIX3 karaoke accent is WHITE only (no bright accent)",
+           all(s["accent_rgb"] == "FFFFFF" for s in styles),
+           sorted({s["accent_rgb"] for s in styles}))
+
+
 def t4_full_pipeline(synth, watermark_path, brief_path):
     reset_campaign()
     run_intake(brief_path, [synth, watermark_path], "WTF Leagues Selftest")
@@ -355,6 +407,8 @@ def main():
     t6_routing()
     t7_intake_analyst(footage_for_t1, watermark, brief)
     t8_restriction_kill_set()
+    t9_caption_text_fixes()
+    t10_reframe_and_palette()
 
     if synth is not None:
         t4_full_pipeline(synth, watermark, brief)
