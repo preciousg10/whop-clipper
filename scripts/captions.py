@@ -899,15 +899,21 @@ _TEXT_OUTPUT_FIELDS = ("caption", "tiktok_caption", "shorts_title")
 
 
 def scrub_clip_compliance(clip, banned, moment_id=""):
-    """AIRTIGHT kill-set sweep over ONE clip's output. Runs EVERY variant through the full
+    """AIRTIGHT kill-set sweep over ONE clip's output. Runs EVERY stored field through the full
     augmented kill-set (banned words + topics + restriction inflections + medical-claim regex):
       - candidate lines containing a restricted term are DROPPED ENTIRELY (not just deprioritized),
+      - KILLED entries whose text carries a restricted term are PURGED too (FIX 6: nothing
+        restricted persists ANYWHERE in captions.json, not even in the killed/diagnostic list),
       - a non-compliant `variant` is dropped,
       - if any restricted term survives in a SHIPPED text field (caption / tiktok_caption /
         shorts_title) the clip is NOT shippable.
     Mutates `clip` in place and returns True if it is compliant to ship, False if it must be
     SKIPPED (fail loud, never ship a non-compliant caption)."""
     clip["candidates"] = [c for c in clip.get("candidates", []) if not banned_hit(c, banned)]
+    # FIX 6: purge restricted killed candidates from the stored killed array (their text — and the
+    # "banned word: <term>" reason — otherwise persist verbatim in captions.json).
+    clip["killed"] = [k for k in clip.get("killed", [])
+                      if not banned_hit((k or {}).get("caption", ""), banned)]
     if clip.get("variant") and banned_hit(clip["variant"], banned):
         clip["variant"] = None
     for f in _TEXT_OUTPUT_FIELDS:
