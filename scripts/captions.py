@@ -933,7 +933,9 @@ def finalize_caption(text, emoji_in_caption=True):
     The banned-word gauntlet and hook-pattern gate have already run upstream; this only
     fixes case/emoji. Rendering (cut.render_caption_png) drops any emoji the font can't
     draw, so a preserved emoji never becomes a tofu box."""
-    text = " ".join((text or "").split())
+    # FIX 2: normalize smart punctuation FIRST so an em-dash/curly quote becomes a separator, not a
+    # silently-dropped char that jams two words ("Left—whats" -> "Left - whats", never "Leftwhats").
+    text = C.normalize_punct(" ".join((text or "").split()))
     if not emoji_in_caption:
         text = _strip_symbols(text)
     text = titlecase(text).strip()

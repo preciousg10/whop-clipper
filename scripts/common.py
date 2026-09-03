@@ -204,6 +204,27 @@ def campaign_tag(name, n=32):
     return (s[:n] or "campaign")
 
 
+# Unicode "smart" punctuation → ASCII. The final render step hard-strips non-ASCII, and it used to
+# DROP an em-dash / curly apostrophe with no space, jamming two words ("Left—whats"→"Leftwhats").
+# Normalizing first guarantees a dash becomes a separator, never a silent join.
+_EMDASH_RE = re.compile(r"\s*[‒–—―−﹘]\s*")  # fig/en/em/horbar/minus
+_HYPHEN_RE = re.compile(r"[‐‑⁃﹣－]")              # hyphen-like → ASCII '-'
+_APOS_RE = re.compile(r"[‘’ʼ′‵]")                # curly/mod apostrophes → '
+_DQUOTE_RE = re.compile(r"[“”″‶]")                    # curly double quotes → "
+
+
+def normalize_punct(text):
+    """Map unicode 'smart' punctuation to ASCII so nothing is silently dropped at the ASCII render
+    step (which would jam two words together). Em/en dashes become a SPACED ' - ' (a real word
+    separator), hyphen characters become a plain '-' (kept inline for compounds), and curly
+    quotes/apostrophes become their ASCII form. Emoji and other characters are untouched."""
+    t = _EMDASH_RE.sub(" - ", text or "")     # clause dash → spaced hyphen (never joins words)
+    t = _HYPHEN_RE.sub("-", t)                 # compound hyphen → ASCII hyphen (kept inline)
+    t = _APOS_RE.sub("'", t)
+    t = _DQUOTE_RE.sub('"', t)
+    return re.sub(r"[ \t]{2,}", " ", t).strip()
+
+
 # --- state / checkpointing -----------------------------------------------------
 def load_state():
     return load_json(STATE_PATH, default={"campaign": None, "stages": {}, "config": {}})

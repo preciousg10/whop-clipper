@@ -458,6 +458,10 @@ def render_caption_png(text, out_path, box_w=CAPTION_BOX_W, max_lines=2, stroke=
     installed — every non-ASCII char is hard-stripped, the old guaranteed no-emoji gate."""
     text_font_path = find_bold_font()
     emoji_font_path = find_emoji_font() if emoji else None
+    # FIX 2: map smart punctuation (em-dash / curly quotes / U+2011 hyphen) to ASCII BEFORE the
+    # non-ASCII strip below — otherwise the strip drops the dash with no space and jams two words
+    # together ("Left—whats" -> "Leftwhats"). Now the dash survives as " - " and words stay apart.
+    text = C.normalize_punct(text or "")
     if emoji_font_path:
         text = _drop_unrenderable_emoji(_keep_ascii_and_emoji(text), emoji_font_path)
     else:
