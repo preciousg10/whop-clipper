@@ -14,6 +14,7 @@ colour + upscale, timings mapped through the cold-open reorder onto the final ti
 Watermark is the campaign PNG from campaign/assets/. Fail loud if anything essential is
 missing.
 """
+import colorsys
 import os
 import re
 import statistics
@@ -53,15 +54,16 @@ SUBTITLE_CENTER_Y = 1440      # ~75% down: in the lower black band, off the vide
 # within good bounds, not chaos.
 DEFAULT_STYLE_SET = {
     "name": "flzsh_default",
-    # Active-word accent palette (RGB hex; converted to ASS &HBBGGRR at use). WHITE ONLY (FIX 3):
-    # every colored accent was removed — cyan first, then yellow and anything bright. Captions and
-    # subtitles are WHITE with the strong black outline, and the active (currently-spoken) word pops
-    # purely by scale, not colour. No colored accent words anywhere.
-    "accent_palette": ["FFFFFF"],
-    #                   white
-    # Active-word emphasis: "color" = accent FILL (now white == base, so the pop is the scale-up);
-    # "box" = a thin accent BORDER (also white). Both stay white — no bright accent.
-    "emphasis_modes": ["color", "box"],
+    # Active-word accent palette (RGB hex) — FALLBACK ONLY, used when adaptive accent is disabled
+    # (`subtitle_adaptive_accent=false`) or no background can be sampled. Normally the accent is
+    # chosen PER CLIP by sampling the clip's background and picking a MUTED contrasting tone (see
+    # adaptive_accent). This muted teal is a safe default, never neon/near-white/pure-yellow.
+    "accent_palette": ["4E9A8F"],
+    #                   muted teal
+    # Active-word emphasis: "color" = accent FILL (the active word is tinted the muted accent, the
+    # strong black outline is KEPT). "box" (accent BORDER) is available via config but off by default
+    # because it replaces the black outline on the active word. Default is color-fill only.
+    "emphasis_modes": ["color"],
     "box_border": 5,              # accent border thickness (px @ output res) for "box" mode
 }
 # NOTE: this style-set is KARAOKE-ONLY. The HOOK (top plate) is deliberately kept CONSTANT — plain
@@ -101,7 +103,7 @@ def resolve_clip_style(cfg, clip_id):
     so a batch spreads across the palette / modes instead of moving in lockstep. (The HOOK is NOT
     styled here — it's constant white/top with a hook_style plate preset; see resolve_hook_style.)"""
     ss = {**DEFAULT_STYLE_SET, **(cfg.get("style_set") or {})}
-    palette = list(ss.get("accent_palette") or ["FFFFFF"])   # FIX 3: white-only fallback (no yellow)
+    palette = list(ss.get("accent_palette") or ["4E9A8F"])   # muted fallback (adaptive accent overrides)
     modes = list(ss.get("emphasis_modes") or ["color"])
     h = _style_hash(clip_id)
     accent_rgb = palette[h % len(palette)]
@@ -111,6 +113,68 @@ def resolve_clip_style(cfg, clip_id):
         "emphasis": modes[(h // 7) % len(modes)],
         "box_border": int(ss.get("box_border", 12)),
     }
+
+
+# --- adaptive, muted per-clip subtitle accent (FIX 1) --------------------------
+# The active/current karaoke word is tinted a per-clip accent CHOSEN FROM THE CLIP'S OWN
+# BACKGROUND: we sample the average colour of the footage over the clip window and pick a MUTED
+# tone that CONTRASTS with it (complementary hue) for readability. Saturation + brightness are
+# clamped so it can never come out neon / near-white, and the pure-yellow band is nudged away.
+# Each clip therefore gets a different, readable accent — never one fixed colour, never white.
+def sample_bg_color(source, start, end):
+    """Average RGB (0-255 tuple) of the clip window — a handful of frames scaled to 1x1 and
+    averaged — or None if ffmpeg/probe fails (then the accent falls back to a neutral choice).
+    This is the background the adaptive subtitle accent contrasts against."""
+    try:
+        dur = max(0.1, float(end) - float(start))
+    except (TypeError, ValueError):
+        return None
+    n = 6
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{start}", "-t", f"{round(dur, 3)}",
+           "-i", str(source), "-an", "-vf", "fps=2,scale=1:1",
+           "-frames:v", str(n), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    data = proc.stdout or b""
+    npx = len(data) // 3
+    if npx < 1:
+        return None
+    r = sum(data[i * 3] for i in range(npx)) / npx
+    g = sum(data[i * 3 + 1] for i in range(npx)) / npx
+    b = sum(data[i * 3 + 2] for i in range(npx)) / npx
+    return (r, g, b)
+
+
+def adaptive_accent(bg_rgb, cfg, seed=None):
+    """Pick a MUTED accent colour ('RRGGBB' hex) that contrasts with `bg_rgb` (0-255 tuple, or
+    None → neutral gray). Complementary hue for contrast + a small deterministic per-clip hue
+    nudge (so two clips over similar backgrounds still differ). Saturation and value are CLAMPED
+    into a muted band via config, so the result is never neon, never near-white, never pure yellow.
+
+    Config knobs (all overridable): subtitle_accent_max_saturation (upper sat cap),
+    subtitle_accent_min_value / subtitle_accent_max_value (brightness band)."""
+    max_sat = float(cfg.get("subtitle_accent_max_saturation", 0.55))
+    min_val = float(cfg.get("subtitle_accent_min_value", 0.45))
+    max_val = float(cfg.get("subtitle_accent_max_value", 0.80))
+    if bg_rgb is None:
+        br, bgc, bb = 0.5, 0.5, 0.5
+    else:
+        br, bgc, bb = [max(0.0, min(1.0, float(c) / 255.0)) for c in bg_rgb]
+    h, s, v = colorsys.rgb_to_hsv(br, bgc, bb)
+    nudge = (((_style_hash(seed) % 61) - 30) / 360.0) if seed is not None else 0.0
+    hue = (h + 0.5 + nudge) % 1.0                         # complementary + small per-clip variety
+    if 0.11 <= hue <= 0.19:                               # avoid the pure-yellow band (~40-70°)
+        hue = 0.08 if hue < 0.15 else 0.23                # → warm orange / green instead
+    # Muted saturation: a real tone (floor so it's not washed to near-white), capped so it can't
+    # go neon. Brightness contrasts the background (darker bg → lighter accent, and vice-versa),
+    # clamped inside the muted band so it never reaches near-white.
+    sat = max(0.30, min(max_sat, 0.42))
+    val = min_val if v >= 0.55 else max_val
+    val = max(min_val, min(max_val, val))
+    r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+    return "".join(f"{int(round(c * 255)):02X}" for c in (r, g, b))
 
 
 # --- cold-open restructure (the biggest hook lever) ----------------------------
@@ -864,14 +928,17 @@ def build_ass(events, cfg, banned, out_path, top_y, fx_events=None, style=None):
     accent = str(style.get("accent_ass") or cfg.get("subtitle_accent_color", "&H00FFFFFF&"))
     emphasis = str(style.get("emphasis", "color"))               # "color" (fill) | "box" (highlight)
     box_border = int(style.get("box_border", 12))
-    scale = int(cfg.get("subtitle_active_scale", 110))            # % upscale of the active word
+    scale = int(cfg.get("subtitle_active_scale", 102))            # % upscale of the active word (small)
+    spacing = int(cfg.get("subtitle_active_spacing", 4))          # px letter-spacing on the active word
     hold = float(cfg.get("subtitle_hold", 0.25))                  # linger after the last word
-    # The active-word override: color mode tints the FILL; box mode keeps the white fill but gives
-    # the word a thick accent BORDER so it reads as a highlighted/boxed word. Both upscale it.
+    sp = f"\\fsp{spacing}" if spacing else ""
+    # The active-word override (FIX 1): a SMALL upscale + letter-spacing so the word spreads out and
+    # POPS gently instead of clumping/ballooning. color mode tints the FILL the muted per-clip accent
+    # (black outline KEPT); box mode gives an accent BORDER instead. \r resets to the style default.
     if emphasis == "box":
-        active_open = f"{{\\3c{accent}\\bord{box_border}\\fscx{scale}\\fscy{scale}}}"
+        active_open = f"{{\\3c{accent}\\bord{box_border}\\fscx{scale}\\fscy{scale}{sp}}}"
     else:
-        active_open = f"{{\\c{accent}\\fscx{scale}\\fscy{scale}}}"
+        active_open = f"{{\\c{accent}\\fscx{scale}\\fscy{scale}{sp}}}"
     dialogues = []
     for li, line in enumerate(lines):
         toks = [w["tok"] for w in line]
@@ -1545,6 +1612,15 @@ def run(state):
         # colour + active-word emphasis mode. The HOOK is intentionally CONSTANT — plain white text
         # at the fixed TOP position — with only its plate/outline set by the hook_style preset.
         style = resolve_clip_style(cfg, c["moment_id"])
+        # FIX 1: choose a MUTED accent from THIS clip's own background so the active karaoke word
+        # contrasts + reads on the footage, different per clip (never one fixed colour / white).
+        if bool(cfg.get("subtitle_adaptive_accent", True)):
+            bg = sample_bg_color(src_path, start, end)
+            accent_rgb = adaptive_accent(bg, cfg, seed=c["moment_id"])
+            style["accent_rgb"] = accent_rgb
+            style["accent_ass"] = _rgb_to_ass(accent_rgb)
+            C.log(f"  accent [{c['moment_id']}]: #{accent_rgb} "
+                  f"({'sampled bg' if bg else 'neutral (no bg sample)'})")
         render_caption_png(c["caption"], cap_png, emoji=emoji_in_caption,
                            font_scale=hook_font_scale, text_color="white",
                            max_font=int(cfg.get("hook_max_font_size", HOOK_MAX_FONT)), **hook_style)

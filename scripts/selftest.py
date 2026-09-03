@@ -343,7 +343,7 @@ def t9_caption_text_fixes():
 
 
 def t10_reframe_and_palette():
-    """Pure-function coverage for the TRACK sharpness cap (FIX 1c) and white-only accent (FIX 3)."""
+    """Pure-function coverage for the TRACK sharpness cap (FIX 1c)."""
     import reframe                                     # imports without cv2 (heavy deps load lazily)
     cfg = {"track_subject_scale": 0.48, "track_max_upscale": 1.3}
     small = (640.0, 360.0, 300.0, 200.0, 0.0)          # bbox_h 300 on 720p → scale ~3.07 (too soft)
@@ -351,10 +351,35 @@ def t10_reframe_and_palette():
     record("T10 FIX1c small subject → blur_fill (plan None), large subject → crop",
            reframe._plan_crop(cfg, 1280, 720, small) is None
            and reframe._plan_crop(cfg, 1280, 720, big) is not None)
-    styles = [cut_stage.resolve_clip_style({}, cid) for cid in ("a", "b", "c", "d", "e", "f")]
-    record("T10 FIX3 karaoke accent is WHITE only (no bright accent)",
-           all(s["accent_rgb"] == "FFFFFF" for s in styles),
-           sorted({s["accent_rgb"] for s in styles}))
+
+
+def t11_adaptive_accent():
+    """FIX 1 — adaptive, MUTED, per-clip subtitle accent (sat/val clamped, never neon/near-white/
+    yellow), and it varies with the clip background (not one fixed colour)."""
+    import colorsys
+
+    def hsv(hx):
+        r, g, b = (int(hx[0:2], 16) / 255.0, int(hx[2:4], 16) / 255.0, int(hx[4:6], 16) / 255.0)
+        return colorsys.rgb_to_hsv(r, g, b)
+
+    cfg = {}
+    dark = cut_stage.adaptive_accent((15, 15, 25), cfg, seed="clipA")     # dark bg → lighter accent
+    bright = cut_stage.adaptive_accent((235, 235, 235), cfg, seed="clipA")  # bright bg → darker accent
+    muted = True
+    for hx in (dark, bright):
+        h, s, v = hsv(hx)
+        if s > 0.55 + 1e-6:                 # saturation capped → never neon
+            muted = False
+        if v > 0.80 + 1e-6 or v < 0.45 - 1e-6:   # brightness clamped → never near-white / too dark
+            muted = False
+        if 0.11 <= h <= 0.19:               # never in the pure-yellow band
+            muted = False
+    record("T11 FIX1 adaptive accent is muted (sat/val capped, not yellow)", muted, f"{dark}/{bright}")
+    # Different backgrounds → different accents (per-clip adaptivity, not one fixed colour / white).
+    a = cut_stage.adaptive_accent((200, 30, 30), cfg, seed="x")
+    b = cut_stage.adaptive_accent((30, 30, 200), cfg, seed="x")
+    record("T11 FIX1 accent varies with background (not one fixed colour)",
+           a != b and a != "FFFFFF" and b != "FFFFFF", f"{a} vs {b}")
 
 
 def t4_full_pipeline(synth, watermark_path, brief_path):
@@ -409,6 +434,7 @@ def main():
     t8_restriction_kill_set()
     t9_caption_text_fixes()
     t10_reframe_and_palette()
+    t11_adaptive_accent()
 
     if synth is not None:
         t4_full_pipeline(synth, watermark, brief)

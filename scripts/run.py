@@ -173,15 +173,19 @@ DEFAULT_CONFIG = {
                                    # VFR concat-seam stutter on cold-open→setup transitions
     "emoji_in_caption": True,      # flzsh DNA: keep emoji as caption punctuation
     "subtitles_enabled": True,     # burn word-level karaoke spoken-word subtitles (ASS/libass)
-    # Karaoke subtitle look (lower-center, ASS/libass). The active (currently-spoken) word pops by
-    # SCALE (upscale), then reverts as the next word speaks. Captions/subtitles are WHITE ONLY with
-    # a strong black outline — no colored accent (FIX 3: cyan then yellow removed).
-    # NOTE: per-clip emphasis-mode variety still comes from the STYLE-SET in cut.py
-    # (DEFAULT_STYLE_SET, resolve_clip_style); the palette is white only. Override per account via
-    # config "style_set": {...}. subtitle_accent_color below is only the FALLBACK when none applies.
-    "subtitle_accent_color": "&H00FFFFFF&",  # FALLBACK active-word colour: WHITE (ASS &HAABBGGRR)
-                                   # + the strong black outline. No bright accent anywhere.
-    "subtitle_active_scale": 110,  # % upscale applied to the active word (the "pop")
+    # Karaoke subtitle look (lower-center, ASS/libass). The active (currently-spoken) word pops with
+    # a SMALL upscale + letter-spacing (spread, not clumped) and is tinted a MUTED per-clip ACCENT
+    # (FIX 1): the accent is sampled from THAT clip's background and made to contrast (complementary
+    # hue), then clamped so it can never be neon / near-white / pure-yellow. Non-active words stay
+    # white; ALL words keep the strong black outline. Each clip gets its own accent, not one fixed
+    # colour. Override per account via config "style_set": {...}.
+    "subtitle_adaptive_accent": True,  # sample the clip bg and pick a muted contrasting accent per clip
+    "subtitle_accent_max_saturation": 0.55,  # HSV sat cap on the accent (never neon)
+    "subtitle_accent_min_value": 0.45,       # HSV value floor (never too dark to read)
+    "subtitle_accent_max_value": 0.80,       # HSV value ceiling (never near-white)
+    "subtitle_accent_color": "&H00FFFFFF&",  # legacy FALLBACK active-word colour when adaptive is off
+    "subtitle_active_scale": 102,  # % upscale applied to the active word (SMALL — a gentle pop, not a balloon)
+    "subtitle_active_spacing": 4,  # px letter-spacing on the active word so it spreads out, not clumped
     "subtitle_ass_fontsize": 54,   # subtitle font size at 1080x1920 output res
     "subtitle_pause_gap": 0.1,    # sec of silence between words that starts a NEW karaoke line
                                    # (breaks on the speaker's natural pauses, even mid-cap)
