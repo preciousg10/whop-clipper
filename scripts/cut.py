@@ -53,15 +53,14 @@ SUBTITLE_CENTER_Y = 1440      # ~75% down: in the lower black band, off the vide
 # within good bounds, not chaos.
 DEFAULT_STYLE_SET = {
     "name": "flzsh_default",
-    # Active-word accent palette (RGB hex; converted to ASS &HBBGGRR at use). Deliberately CLEAN
-    # and readable, NOT garish: WHITE is the default (relies on the strong black outline to pop),
-    # bright YELLOW is the one bolder accent that clearly reads on any footage. Cyan / deep-sky-blue
-    # / neon lime / hot-pink / orange were REMOVED (FIX 6): cyan looked bad on light footage and the
-    # neons read as garish. White + yellow only.
-    "accent_palette": ["FFFFFF", "FFFF00"],
-    #                   white     yellow
-    # Active-word emphasis: "color" = accent FILL (current look); "box" = accent HIGHLIGHT behind
-    # the word (a THIN accent border/halo reads as a clean highlight around it — not a heavy box).
+    # Active-word accent palette (RGB hex; converted to ASS &HBBGGRR at use). WHITE ONLY (FIX 3):
+    # every colored accent was removed — cyan first, then yellow and anything bright. Captions and
+    # subtitles are WHITE with the strong black outline, and the active (currently-spoken) word pops
+    # purely by scale, not colour. No colored accent words anywhere.
+    "accent_palette": ["FFFFFF"],
+    #                   white
+    # Active-word emphasis: "color" = accent FILL (now white == base, so the pop is the scale-up);
+    # "box" = a thin accent BORDER (also white). Both stay white — no bright accent.
     "emphasis_modes": ["color", "box"],
     "box_border": 5,              # accent border thickness (px @ output res) for "box" mode
 }
@@ -102,7 +101,7 @@ def resolve_clip_style(cfg, clip_id):
     so a batch spreads across the palette / modes instead of moving in lockstep. (The HOOK is NOT
     styled here — it's constant white/top with a hook_style plate preset; see resolve_hook_style.)"""
     ss = {**DEFAULT_STYLE_SET, **(cfg.get("style_set") or {})}
-    palette = list(ss.get("accent_palette") or ["FFFF00"])
+    palette = list(ss.get("accent_palette") or ["FFFFFF"])   # FIX 3: white-only fallback (no yellow)
     modes = list(ss.get("emphasis_modes") or ["color"])
     h = _style_hash(clip_id)
     accent_rgb = palette[h % len(palette)]

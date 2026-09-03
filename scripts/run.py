@@ -173,16 +173,14 @@ DEFAULT_CONFIG = {
                                    # VFR concat-seam stutter on cold-open→setup transitions
     "emoji_in_caption": True,      # flzsh DNA: keep emoji as caption punctuation
     "subtitles_enabled": True,     # burn word-level karaoke spoken-word subtitles (ASS/libass)
-    # Karaoke subtitle look (lower-center, ASS/libass). The active (currently-spoken) word
-    # pops in the accent colour + upscale, then reverts as the next word speaks. Accent is a
-    # per-account/config value in ASS &HBBGGRR order (reversed hex) — default punchy yellow.
-    # NOTE: per-clip VARIETY (accent colour, active-word emphasis mode, hook position) now comes
-    # from the named STYLE-SET in cut.py (DEFAULT_STYLE_SET, resolve_clip_style), rotated
-    # deterministically per clip. Override the whole set per account/category via config
-    # "style_set": {...}. subtitle_accent_color below is only the FALLBACK when no style-set applies.
-    "subtitle_accent_color": "&H00FFFFFF&",  # FALLBACK active-word colour when no style-set applies:
-                                   # WHITE (ASS &HAABBGGRR) + the strong black outline. Cyan removed
-                                   # (FIX 6). The per-clip palette (cut.DEFAULT_STYLE_SET) is white/yellow.
+    # Karaoke subtitle look (lower-center, ASS/libass). The active (currently-spoken) word pops by
+    # SCALE (upscale), then reverts as the next word speaks. Captions/subtitles are WHITE ONLY with
+    # a strong black outline — no colored accent (FIX 3: cyan then yellow removed).
+    # NOTE: per-clip emphasis-mode variety still comes from the STYLE-SET in cut.py
+    # (DEFAULT_STYLE_SET, resolve_clip_style); the palette is white only. Override per account via
+    # config "style_set": {...}. subtitle_accent_color below is only the FALLBACK when none applies.
+    "subtitle_accent_color": "&H00FFFFFF&",  # FALLBACK active-word colour: WHITE (ASS &HAABBGGRR)
+                                   # + the strong black outline. No bright accent anywhere.
     "subtitle_active_scale": 110,  # % upscale applied to the active word (the "pop")
     "subtitle_ass_fontsize": 54,   # subtitle font size at 1080x1920 output res
     "subtitle_pause_gap": 0.1,    # sec of silence between words that starts a NEW karaoke line
