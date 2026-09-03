@@ -254,9 +254,10 @@ def decide_track(video_path, cfg, detectors, n_samples=14, window=None):
 
 
 def _measure_subject(cap, detectors, n=14):
-    """Sample the clip and return the MEDIAN subject bbox (cx, cy, h, w) — used to size the crop
-    ONCE per clip so the zoom stays fixed (no per-frame pulsing). The WIDTH is carried so the crop
-    can guarantee horizontal padding (FIX 1: never clip a wide subject at the edges). None if no
+    """Sample the clip and return the MEDIAN subject bbox plus its horizontal MOTION:
+    (cx, cy, h, w, motion_px). The median sizes the crop ONCE per clip (fixed zoom, no pulsing);
+    motion_px = the std-dev of the subject's horizontal center across samples, so a mostly-static
+    talking head can be given a LOCKED crop (no per-frame chasing = no jitter, FIX 1). None if no
     subject sampled. Rewinds the capture to the start when done."""
     import cv2
     import numpy as np
@@ -273,7 +274,9 @@ def _measure_subject(cap, detectors, n=14):
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     if not hs:
         return None
-    return float(np.median(cxs)), float(np.median(cys)), float(np.median(hs)), float(np.median(ws))
+    motion = float(np.std(cxs)) if len(cxs) > 1 else 0.0
+    return (float(np.median(cxs)), float(np.median(cys)), float(np.median(hs)),
+            float(np.median(ws)), motion)
 
 
 def _plan_crop(cfg, fw, fh, subj):
@@ -286,22 +289,22 @@ def _plan_crop(cfg, fw, fh, subj):
     (a webcam close-up), we can't crop 'wider than the source', so we scale a full-height 9:16 crop
     DOWN and letterbox it on a blurred background — giving the looser framing the crop alone can't.
 
-    Returns dict: {letterbox, crop_w, crop_h, y0, fg_h}."""
+    Returns dict {letterbox, crop_w, crop_h, y0, fg_h}, or None when TRACK would UPSCALE the
+    subject beyond native resolution (soft/blurry) — the caller then falls back to blur_fill, which
+    keeps the subject SHARP (FIX 1c: sharpness over centering)."""
     target = min(0.95, max(0.30, float(cfg.get("track_subject_scale", 0.48))))
-    _, cy, bbox_h, bbox_w = subj
+    max_upscale = max(1.0, float(cfg.get("track_max_upscale", 1.3)))
+    cy, bbox_h = subj[1], subj[2]
     scale = target * H / max(1.0, bbox_h)              # output px per source px
+    # FIX 1c — UPSCALE CAP: `scale` is how much TRACK enlarges the subject. Above `max_upscale` the
+    # crop is pushed past the source's native detail (720p → 1080p+) and reads soft. A small subject
+    # (seated podcast) hits this — so we bail to blur_fill (sharp, downscaled) instead of shipping a
+    # blurry upscaled crop. No wide-crop "padding guard" any more — a slightly tighter SHARP crop
+    # beats a wide upscaled one.
+    if scale > max_upscale:
+        return None
     crop_w_want = int(round(W / scale))                # 9:16 source window that hits the target
     crop_h_want = int(round(H / scale))
-    # FIX 1 — HORIZONTAL PADDING GUARD: the height-driven window can still be narrower than a WIDE
-    # subject (arms out / turned / broad shoulders), clipping them at the left/right edge. Ensure
-    # the subject width fills at most `track_max_subject_width` of the crop; if not, widen the crop
-    # (and its height, to hold 9:16) so the person keeps side padding and is never cut off.
-    max_w_frac = min(0.95, max(0.40, float(cfg.get("track_max_subject_width", 0.80))))
-    min_crop_w = bbox_w / max_w_frac
-    if bbox_w > 0 and crop_w_want < min_crop_w:
-        grow = min_crop_w / crop_w_want
-        crop_w_want = int(round(crop_w_want * grow))
-        crop_h_want = int(round(crop_h_want * grow))
     if crop_h_want <= fh and crop_w_want <= fw:
         # fits: crop the window directly, positioned on the subject with a little headroom.
         crop_h, crop_w = crop_h_want, crop_w_want
@@ -333,19 +336,35 @@ def track_reframe(content_mp4, out_mp4, cfg, detectors, fps=30):
         return False
     subj = _measure_subject(cap, detectors)
     if subj is None:                                   # no subject found — nothing to track
-        # neutral: ~full-height framing, mid-width subject (cx, cy, h, w)
-        subj = (fw / 2.0, fh / 2.0, fh * 0.90, fw * 0.50)
+        # neutral: ~full-height framing, mid-width subject (cx, cy, h, w, motion)
+        subj = (fw / 2.0, fh / 2.0, fh * 0.90, fw * 0.50, 0.0)
     plan = _plan_crop(cfg, fw, fh, subj)
+    if plan is None:                                   # would upscale beyond native → blur_fill is sharper
+        cap.release()
+        C.log("    TRACK: subject too small — a crop would upscale past native (soft); "
+              "using blur_fill (sharper) for this clip.")
+        return False
     crop_w, crop_h, y0, letterbox, fg_h = (
         plan["crop_w"], plan["crop_h"], plan["y0"], plan["letterbox"], plan["fg_h"])
     if crop_w >= fw and not letterbox:                 # nothing to crop horizontally → not useful
         cap.release()
         return False
+    # FIX 1a — STATIC vs TRACKED. A mostly-static talking head (subject not moving across the frame)
+    # gets a LOCKED crop centred on the subject: NO per-frame chasing, so no left/right jitter on
+    # small arm/hand movements. Only a subject that actually moves across the frame is tracked, and
+    # then with STRONG smoothing (FIX 1b) so small movements still don't shift the crop.
+    subj_cx = float(subj[0])
+    motion_frac = float(subj[4]) / max(1.0, float(fw))
+    static = motion_frac < float(cfg.get("track_static_motion", 0.02))
+    x0_fixed = int(round(min(max(subj_cx - crop_w / 2.0, 0.0), fw - crop_w)))
     cam = SmoothedCameraman(
         fw, crop_w,
-        safe_ratio=float(cfg.get("track_safe_zone", 0.35)),
-        smooth=float(cfg.get("track_smooth", 0.12)),
-        max_pan=float(cfg.get("track_max_pan", 12.0)))
+        safe_ratio=float(cfg.get("track_safe_zone", 0.55)),
+        smooth=float(cfg.get("track_smooth", 0.06)),
+        max_pan=float(cfg.get("track_max_pan", 8.0)))
+    if static:
+        C.log(f"    TRACK: static subject (motion {motion_frac:.3f} < "
+              f"{float(cfg.get('track_static_motion', 0.02)):.3f}) → FIXED crop, no chasing (no jitter).")
     detect_every = max(1, int(cfg.get("track_detect_every", 3)))
     fg_y = (H - fg_h) // 2                              # letterbox: vertical offset of the fg
 
@@ -363,11 +382,14 @@ def track_reframe(content_mp4, out_mp4, cfg, detectors, fps=30):
             ok, frame = cap.read()
             if not ok:
                 break
-            if fi % detect_every == 0:
-                s = detectors.subject(frame)
-                if s is not None:
-                    last_subject = s[0]                  # subject center x (crop size is fixed)
-            x0 = cam.update(last_subject)
+            if static:
+                x0 = x0_fixed                            # locked — no per-frame chasing, no jitter
+            else:
+                if fi % detect_every == 0:
+                    s = detectors.subject(frame)
+                    if s is not None:
+                        last_subject = s[0]              # subject center x (crop size is fixed)
+                x0 = cam.update(last_subject)
             region = frame[y0:y0 + crop_h, x0:x0 + crop_w]
             if not letterbox:
                 out = cv2.resize(region, (W, H), interpolation=cv2.INTER_LINEAR)
