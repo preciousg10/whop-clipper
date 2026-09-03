@@ -73,6 +73,24 @@ BAIT_RE = re.compile(
     r"the reason (why|is why)|wait ?(til+|till) you (see|hear) what|"
     r"number \w+ will (shock|surprise))\b", re.I)
 
+# GENERIC FILLER HOOKS (FIX 5): a whole caption that is ONLY a generic filler — no clip content at
+# all ("what is happening", "this is crazy", "nah this is wild", "no way"). Anchored ^…$ so it
+# matches ONLY a caption that is entirely filler; a clip-specific line ("no way melatonin does
+# that") is NOT caught. When only these survive we FORCE a synthesized clip-specific hook instead.
+GENERIC_FILLER_RE = re.compile(
+    r"^\W*(?:"
+    r"what(?:'?s| is)?\s+(?:happening|going\s+on|even\s+(?:happening|going\s+on))|"
+    r"this\s+is\s+(?:crazy|wild|insane|nuts|mad|unreal|actually\s+crazy|so\s+(?:crazy|wild|insane))|"
+    r"(?:nah\s+)?this\s+is\s+(?:so\s+)?(?:crazy|wild|insane|unserious|diabolical)|"
+    r"nah\s+this\s+is\s+(?:wild|crazy|actually\s+crazy|insane|nuts|unreal)|"
+    r"(?:nah\s+)?(?:this|that)\s+can'?t\s+be\s+real|"
+    r"no\s+way|no\s+shot|so\s+(?:crazy|wild|unserious)|peak\s+chaos|this\s+is\s+peak\s+\w+|"
+    r"why\s+(?:did|does|is)\s+this\s+(?:even\s+)?(?:happen|happening|real|so\s+\w+)|"
+    r"how\s+is\s+this\s+(?:even\s+)?real|you\s+(?:have|need)\s+to\s+see\s+this|"
+    r"wait\s+for\s+(?:it|the\s+end)|tell\s+me\s+why\s+this\s+happened|"
+    r"the\s+way\s+this\s+ends(?:\s+is\s+\w+)?|watch\s+(?:this|till\s+the\s+(?:very\s+)?end)"
+    r")\W*$", re.I)
+
 # --- hook GROUNDING (Task 2: no invented / mis-transcribed nouns) --------------
 # A hook must be about what THIS clip actually contains. A hook may freely use structural
 # hook words + generic reactions (below); but any OTHER content word must appear in the
@@ -952,21 +970,28 @@ def _generic_caption(cands, banned, event, m, hook_prefix_use, hook_prefix_cap, 
     """The default flzsh five-hook caption path: banned + quality + grounding gauntlets, then
     pick the best specific hook under the batch-variety cap. Returns (best, variant, killed).
     Used when the campaign has NO required onscreen-text format."""
+    # GROUNDING (Task 2): a hook may only be specific about words in THIS moment's transcript. Only
+    # enforced when we actually have transcript to ground on — also gates the generic-filler kill.
+    tvocab = _transcript_vocab(event)
+    enforce_ground = len(tvocab) >= 3
     # gauntlet 1: banned words (HARD — these can never ship)
     banned_clean, killed = gauntlet(cands, banned)
-    # gauntlet 2: quality (max 8 words, no describing, single line, has a hook)
+    # gauntlet 2: quality (max 8 words, no describing, single line, has a hook) + generic-filler
+    # kill (FIX 5): when we have a transcript to be specific about, a whole-caption generic filler
+    # ("what is happening", "this is crazy") is never acceptable — kill it so only a clip-specific
+    # hook (or a synthesized one) can win.
     kept = []
     for c in banned_clean:
         reason = quality_kill(c)
+        if not reason and enforce_ground and GENERIC_FILLER_RE.match(c):
+            reason = "generic filler hook (forcing a clip-specific hook)"
         if reason:
             killed.append({"caption": c, "reason": reason})
         else:
             kept.append(c)
-    # GROUNDING (Task 2): a hook may only be specific about words that are in THIS moment's
-    # transcript. Drop candidates that name something invented/mis-transcribed. Only enforced
-    # when we actually have transcript to ground on.
-    tvocab = _transcript_vocab(event)
-    enforce_ground = len(tvocab) >= 3
+    # Also drop generic fillers from the raw banned_clean pool so no deep fallback can surface one.
+    if enforce_ground:
+        banned_clean = [c for c in banned_clean if not GENERIC_FILLER_RE.match(c)]
 
     def _grounded_only(cs):
         if not enforce_ground:
@@ -993,6 +1018,12 @@ def _generic_caption(cands, banned, event, m, hook_prefix_use, hook_prefix_cap, 
         C.warn(f"moment {m['id']}: no hook-passing caption — using best grounded, clip-specific "
                f"Groq line (specific + accurate over a template).")
         pool = clean_gs
+    elif specific_fb:
+        # FIX 5: only generic / non-clip-specific candidates survived → FORCE a clip-specific hook
+        # synthesized from THIS clip's transcript noun, rather than shipping a generic hook.
+        C.warn(f"moment {m['id']}: only generic/non-specific candidates survived — FORCING a "
+               f"clip-specific hook synthesized from the transcript (FIX 5).")
+        pool = specific_fb
     elif kept_g:
         pool = kept_g                                    # grounded + hook-passing (no explicit term)
     elif kept:
@@ -1001,12 +1032,6 @@ def _generic_caption(cands, banned, event, m, hook_prefix_use, hook_prefix_cap, 
         C.warn(f"moment {m['id']}: no candidate hit a hook pattern — keeping best raw "
                f"Groq caption (specific to the clip) over a generic template.")
         pool = banned_clean
-    elif specific_fb:
-        # Every real Groq candidate was killed → synthesize a GRAMMATICAL hook from a clean
-        # transcript noun (real lines are preferred above; this only fires when there are none).
-        C.warn(f"moment {m['id']}: all Groq candidates killed — synthesizing a grammatical hook "
-               f"from a transcript noun.")
-        pool = specific_fb
     elif not enforce_ground and generic_fb:
         # no transcript to be specific about (text-less audio spike) → a GRAMMATICAL generic hook.
         C.warn(f"moment {m['id']}: no transcript to build a specific hook — generic curiosity hook.")
