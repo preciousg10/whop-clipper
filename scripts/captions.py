@@ -908,19 +908,25 @@ def _strip_symbols(text):
     return re.sub(r"\s{2,}", " ", ascii_only).strip()
 
 
+_TITLE_SEP_RE = re.compile(r"([\s\-/]+)")   # word separators for Title Case (space, hyphen, slash)
+
+
 def titlecase(text):
-    """Title Case (Like This): capitalize the first letter of each word, leaving the rest of
-    the word untouched so contractions and emoji survive ("don't" -> "Don't", "😭fire" ->
-    "😭Fire", a masked "b**" -> "B**"). A leading number leaves the word alone ("10v1").
-    This is the user-preferred caption/subtitle casing — it OVERRIDES the old lowercase
-    default (kept as a single choke point so both the hook caption and burned subtitles
-    agree)."""
-    def cap(word):
-        for i, ch in enumerate(word):
+    """Title Case (Like This): capitalize the first letter of each word, leaving the rest of the
+    word untouched so contractions and emoji survive ("don't" -> "Don't", "😭fire" -> "😭Fire", a
+    masked "b**" -> "B**"). Word boundaries include HYPHENS and SLASHES, so hyphenated compounds and
+    names are properly capitalized too — "night-and-day" -> "Night-And-Day", "mr beast" -> "Mr
+    Beast", "mr-beast" -> "Mr-Beast" (FIX 4). A leading number leaves the word alone ("10v1").
+    This is the user-preferred caption/subtitle casing (single choke point for both the hook caption
+    and burned subtitles)."""
+    def cap_seg(seg):
+        for i, ch in enumerate(seg):
             if ch.isalnum():
-                return (word[:i] + ch.upper() + word[i + 1:]) if ch.isalpha() else word
-        return word
-    return " ".join(cap(w) for w in (text or "").split())
+                return (seg[:i] + ch.upper() + seg[i + 1:]) if ch.isalpha() else seg
+        return seg
+    # split keeping the separators; capitalize each non-separator segment
+    return "".join(p if _TITLE_SEP_RE.fullmatch(p) else cap_seg(p)
+                   for p in _TITLE_SEP_RE.split(text or ""))
 
 
 def finalize_caption(text, emoji_in_caption=True):
