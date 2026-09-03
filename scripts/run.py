@@ -185,10 +185,11 @@ DEFAULT_CONFIG = {
     # hue), then clamped so it can never be neon / near-white / pure-yellow. Non-active words stay
     # white; ALL words keep the strong black outline. Each clip gets its own accent, not one fixed
     # colour. Override per account via config "style_set": {...}.
-    "subtitle_adaptive_accent": True,  # sample the clip bg and pick a muted contrasting accent per clip
-    "subtitle_accent_max_saturation": 0.55,  # HSV sat cap on the accent (never neon)
-    "subtitle_accent_min_value": 0.45,       # HSV value floor (never too dark to read)
-    "subtitle_accent_max_value": 0.80,       # HSV value ceiling (never near-white)
+    "subtitle_adaptive_accent": True,  # sample the clip bg and pick a full contrasting accent per clip
+    "subtitle_accent_min_saturation": 0.55,  # HSV sat FLOOR — keeps it a real colour, not a pale pastel
+    "subtitle_accent_max_saturation": 0.75,  # HSV sat cap on the accent (never neon)
+    "subtitle_accent_min_value": 0.50,       # HSV value floor (mid band — never muddy-dark)
+    "subtitle_accent_max_value": 0.72,       # HSV value ceiling (mid band — never near-white / pale)
     "subtitle_accent_color": "&H00FFFFFF&",  # legacy FALLBACK active-word colour when adaptive is off
     "subtitle_active_scale": 102,  # % upscale applied to the active word (SMALL — a gentle pop, not a balloon)
     "subtitle_active_spacing": 0,  # px letter-spacing on the active word (0 = normal/default spacing)

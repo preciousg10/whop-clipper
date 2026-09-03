@@ -354,8 +354,9 @@ def t10_reframe_and_palette():
 
 
 def t11_adaptive_accent():
-    """FIX 1 — adaptive, MUTED, per-clip subtitle accent (sat/val clamped, never neon/near-white/
-    yellow), and it varies with the clip background (not one fixed colour)."""
+    """FIX 1 — adaptive, per-clip subtitle accent: a FULL real colour (sat floored so it's not a
+    pale pastel, capped so it's never neon; value in a mid band so it's never near-white/muddy;
+    never pure yellow), varying with the clip background (not one fixed colour)."""
     import colorsys
 
     def hsv(hx):
@@ -365,16 +366,18 @@ def t11_adaptive_accent():
     cfg = {}
     dark = cut_stage.adaptive_accent((15, 15, 25), cfg, seed="clipA")     # dark bg → lighter accent
     bright = cut_stage.adaptive_accent((235, 235, 235), cfg, seed="clipA")  # bright bg → darker accent
-    muted = True
+    full = True
+    eps = 0.01                                   # 8-bit round-trip quantization slack (~1/255)
     for hx in (dark, bright):
         h, s, v = hsv(hx)
-        if s > 0.55 + 1e-6:                 # saturation capped → never neon
-            muted = False
-        if v > 0.80 + 1e-6 or v < 0.45 - 1e-6:   # brightness clamped → never near-white / too dark
-            muted = False
-        if 0.11 <= h <= 0.19:               # never in the pure-yellow band
-            muted = False
-    record("T11 FIX1 adaptive accent is muted (sat/val capped, not yellow)", muted, f"{dark}/{bright}")
+        if s < 0.55 - eps or s > 0.75 + eps:     # sat floored (not pale) AND capped (not neon)
+            full = False
+        if v < 0.50 - eps or v > 0.72 + eps:     # value in the mid band (not near-white, not muddy)
+            full = False
+        if 0.11 <= h <= 0.19:                    # never in the pure-yellow band
+            full = False
+    record("T11 FIX1 adaptive accent is a full colour (sat floored+capped, mid value, not yellow)",
+           full, f"{dark}/{bright}")
     # Different backgrounds → different accents (per-clip adaptivity, not one fixed colour / white).
     a = cut_stage.adaptive_accent((200, 30, 30), cfg, seed="x")
     b = cut_stage.adaptive_accent((30, 30, 200), cfg, seed="x")

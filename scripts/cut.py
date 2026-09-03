@@ -148,16 +148,20 @@ def sample_bg_color(source, start, end):
 
 
 def adaptive_accent(bg_rgb, cfg, seed=None):
-    """Pick a MUTED accent colour ('RRGGBB' hex) that contrasts with `bg_rgb` (0-255 tuple, or
-    None → neutral gray). Complementary hue for contrast + a small deterministic per-clip hue
-    nudge (so two clips over similar backgrounds still differ). Saturation and value are CLAMPED
-    into a muted band via config, so the result is never neon, never near-white, never pure yellow.
+    """Pick an accent colour ('RRGGBB' hex) that contrasts with `bg_rgb` (0-255 tuple, or None →
+    neutral gray). Complementary hue for contrast + a small deterministic per-clip hue nudge (so
+    two clips over similar backgrounds still differ). The accent is a FULL, real colour — a proper
+    teal / blue / amber, not a pale milky pastel and not a neon: saturation sits at a fuller target
+    inside [min_sat, max_sat] and value in a MID band, both CLAMPED via config so it can never come
+    out washed-out, neon, near-white, or pure yellow.
 
-    Config knobs (all overridable): subtitle_accent_max_saturation (upper sat cap),
-    subtitle_accent_min_value / subtitle_accent_max_value (brightness band)."""
-    max_sat = float(cfg.get("subtitle_accent_max_saturation", 0.55))
-    min_val = float(cfg.get("subtitle_accent_min_value", 0.45))
-    max_val = float(cfg.get("subtitle_accent_max_value", 0.80))
+    Config knobs (all overridable): subtitle_accent_min_saturation / subtitle_accent_max_saturation
+    (the saturation floor + cap) and subtitle_accent_min_value / subtitle_accent_max_value (the
+    mid-brightness band)."""
+    min_sat = float(cfg.get("subtitle_accent_min_saturation", 0.55))
+    max_sat = float(cfg.get("subtitle_accent_max_saturation", 0.75))
+    min_val = float(cfg.get("subtitle_accent_min_value", 0.50))
+    max_val = float(cfg.get("subtitle_accent_max_value", 0.72))
     if bg_rgb is None:
         br, bgc, bb = 0.5, 0.5, 0.5
     else:
@@ -167,11 +171,12 @@ def adaptive_accent(bg_rgb, cfg, seed=None):
     hue = (h + 0.5 + nudge) % 1.0                         # complementary + small per-clip variety
     if 0.11 <= hue <= 0.19:                               # avoid the pure-yellow band (~40-70°)
         hue = 0.08 if hue < 0.15 else 0.23                # → warm orange / green instead
-    # Muted saturation: a real tone (floor so it's not washed to near-white), capped so it can't
-    # go neon. Brightness contrasts the background (darker bg → lighter accent, and vice-versa),
-    # clamped inside the muted band so it never reaches near-white.
-    sat = max(0.30, min(max_sat, 0.42))
-    val = min_val if v >= 0.55 else max_val
+    # FULL saturation target (0.65) clamped to [min_sat, max_sat]: the floor keeps it from washing
+    # out to a pale pastel, the cap keeps it below neon. Value in a MID band (contrasting the bg —
+    # darker bg → the higher end, brighter bg → the lower end) so it reads as a real colour, never
+    # near-white and never muddy-dark.
+    sat = max(min_sat, min(max_sat, 0.65))
+    val = min_val if v >= 0.55 else max_val              # bright bg → darker accent, dark bg → lighter
     val = max(min_val, min(max_val, val))
     r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
     return "".join(f"{int(round(c * 255)):02X}" for c in (r, g, b))
