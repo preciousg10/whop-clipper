@@ -155,6 +155,12 @@ DEFAULT_CONFIG = {
     "clip_sentence_grace_seconds": 4,  # FIX 4: how far past clip_max the END may extend to finish
                                    # the sentence in progress (land on a speech boundary, not a
                                    # hard time cap mid-word). 0 disables the sentence-snap.
+    # FIX 2: after the last spoken word, extend the clip END to the next point where the SOURCE
+    # AUDIO actually goes quiet (real RMS/silencedetect, not transcript times) and cut a beat into
+    # that silence — the speaker fully finishes + a moment of quiet, never a mid-word chop. Bounded
+    # by clip_max + sentence_grace. clip_trailing_silence_seconds = the required quiet duration.
+    "clip_trailing_silence_seconds": 0.4,  # required trailing silence after the last word (0 disables)
+    "clip_silence_noise": "-32dB",         # silencedetect noise floor for the trailing-silence scan
     "min_separation_seconds": 60,  # min gap between two selected moments (same source)
     "merge_gap_seconds": 7,        # merge moments closer than this into one (was 15 —
                                    # chained non-stop commentary into 400-550s blobs)

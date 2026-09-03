@@ -382,6 +382,36 @@ def t11_adaptive_accent():
            a != b and a != "FFFFFF" and b != "FFFFFF", f"{a} vs {b}")
 
 
+def t12_silence_end():
+    """FIX 2 — end the clip on ACTUAL AUDIO SILENCE after the last word, a beat into the quiet,
+    never mid-word; capped at clip_max + grace. Stub ffmpeg silencedetect with a canned quiet gap."""
+    def _stub(canned):
+        class _P:
+            stderr = canned
+        return lambda *a, **k: _P()
+
+    orig = cut_stage.subprocess.run
+    try:
+        cfg = {"clip_trailing_silence_seconds": 0.4, "clip_sentence_grace_seconds": 4}
+        # near silence: scan starts at end-0.3=9.7; silence_start 2.0 → abs 11.7; cut = 11.7+0.4=12.1
+        cut_stage.subprocess.run = _stub("silence_start: 2.00\nsilence_end: 3.50\n")
+        new_end = cut_stage.snap_end_to_silence("x.mp4", 0.0, 10.0, 30.0, 60.0, 1, cfg)
+        record("T12 FIX2 end extends to a beat into trailing silence (never mid-word)",
+               11.9 <= new_end <= 12.3, f"end 10.0 → {new_end}")
+        # far silence: ceiling = start+cmax+grace = 0+5+4 = 9.0; a silence past it clamps to 9.0.
+        cut_stage.subprocess.run = _stub("silence_start: 10.00\nsilence_end: 12.00\n")
+        capped = cut_stage.snap_end_to_silence("x.mp4", 0.0, 5.0, 5.0, 60.0, 1, cfg)
+        record("T12 FIX2 respects clip_max + grace ceiling",
+               abs(capped - 9.0) < 1e-6, f"→ {capped} (ceiling 9.0)")
+        # trailing=0 disables the silence snap (end unchanged).
+        cut_stage.subprocess.run = _stub("")
+        off = cut_stage.snap_end_to_silence("x.mp4", 0.0, 10.0, 30.0, 60.0, 1,
+                                            {"clip_trailing_silence_seconds": 0})
+        record("T12 FIX2 disabled when trailing=0 (end unchanged)", off == 10.0, f"→ {off}")
+    finally:
+        cut_stage.subprocess.run = orig
+
+
 def t4_full_pipeline(synth, watermark_path, brief_path):
     reset_campaign()
     run_intake(brief_path, [synth, watermark_path], "WTF Leagues Selftest")
@@ -435,6 +465,7 @@ def main():
     t9_caption_text_fixes()
     t10_reframe_and_palette()
     t11_adaptive_accent()
+    t12_silence_end()
 
     if synth is not None:
         t4_full_pipeline(synth, watermark, brief)

@@ -1102,6 +1102,58 @@ def snap_end_to_sentence(transcript, start, end, cmax, duration, grace=4.0, tol=
     return end
 
 
+def snap_end_to_silence(source, start, end, cmax, duration, n_audio, cfg):
+    """End the clip on ACTUAL AUDIO SILENCE, not just a transcript timestamp (FIX 2).
+
+    Transcript word/segment times stop at the last WORD and omit the trailing breath/pause, so a
+    pure-transcript end still clips the speaker mid-finish. This measures the REAL source audio
+    (ffmpeg silencedetect / RMS): it scans from just before `end` forward for the first point where
+    the audio goes quiet for at least `clip_trailing_silence_seconds`, and ends the clip a beat INTO
+    that silence — the speaker fully finishes, a moment of quiet, then the cut. We never end while
+    audio is still active (a silence must actually begin at/after the last word).
+
+    clip_max_seconds is the ceiling: the scan may reach up to clip_max + sentence_grace (never past
+    the source end), but prefers the natural silence within it. Returns the possibly-extended end;
+    unchanged when no clean trailing silence is reachable or the audio probe fails."""
+    trailing = float(cfg.get("clip_trailing_silence_seconds", 0.4))
+    if trailing <= 0:
+        return end
+    grace = float(cfg.get("clip_sentence_grace_seconds", 4))
+    noise = str(cfg.get("clip_silence_noise", "-32dB"))
+    hard = min(float(duration), float(start) + float(cmax) + grace)      # ceiling (clip_max + grace)
+    scan_lo = max(float(start), float(end) - 0.3)                        # a hair before the last word
+    scan_hi = min(hard + trailing + 0.5, float(duration))
+    length = scan_hi - scan_lo
+    if length < 0.2:
+        return end
+    base = ["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{scan_lo}", "-t", f"{round(length, 3)}",
+            "-i", str(source)]
+    sd = f"silencedetect=noise={noise}:d={trailing}"
+    if n_audio and n_audio >= 2:                        # measure the MERGED audio (all tracks)
+        labels = "".join(f"[0:a:{k}]" for k in range(n_audio))
+        cmd = base + ["-filter_complex", f"{labels}amix=inputs={n_audio}:normalize=0,{sd}[s]",
+                      "-map", "[s]", "-f", "null", "-"]
+    else:
+        cmd = base + ["-af", sd, "-f", "null", "-"]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    except Exception:
+        return end
+    starts = []
+    for line in (proc.stderr or "").splitlines():
+        m = re.search(r"silence_start:\s*([-\d.]+)", line)
+        if m:                                          # silencedetect times are relative to scan_lo
+            starts.append(scan_lo + float(m.group(1)))
+    tol = 0.25                                         # the silence that begins right as speech ends
+    for s0 in sorted(starts):
+        if s0 >= float(end) - tol:
+            cut = min(s0 + trailing, hard)             # end a beat INTO the quiet, capped at ceiling
+            if cut > float(end):
+                return round(cut, 2)
+            return end
+    return end
+
+
 def peak_motion_time(source, peak, start, end, radius=MOTION_RADIUS):
     """Scan ±radius seconds around the audio peak and return the absolute source time
     of the highest-motion frame (max ffmpeg scene score) — so the cold-open opens on
@@ -1543,12 +1595,20 @@ def run(state):
     # check) that a near-duplicate never reaches drafts/. Windows are computed once here.
     clips, kept_windows = [], []
     for c in ranked_clips:
-        duration = durations.get(c["source"]) or C.ffprobe_duration(C.ROOT / c["source"])
+        src_path = C.ROOT / c["source"]
+        duration = durations.get(c["source"]) or C.ffprobe_duration(src_path)
+        if c["source"] not in audio_cache:
+            audio_cache[c["source"]] = C.audio_stream_count(src_path)
+        n_audio = audio_cache[c["source"]]
         s, e = clip_bounds(c, duration, cmin, cmax, pre, post)
         # FIX 4: extend the END slightly to the next natural pause so the clip finishes the
         # sentence instead of cutting mid-word at the time cap.
         e = snap_end_to_sentence(transcript_by_source.get(c["source"], []), s, e, cmax, duration,
                                  grace=sentence_grace)
+        # FIX 2: the transcript boundary above omits the trailing pause, so measure the REAL source
+        # audio and end a beat INTO the next silence — the speaker fully finishes before the cut.
+        # Done here (before dedup) so the final window is what the overlap guard sees.
+        e = snap_end_to_silence(src_path, s, e, cmax, duration, n_audio, cfg)
         dup = next((w for w in kept_windows
                     if w[0] == c["source"] and not (e <= w[1] or s >= w[2])), None)
         if dup:
