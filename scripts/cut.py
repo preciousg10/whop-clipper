@@ -1320,9 +1320,9 @@ def _content_fc(segments, cold_open, has_audio, n_audio, cfg):
     if has_audio:
         fc.append(f"{audio_label}{LOUDNORM}[aout];")   # loudness normalize to a social target
         aout = "[aout]"
-    # Downscale to max_source_height first so the WHOLE graph runs on ≤720p frames (4K through
-    # split+scale+overlay OOMs). ,fps also normalizes the single-segment path to CFR.
-    max_src_h = int(cfg.get("max_source_height", 720) or 720)
+    # Downscale to max_source_height first so the WHOLE graph runs on ≤max_h frames (4K through
+    # split+scale+overlay OOMs). ,fps also normalizes the single-segment path to CFR. Default 1080.
+    max_src_h = int(cfg.get("max_source_height", 1080) or 1080)
     fc.append(f"{vsrc}scale=-2:'min(ih,{max_src_h})',fps={fps}[dsrc];")
     return fc, "[dsrc]", aout, fps
 

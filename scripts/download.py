@@ -9,8 +9,8 @@ Handles the source types intake feeds it:
   - local paths           -> copied in
 
 Big Drive VODs (tens of GB) are not downloaded raw by default: Drive serves
-transcoded 360p/720p preview streams that yt-dlp can list and fetch. We pick the best
-stream at or below `max_source_height` (default 720). If no transcoded stream exists we
+transcoded 360p/720p/1080p preview streams that yt-dlp can list and fetch. We pick the best
+stream at or below `max_source_height` (default 1080). If no transcoded stream exists we
 FAIL LOUD with the original file size rather than silently pulling a 33GB file; pass
 --original (or original=True) to force the raw download.
 
@@ -131,8 +131,8 @@ def looks_like_youtube_block(text):
 # All of it is CONFIG-DRIVEN (run.py DEFAULT_CONFIG) with sane defaults; DL.configure(cfg) at
 # process start overrides the defaults from state config. Nothing here touches Drive footage.
 # ============================================================================
-YOUTUBE_FORMAT_DEFAULT = ("bestvideo[height<=720][vcodec^=avc1]+bestaudio/"
-                          "bestvideo[height<=720]+bestaudio/best[height<=720]")
+YOUTUBE_FORMAT_DEFAULT = ("bestvideo[height<=1080][vcodec^=avc1]+bestaudio/"
+                          "bestvideo[height<=1080]+bestaudio/best[height<=1080]")
 
 _CFG = {
     # BUILD A — PO-token server
@@ -899,7 +899,7 @@ def _require_audio(files):
                 f"Re-run with --original to fetch the full file with audio.")
 
 
-def _fetch_drive_file(url, staging, max_source_height=720, original=False,
+def _fetch_drive_file(url, staging, max_source_height=1080, original=False,
                       cookies_from_browser=None):
     """Fetch a single Drive file. By default download the best transcoded preview
     stream at or below max_source_height; --original forces the raw file via gdown."""
@@ -998,7 +998,7 @@ def _fetch_drive_file(url, staging, max_source_height=720, original=False,
     return files
 
 
-def download_source(url, cookies_from_browser=None, max_source_height=720, original=False):
+def download_source(url, cookies_from_browser=None, max_source_height=1080, original=False):
     """Download one source and route each resulting file by type.
 
     Returns a list of {"path": <rel-to-ROOT>, "kind": "footage"|"asset"|"doc"|"other"}.
@@ -1019,11 +1019,11 @@ def download_source(url, cookies_from_browser=None, max_source_height=720, origi
                                     cookies_from_browser=cookies_from_browser)
         elif is_youtube_url(url):
             # YOUTUBE: BUILD B — daily cap + organic AFK-style break BEFORE the pull (scaled to the
-            # PREVIOUS video's length), and the PROVEN working format (720p h264 + m4a, muxed) that
+            # PREVIOUS video's length), and the PROVEN working format (h264 + m4a, muxed, up to 1080p) that
             # the PO-token server enables. Falls back to a height-capped ladder so a video lacking
             # the exact avc1 combo still downloads. Counter is bumped only AFTER a successful pull.
             _youtube_predownload_pacing(url)
-            h = int(max_source_height or 720)
+            h = int(max_source_height or 1080)
             yt_fmt = _CFG.get("youtube_format") or YOUTUBE_FORMAT_DEFAULT
             fmt = f"{yt_fmt}/bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
             raw = _fetch_ytdlp(url, staging, cookies_from_browser=cookies_from_browser,
@@ -1041,10 +1041,10 @@ def download_source(url, cookies_from_browser=None, max_source_height=720, origi
         else:
             # Non-YouTube VOD (Kick/Twitch) / direct http. Prefer <= max_source_height so yt-dlp
             # never pulls 4K, but FALL BACK GRACEFULLY — never hard-fail just because the exact
-            # muxed <=720 combo is missing. Ladder: (1) best video<=h + best audio (ffmpeg-muxed),
+            # muxed <=1080 combo is missing. Ladder: (1) best video<=h + best audio (ffmpeg-muxed),
             # (2) best pre-muxed stream <=h, (3) best video + best audio at ANY height (muxed),
-            # (4) absolute best. The cut stage downscales anyway, so a >720 fallback is fine.
-            h = int(max_source_height or 720)
+            # (4) absolute best. The cut stage downscales anyway, so a >1080 fallback is fine.
+            h = int(max_source_height or 1080)
             fmt = f"bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
             raw = _fetch_ytdlp(url, staging, cookies_from_browser=cookies_from_browser,
                                format_id=fmt)
@@ -1073,7 +1073,7 @@ def download_source(url, cookies_from_browser=None, max_source_height=720, origi
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def ensure_downloaded(manifest, cookies_from_browser=None, max_source_height=720,
+def ensure_downloaded(manifest, cookies_from_browser=None, max_source_height=1080,
                       original=False):
     """Pipeline 'download' stage: re-fetch any manifest file that's gone missing.
     Non-fatal per source. Returns the number of sources re-fetched."""
@@ -1101,8 +1101,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Download one source into the campaign.")
     ap.add_argument("url", help="Drive folder / Drive file / VOD URL / direct file / local path")
     ap.add_argument("--cookies-from-browser", help="e.g. chrome, edge, firefox (for gated VODs)")
-    ap.add_argument("--max-source-height", type=int, default=720,
-                    help="max height for Drive transcoded preview streams (default 720)")
+    ap.add_argument("--max-source-height", type=int, default=1080,
+                    help="max height for Drive transcoded preview streams (default 1080)")
     ap.add_argument("--original", action="store_true",
                     help="for Drive files, force the raw original instead of a preview stream")
     args = ap.parse_args()

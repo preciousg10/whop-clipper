@@ -96,10 +96,11 @@ DEFAULT_CONFIG = {
     # A 28-video burst with no spacing got the IP bot-flagged. So: cap the bitrate, sleep randomly
     # between requests/videos on the yt-dlp call, take ORGANIC AFK-STYLE breaks BETWEEN videos
     # (like Scout's scrape breaks), and stop for the day past a volume cap (persisted per date in
-    # memory/yt_download_log.json). The proven working format (720p h264 + m4a) is the default.
+    # memory/yt_download_log.json). The proven working format (h264 + m4a) is the default, now up
+    # to 1080p for more source pixels (sharper TRACK crops, less blur_fill fallback).
     # Channel-cap-3 / 403-backoff / cookies / the footage cap all stay in force alongside these.
-    "youtube_format": ("bestvideo[height<=720][vcodec^=avc1]+bestaudio/"
-                       "bestvideo[height<=720]+bestaudio/best[height<=720]"),
+    "youtube_format": ("bestvideo[height<=1080][vcodec^=avc1]+bestaudio/"
+                       "bestvideo[height<=1080]+bestaudio/best[height<=1080]"),
     "download_rate_limit": "5M",          # yt-dlp --limit-rate (bytes/s; "" = unlimited)
     "download_sleep_requests": 1.0,       # --sleep-requests (pause between HTTP requests)
     "download_sleep_interval": 2.0,       # --sleep-interval (min random pre-video pause, on yt-dlp)
@@ -214,10 +215,13 @@ DEFAULT_CONFIG = {
     "watermark_scale": 0.18,       # fraction of 1080px width
     "watermark_margin": 40,        # px from edges
     "watermark_file": None,        # exact/substring name in assets/; None = auto-pick
-    "max_source_height": 720,      # cap for downloads AND the render: cut downscales the
+    "max_source_height": 1080,     # cap for downloads AND the render: cut downscales the
                                    # source to this height before the blur-fill graph (4K
                                    # frames through split+scale+overlay OOM), and download.py
-                                   # caps the yt-dlp format at this height (never pull 4K).
+                                   # caps the yt-dlp format at this height (never pull 4K). 1080
+                                   # (was 720) gives TRACK more pixels to crop sharp; the render
+                                   # downscale + the "don't upscale past native" reframe guard
+                                   # (track_max_upscale) both still apply.
     "ffmpeg_threads": 2,           # fewer threads = lower peak RAM in the cut stage
 }
 
@@ -301,7 +305,7 @@ def stage_download(state):
     DL.ensure_token_server(cfg)
     repaired = DL.ensure_downloaded(
         manifest, cookies_from_browser=_COOKIES,
-        max_source_height=cfg.get("max_source_height", 720), original=_ORIGINAL)
+        max_source_height=cfg.get("max_source_height", 1080), original=_ORIGINAL)
     C.mark_stage(state, "download", repaired=repaired)
     C.log(f"download stage: {repaired} file(s) re-fetched, rest present.")
 
@@ -755,7 +759,7 @@ def main():
     ap.add_argument("--watermark-file", help="watermark filename in assets/ (exact or substring)")
     ap.add_argument("--cookies-from-browser", help="browser for cookies when re-fetching gated VODs")
     ap.add_argument("--max-source-height", type=int, dest="max_source_height",
-                    help="cap for Drive transcoded preview streams in px (default 720)")
+                    help="cap for Drive transcoded preview streams in px (default 1080)")
     ap.add_argument("--original", action="store_true",
                     help="force raw original Drive files instead of preview streams")
     ap.add_argument("--allow-any-language", action="store_true", dest="allow_any_language",

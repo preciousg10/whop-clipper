@@ -396,7 +396,7 @@ def _footage_seconds(entries):
     return total
 
 
-def download_links(links, cookies, downloaded, max_source_height=720, original=False,
+def download_links(links, cookies, downloaded, max_source_height=1080, original=False,
                    prior_by_source=None, budget=None, channel_max=0, spacing=0.0, yt_block=None):
     """Download each source, routing files by type. Footage-cap-, channel-, and YouTube-block-aware.
 
@@ -1313,8 +1313,8 @@ def main():
                     help="path to a specific pick.json (implies --from-pick).")
     ap.add_argument("--cookies-from-browser",
                     help="browser for cookies on gated VODs (chrome/edge/firefox) — Kick needs this")
-    ap.add_argument("--max-source-height", type=int, default=720,
-                    help="cap for Drive transcoded preview streams in px (default 720)")
+    ap.add_argument("--max-source-height", type=int, default=1080,
+                    help="cap for Drive transcoded preview streams in px (default 1080)")
     ap.add_argument("--original", action="store_true",
                     help="force raw original Drive files instead of preview streams")
     ap.add_argument("--footage-cap-hours", type=float, default=None,
