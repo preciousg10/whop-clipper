@@ -1340,9 +1340,13 @@ def build_content_cmd(source, start, end, segments, cold_open, out_path, cfg, ha
            "-filter_complex_threads", threads, "-threads", threads,
            "-ss", f"{start}", "-t", f"{dur}", "-i", str(source),
            "-filter_complex", "".join(fc), "-map", "[vout]"]
+    abr = str(cfg.get("output_audio_bitrate", "192k"))
     if has_audio and aout:
-        cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "160k"]
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", abr]
+    # Intermediate: keep it near-lossless (content_crf, default 16) so the reframe + final overlay
+    # re-encode don't stack generation loss. A fast preset here is fine — this file is transient.
+    ccrf = str(cfg.get("content_crf", 16))
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", ccrf,
             "-pix_fmt", "yuv420p", "-r", str(fps), str(out_path)]
     return cmd
 
@@ -1377,8 +1381,10 @@ def build_overlay_cmd(video_1080, audio_src, caption_png, watermark_png, ass_pat
         cmd += ["-i", str(watermark_png)]
     cmd += ["-i", str(audio_src), "-filter_complex", "".join(fc), "-map", "[vout]"]
     if has_audio:
-        cmd += ["-map", f"{audio_in}:a", "-c:a", "copy"]
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+        cmd += ["-map", f"{audio_in}:a", "-c:a", "copy"]   # carry the content pass's AAC as-is
+    crf = str(cfg.get("output_crf", 18))
+    preset = str(cfg.get("output_preset", "medium"))
+    cmd += ["-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
             "-r", str(fps), "-movflags", "+faststart", str(out_path)]
     return cmd
 
@@ -1461,8 +1467,10 @@ def build_compose_cmd(source, start, end, segments, cold_open, caption_png, wate
         cmd += ["-i", str(watermark_png)]
     cmd += ["-filter_complex", "".join(fc), "-map", "[vout]"]
     if has_audio:
-        cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "160k"]
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", str(cfg.get("output_audio_bitrate", "192k"))]
+    crf = str(cfg.get("output_crf", 18))
+    preset = str(cfg.get("output_preset", "medium"))
+    cmd += ["-c:v", "libx264", "-preset", preset, "-crf", crf,
             "-pix_fmt", "yuv420p", "-r", str(fps),   # stamp CFR at the encoder (FIX 3)
             "-movflags", "+faststart", str(out_path)]
     return cmd

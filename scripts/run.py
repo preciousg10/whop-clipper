@@ -223,6 +223,15 @@ DEFAULT_CONFIG = {
                                    # downscale + the "don't upscale past native" reframe guard
                                    # (track_max_upscale) both still apply.
     "ffmpeg_threads": 2,           # fewer threads = lower peak RAM in the cut stage
+    # FINAL EXPORT quality (libx264). The delivered clip should not be the quality bottleneck:
+    # CRF 18 is visually near-transparent for social, `medium` preset gives better compression
+    # (quality per bit) than the old `veryfast`, and yuv420p keeps it universally playable.
+    "output_crf": 18,              # final H.264 CRF (lower = higher quality; ~18 is high quality)
+    "output_preset": "medium",     # x264 preset — better quality/size than veryfast, still practical
+    "output_audio_bitrate": "192k",  # AAC bitrate for the delivered clip
+    # TRACK renders in 3 passes; pass 1 is an INTERMEDIATE that gets reframed + re-encoded, so keep
+    # it near-lossless (low CRF) to avoid stacking generation loss into the final overlay encode.
+    "content_crf": 16,             # TRACK intermediate CRF (near-lossless; fast preset stays)
 }
 
 _COOKIES = None                   # browser for cookies during the download stage
