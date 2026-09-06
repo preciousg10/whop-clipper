@@ -37,10 +37,15 @@ def _run(cmd):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--lane", default=None, metavar="LANE",
+                    help="PREFERRED narrow — pass through to pickcampaign: rank the walk to "
+                         "campaigns scout tagged with this AUDIENCE-LANE (a topic/audience people "
+                         "follow, e.g. ENTERTAINMENT_STREAMER, GAMING, SPORTS, MONEY, HEALTH — or a "
+                         "short form). A campaign can be in several lanes. Composes with --category.")
     ap.add_argument("--category", default=None, metavar="CAT",
                     help="pass through to pickcampaign: narrow the walk to ONE scout category "
                          "(e.g. podcast, streamer, gaming, sports, music, brand, meme, news, "
-                         "movie — or an exact scout tag).")
+                         "movie — or an exact scout tag). --lane is the newer preferred narrow.")
     ap.add_argument("--streamer-only", action="store_true",
                     help="pass through to pickcampaign (alias for --category streamer)")
     ap.add_argument("--scout-json", help="explicit scout campaigns.json (pass-through)")
@@ -56,6 +61,8 @@ def main():
 
     def pick_cmd(excludes):
         cmd = [pickcampaign]
+        if args.lane:
+            cmd += ["--lane", args.lane]
         if args.category:
             cmd += ["--category", args.category]
         if args.streamer_only:

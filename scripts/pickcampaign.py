@@ -64,10 +64,14 @@ def _pre_score(c):
     return c.get("pre_score") or 0
 
 
-def rank_campaigns(campaigns, *, category=None):
+def rank_campaigns(campaigns, *, category=None, lane=None):
     """Rankable = a scraped/refreshed, non-disqualified campaign that rests on at least one
     real signal (not UNKNOWN-only). Sorted by scout's composite, tie-broken toward the
     better-understood campaign then pre_score — identical to scout's own report ordering.
+
+    lane: narrow to campaigns scout tagged with this AUDIENCE-LANE (see resolve_lane) — the
+    NEW preferred grouping for posting (a campaign carries several lanes in `rec["lanes"]`;
+    membership = the lane appears in that list). Applied ON TOP OF any category filter.
 
     category: narrow to a single scout category tag (see resolve_category). `streamer_irl`
     uses the ENRICHED streamer handoff ranking (sports-with-signal rescued at x0.6, ordered by
@@ -84,6 +88,10 @@ def rank_campaigns(campaigns, *, category=None):
         and _composite(c) > 0
         and _core_known(c) > 0              # skip UNKNOWN-only (ranked on neutrals alone)
     ]
+    # AUDIENCE-LANE filter (the new preferred narrow). Reuses scout's persisted `lanes` tags —
+    # no re-derivation here. Applied first so it composes with any category filter below.
+    if lane:
+        rankable = [c for c in rankable if lane in _lanes(c)]
     if category == "streamer_irl":
         rankable = [c for c in rankable if streamer_mode_class(c)[0]]
         # Order by the penalty-adjusted composite (sports-with-signal is demoted x0.6), then
@@ -145,6 +153,13 @@ def _cats(c):
     return out
 
 
+def _lanes(c):
+    """Every AUDIENCE-LANE scout tagged onto this campaign (rec["lanes"], multi-assign),
+    upper-cased for a case-insensitive membership test. Empty if scout hasn't tagged lanes
+    yet (an old board — re-run scout --rescore to populate them)."""
+    return {str(x).strip().upper() for x in (c.get("lanes") or []) if x}
+
+
 def streamer_mode_class(c):
     """(include, tier, factor, reason) for the streamer-only mode. `factor` multiplies the
     composite for RANKING only — the stored composite (full board) is never touched."""
@@ -201,6 +216,50 @@ def resolve_category(value):
                + ", ".join(SCOUT_CATEGORIES)
                + " (short forms: podcast, streamer, gaming, sports, music, brand, meme, "
                  "news, movie).")
+    return tag
+
+
+# --- audience-lane filter (--lane, the NEW preferred narrow) -------------------
+# Scout persists every campaign's AUDIENCE-LANES (a topic/audience people follow) in
+# rec["lanes"] (multi-assign — a campaign can be in several). This is the real POSTING
+# grouping, as opposed to a scout `category` (a FORMAT like podcast/brand). --lane narrows
+# the walk to campaigns tagged with one lane; it reads scout's stored tags (no re-derivation)
+# and composes on top of --category. Keep this list in sync with scout's lanes.py (LANE_NAMES).
+SCOUT_LANES = (
+    "HEALTH", "FITNESS", "MONEY", "MOTIVATION_MINDSET", "GAMING",
+    "ENTERTAINMENT_STREAMER", "SPORTS", "MUSIC", "COMEDY_MEMES",
+    "NEWS_POLITICS", "FAITH", "OTHER",
+)
+# Convenience short forms -> the exact scout lane name. Exact names are always accepted.
+LANE_ALIASES = {
+    "health": "HEALTH",
+    "fitness": "FITNESS", "gym": "FITNESS",
+    "money": "MONEY", "finance": "MONEY", "crypto": "MONEY",
+    "motivation": "MOTIVATION_MINDSET", "mindset": "MOTIVATION_MINDSET",
+    "motivation_mindset": "MOTIVATION_MINDSET",
+    "gaming": "GAMING", "game": "GAMING", "games": "GAMING",
+    "entertainment": "ENTERTAINMENT_STREAMER", "streamer": "ENTERTAINMENT_STREAMER",
+    "entertainment_streamer": "ENTERTAINMENT_STREAMER", "irl": "ENTERTAINMENT_STREAMER",
+    "sports": "SPORTS", "sport": "SPORTS",
+    "music": "MUSIC",
+    "comedy": "COMEDY_MEMES", "memes": "COMEDY_MEMES", "meme": "COMEDY_MEMES",
+    "comedy_memes": "COMEDY_MEMES",
+    "news": "NEWS_POLITICS", "politics": "NEWS_POLITICS", "news_politics": "NEWS_POLITICS",
+    "faith": "FAITH", "religion": "FAITH",
+    "other": "OTHER",
+}
+
+
+def resolve_lane(value):
+    """Map a --lane value (short form or exact lane name) to scout's exact lane string.
+    Fail loud on an unknown value (never silently narrow to the wrong set)."""
+    key = (value or "").strip().lower()
+    tag = LANE_ALIASES.get(key) or (key.upper() if key.upper() in SCOUT_LANES else None)
+    if not tag:
+        C.fail(f"--lane {value!r} is not a known audience-lane. Choose one of: "
+               + ", ".join(SCOUT_LANES)
+               + " (short forms: health, fitness, money, motivation, gaming, "
+                 "entertainment/streamer, sports, music, comedy, news, faith, other).")
     return tag
 
 
@@ -717,7 +776,7 @@ def warn_if_stale_board(scout_json, max_hours):
         C.log(f"scout board age: {age:.1f}h (fresh, < {max_hours}h).")
 
 
-def _commit_pick(pick, rank, scout_json, category=None):
+def _commit_pick(pick, rank, scout_json, category=None, lane=None):
     """Write the intake inputs (brief.txt, links.txt, pick.json) for the chosen campaign and
     print the summary + next steps. Only called AFTER `clippable` passed, so links is non-empty."""
     name = pick.get("name") or "(unnamed campaign)"
@@ -742,8 +801,11 @@ def _commit_pick(pick, rank, scout_json, category=None):
         # rank_mode stays "streamer_only" for the streamer set (back-compat: run.py reads it);
         # any other narrowed set is "category", full board is "full_board". `category` carries
         # the exact tag so run.py can thread --category back on auto-advance.
-        "rank_mode": "streamer_only" if is_streamer else ("category" if category else "full_board"),
+        "rank_mode": ("streamer_only" if is_streamer
+                      else ("lane" if lane and not category
+                            else ("category" if category else "full_board"))),
         "category": category,
+        "lane": lane,
         "streamer_tier": sm_tier,
         "composite_score": _composite(pick),
         "core_signals_known": _core_known(pick),
@@ -764,8 +826,14 @@ def _commit_pick(pick, rank, scout_json, category=None):
     print("=" * 66)
     if is_streamer:
         print(f"  mode          : STREAMER/IRL only  (tier: {sm_tier})")
+    elif lane and category:
+        print(f"  mode          : lane {lane} + category {category}")
+    elif lane:
+        print(f"  mode          : lane {lane} only")
     elif category:
         print(f"  mode          : category {category} only")
+    if lane:
+        print(f"  campaign lanes: {', '.join(sorted(_lanes(pick))) or '(none tagged)'}")
     print(f"  composite     : {_composite(pick):.4f}  ({_core_known(pick)}/5 core signals known)")
     print(f"  locator       : {locator}  ({how})")
     print(f"  rules source  : {pick.get('rules_source') or 'unknown'}")
@@ -815,6 +883,16 @@ def main():
     ap.add_argument("--streamer-only", action="store_true",
                     help="alias for --category streamer (STREAMER/IRL-only handoff; kept for "
                          "backward compat).")
+    ap.add_argument("--lane", default=None, metavar="LANE",
+                    help="PREFERRED narrow: rank + pick only campaigns scout tagged with this "
+                         "AUDIENCE-LANE (a topic/audience people follow, the real posting group). "
+                         "A campaign carries several lanes (rec['lanes']); membership = the lane is "
+                         "in that list. Accepts short forms mapped to scout's exact lane names: "
+                         "health, fitness, money, motivation, gaming, entertainment/streamer, "
+                         "sports, music, comedy, news, faith, other (or pass the exact name). Reads "
+                         "scout's stored lane tags — no re-derivation. Composes on top of --category. "
+                         "The full board in campaigns.json is untouched; only what's ranked + handed "
+                         "to the clipper changes. (Old board without lanes? re-run scout --rescore.)")
     ap.add_argument("--preedited-min-seconds", type=int, default=DEFAULT_PREEDITED_MIN_SECONDS,
                     help=f"pre-edited filter: a footage file this long or longer counts as a "
                          f"real VOD (default {DEFAULT_PREEDITED_MIN_SECONDS}s). A campaign whose "
@@ -851,13 +929,23 @@ def main():
             C.fail(f"--streamer-only conflicts with --category {args.category!r} "
                    f"(resolved to {category}). Pass only one.")
         category = "streamer_irl"
+    # Resolve the audience-lane narrow (the new preferred path). Composes with --category.
+    lane = resolve_lane(args.lane) if args.lane else None
 
     scout_json = args.scout_json or os.path.join(args.scout_dir, "campaigns.json")
     scout_dir = os.path.dirname(scout_json) or "."
     campaigns = load_scout_campaigns(scout_json)
     warn_if_stale_board(scout_json, args.stale_board_hours)   # Unit 2d: never silent on a stale board
-    ranked = rank_campaigns(campaigns, category=category)
+    ranked = rank_campaigns(campaigns, category=category, lane=lane)
     if not ranked:
+        if lane:
+            board_has_lanes = any(c.get("lanes") for c in campaigns)
+            extra = ("" if board_has_lanes else
+                     " NOTE: no campaign on this board carries ANY lane tag yet — re-run "
+                     "scout with --rescore to populate rec['lanes'] first.")
+            C.fail(f"no {lane!r} campaigns in scout's ranked output"
+                   + (f" (also narrowed to category {category})" if category else "")
+                   + f".{extra} Re-run scout, drop --lane, or pick a different lane.")
         if category == "streamer_irl":
             C.fail("no STREAMER/IRL campaigns in scout's ranked output (no streamer_irl tags, "
                    "and no sports campaign carried a streamer/IRL keyword signal). Re-run scout, "
@@ -871,7 +959,12 @@ def main():
     done_ids = _load_done_ids(scout_dir)
 
     # Show the shortlist so the pick is transparent.
-    mode_txt = f" [{category} only]" if category else ""
+    narrows = []
+    if lane:
+        narrows.append(f"lane {lane}")
+    if category:
+        narrows.append(f"category {category}")
+    mode_txt = f" [{' + '.join(narrows)}]" if narrows else ""
     C.log(f"scout ranked {len(ranked)} candidate(s){mode_txt} (from {scout_json}); "
           f"walking the top {min(args.max_walk, len(ranked))} for the first clippable one:")
     for i, c in enumerate(ranked[:max(args.max_walk, 8)], 1):
@@ -891,7 +984,7 @@ def main():
         if not ok:
             C.fail(f"--rank {args.rank} '{pick.get('name')}' is not clippable: {why}. "
                    "Drop --rank to walk to the first clippable campaign instead.")
-        _commit_pick(pick, args.rank, scout_json, category=category)
+        _commit_pick(pick, args.rank, scout_json, category=category, lane=lane)
         return
 
     # Walk the top N; take the FIRST that passes all preconditions, logging every skip + reason.
@@ -932,7 +1025,7 @@ def main():
             for sr, sc, sw in skips:
                 C.log(f"  skip #{sr}  {sc.get('name')!r} — {sw}")
             C.log(f"  -> clippable at #{i}: {c.get('name')!r}")
-            _commit_pick(c, i, scout_json, category=category)
+            _commit_pick(c, i, scout_json, category=category, lane=lane)
             return
         skips.append((i, c, why))
 

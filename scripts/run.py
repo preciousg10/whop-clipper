@@ -559,11 +559,15 @@ def _pick_and_intake_next(excluded, args):
     pc = [sys.executable, os.path.join(scripts, "pickcampaign.py")]
     if pick.get("scout_json"):
         pc += ["--scout-json", pick["scout_json"]]
-    # Preserve the pick's narrow on advance. `category` carries the exact tag for any narrowed
-    # walk (streamer_irl included); rank_mode is the back-compat path for older pick.json files.
+    # Preserve the pick's narrow on advance. `lane` carries the audience-lane narrow (the new
+    # preferred grouping); `category` carries the exact category tag (streamer_irl included);
+    # rank_mode is the back-compat path for older pick.json files. Lane + category compose, so
+    # thread BOTH when present.
+    if pick.get("lane"):
+        pc += ["--lane", pick["lane"]]
     if pick.get("category"):
         pc += ["--category", pick["category"]]
-    elif pick.get("rank_mode") == "streamer_only":
+    elif not pick.get("lane") and pick.get("rank_mode") == "streamer_only":
         pc.append("--streamer-only")
     # FIX 1: thread the language gate through so the pre-download skip matches run.py's setting —
     # --allow-any-language disables BOTH the pickcampaign pre-download gate and index.py's gate.
