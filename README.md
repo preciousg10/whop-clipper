@@ -5,6 +5,9 @@ give it a campaign brief + footage links; it downloads everything, finds the str
 moments, writes flzsh-style captions (rules-checked), and renders finished vertical
 clips with the watermark burned in. **You review, post, and submit — never the tool.**
 
+> Companion project: [**whop-scout**](https://github.com/preciousg10/whop-scout) researches and
+> ranks which campaigns are worth clipping for; this repo (**whop-clipper**) produces the clips.
+
 The agent's brain is `instructions.md` (read it). Groq does the volume work
 (moment scanning, caption first-drafts); final taste calls happen when you run the
 agent in Claude Code with `instructions.md` loaded. These scripts prepare and execute.
